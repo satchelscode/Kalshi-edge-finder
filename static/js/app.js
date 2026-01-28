@@ -1,4 +1,4 @@
-// Kalshi Edge Finder - Frontend JavaScript WITH DEBUG INFO
+// Kalshi Edge Finder - Frontend JavaScript WITH DEBUG INFO - FIXED
 
 let scanInterval = null;
 
@@ -21,7 +21,7 @@ async function startScan() {
         if (data.status === 'scanning') {
             pollForResults();
         } else {
-            showError(data.message);
+            showError(data.message || 'Scan failed');
         }
     } catch (error) {
         showError('Failed to start scan: ' + error.message);
@@ -74,11 +74,12 @@ function displayResults(data) {
 
 function createDebugDisplay(data) {
     const debug = data.debug || {};
+    const minEdge = data.min_edge || 10;
     
     return `
         <div class="no-edges">
             <h2>❌ No Edges Found</h2>
-            <p>Searched for edges ≥ ${data.min_edge}%</p>
+            <p>Searched for edges ≥ ${minEdge}%</p>
             
             <div class="debug-box">
                 <h3>🔍 Debug Information</h3>
@@ -95,25 +96,25 @@ function createDebugDisplay(data) {
                 
                 ${debug.kalshi_markets_list && debug.kalshi_markets_list.length > 0 ? `
                 <div class="debug-section">
-                    <h4>📝 Sample Kalshi Markets:</h4>
+                    <h4>📝 Sample Kalshi Markets (first 10):</h4>
                     <ul class="market-list">
-                        ${debug.kalshi_markets_list.slice(0, 10).map(m => `<li>${m}</li>`).join('')}
+                        ${debug.kalshi_markets_list.slice(0, 10).map(m => `<li>${escapeHtml(m)}</li>`).join('')}
                     </ul>
                 </div>
                 ` : ''}
                 
                 ${debug.fanduel_teams && debug.fanduel_teams.length > 0 ? `
                 <div class="debug-section">
-                    <h4>🏈 Sample FanDuel Teams:</h4>
+                    <h4>🏈 Sample FanDuel Teams (first 10):</h4>
                     <ul class="market-list">
-                        ${debug.fanduel_teams.slice(0, 10).map(t => `<li>${t}</li>`).join('')}
+                        ${debug.fanduel_teams.slice(0, 10).map(t => `<li>${escapeHtml(t)}</li>`).join('')}
                     </ul>
                 </div>
                 ` : ''}
                 
                 ${debug.match_details && debug.match_details.length > 0 ? `
                 <div class="debug-section">
-                    <h4>🎯 Matched Events (All Edges):</h4>
+                    <h4>🎯 Matched Events (showing ALL edges found):</h4>
                     <table class="match-table">
                         <tr>
                             <th>Kalshi Market</th>
@@ -121,15 +122,16 @@ function createDebugDisplay(data) {
                             <th>FanDuel Odds</th>
                             <th>Edge %</th>
                         </tr>
-                        ${debug.match_details.map(m => `
-                            <tr class="${m.edge >= data.min_edge ? 'good-edge' : ''}">
-                                <td>${m.kalshi_title}</td>
-                                <td>$${m.kalshi_price.toFixed(2)}</td>
-                                <td>${formatOdds(m.fanduel_odds)}</td>
-                                <td>${m.edge.toFixed(1)}%</td>
+                        ${debug.match_details.slice(0, 20).map(m => `
+                            <tr class="${m.edge >= minEdge ? 'good-edge' : ''}">
+                                <td>${escapeHtml(m.kalshi_title || 'Unknown')}</td>
+                                <td>$${(m.kalshi_price || 0).toFixed(2)}</td>
+                                <td>${formatOdds(m.fanduel_odds || 0)}</td>
+                                <td>${(m.edge || 0).toFixed(1)}%</td>
                             </tr>
                         `).join('')}
                     </table>
+                    ${debug.match_details.length > 20 ? `<p style="text-align:center; margin-top:10px;"><em>Showing first 20 of ${debug.match_details.length} matches</em></p>` : ''}
                 </div>
                 ` : ''}
                 
@@ -142,6 +144,7 @@ function createDebugDisplay(data) {
                         <li>Different naming formats (e.g., "LA Lakers" vs "Lakers")</li>
                         <li>Different sports being offered</li>
                         <li>Timing - no overlapping games right now</li>
+                        <li>Kalshi has different types of markets (politics, economics) vs FanDuel (pure sports)</li>
                     </ul>
                 </div>
                 ` : ''}
@@ -150,19 +153,19 @@ function createDebugDisplay(data) {
                 <div class="debug-section error">
                     <h4>❌ Errors:</h4>
                     <ul>
-                        ${debug.errors.map(e => `<li>${e}</li>`).join('')}
+                        ${debug.errors.map(e => `<li>${escapeHtml(e)}</li>`).join('')}
                     </ul>
                 </div>
                 ` : ''}
             </div>
             
             <div class="info-box" style="margin-top: 30px;">
-                <h3>💡 What to do:</h3>
+                <h3>💡 What to do next:</h3>
                 <ul>
                     <li><strong>If matches_found = 0:</strong> Event names aren't matching. This is the main issue!</li>
-                    <li><strong>If matched but edge too small:</strong> Markets are efficient right now</li>
-                    <li><strong>Try again:</strong> During game days (tonight, weekends)</li>
-                    <li><strong>Lower threshold:</strong> Try MIN_EDGE=0.5 to see all matches</li>
+                    <li><strong>If matched but edges too small:</strong> Markets are efficient right now (normal!)</li>
+                    <li><strong>Try again:</strong> During game days (tonight, weekends) when more games are live</li>
+                    <li><strong>Lower threshold:</strong> Set MIN_EDGE=0.1 in Render to see ALL matches</li>
                 </ul>
             </div>
         </div>
@@ -174,8 +177,8 @@ function createEdgeCard(edge, number) {
         <div class="edge-card">
             <div class="edge-header">
                 <div class="edge-title">
-                    <h3>Edge #${number}: ${edge.event_name}</h3>
-                    <p class="market-ticker">Market: ${edge.kalshi_market}</p>
+                    <h3>Edge #${number}: ${escapeHtml(edge.event_name)}</h3>
+                    <p class="market-ticker">Market: ${escapeHtml(edge.kalshi_market)}</p>
                 </div>
                 <div class="edge-badge">
                     ${edge.edge}% Edge
@@ -225,7 +228,15 @@ function createEdgeCard(edge, number) {
 }
 
 function formatOdds(odds) {
+    if (!odds) return 'N/A';
     return odds > 0 ? `+${odds}` : `${odds}`;
+}
+
+function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
 }
 
 async function refreshEdges() {
@@ -243,7 +254,8 @@ function showError(message) {
     edgesContainer.innerHTML = `
         <div class="no-edges">
             <h2>❌ Error</h2>
-            <p>${message}</p>
+            <p>${escapeHtml(message)}</p>
+            <p style="margin-top: 20px;">Check the browser console (F12) for more details.</p>
         </div>
     `;
 }
