@@ -288,6 +288,27 @@ class TheOddsAPI:
         
         return sport_odds
     
+    def _extract_player_name(self, title: str) -> Optional[str]:
+        """
+        Extract player name from Kalshi market titles like:
+        'Will Shai Gilgeous-Alexander win Western Conference Finals MVP?'
+        Returns: 'Shai Gilgeous-Alexander'
+        """
+        import re
+        
+        # Pattern: "Will [PLAYER NAME] win/make/..." 
+        match = re.search(r'Will\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+[A-Z][a-z]+)?)\s+(?:win|make|be|score|have)', title, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        
+        # Pattern: "Who will win [AWARD]? - [PLAYER NAME]"
+        if '?' in title and '-' in title:
+            parts = title.split('-')
+            if len(parts) == 2:
+                return parts[1].strip()
+        
+        return None
+    
     def _generate_keys(self, team: str, home: str, away: str, market_type: str, point) -> List[str]:
         """Generate multiple key variations for matching"""
         keys = [
@@ -331,15 +352,33 @@ class TheOddsAPI:
 
 def match_events(kalshi_title: str, fanduel_odds: Dict) -> Optional[Dict]:
     """Match Kalshi event with FanDuel odds using fuzzy matching"""
+    import re
     
     kalshi_lower = kalshi_title.lower()
     
-    # Direct match first
+    # FIRST: Try to extract player name from Kalshi title
+    # Pattern: "Will [PLAYER NAME] win/make/be/score..."
+    player_match = re.search(r'Will\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+[A-Z][a-z]+)?)\s+(?:win|make|be|score|have)', kalshi_title, re.IGNORECASE)
+    
+    if player_match:
+        player_name = player_match.group(1).strip().lower()
+        # Try to match this player name with FanDuel
+        for fd_key, fd_data in fanduel_odds.items():
+            fd_key_lower = fd_key.lower()
+            # Check if player name appears in FanDuel key
+            if player_name in fd_key_lower or fd_key_lower in player_name:
+                # Additional check: make sure words overlap significantly
+                player_words = set(player_name.split())
+                fd_words = set(fd_key_lower.split())
+                if len(player_words & fd_words) >= min(2, len(player_words)):
+                    return fd_data
+    
+    # SECOND: Direct match 
     for fd_key, fd_data in fanduel_odds.items():
         if fd_key.lower() in kalshi_lower or kalshi_lower in fd_key.lower():
             return fd_data
     
-    # Extract team names and match
+    # THIRD: Word overlap matching
     kalshi_words = set(kalshi_lower.split())
     
     best_match = None
