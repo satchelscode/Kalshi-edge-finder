@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kalshi Edge Finder</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .header p {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        .controls {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-secondary {
+            background: #48bb78;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #38a169;
+            transform: translateY(-2px);
+        }
+
+        .btn-danger {
+            background: #f56565;
+            color: white;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .status {
+            text-align: center;
+            padding: 15px;
+            background: #f7fafc;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+
+        .status-running {
+            background: #bee3f8;
+            border-left: 4px solid #3182ce;
+        }
+
+        .status-success {
+            background: #c6f6d5;
+            border-left: 4px solid #38a169;
+        }
+
+        .status-error {
+            background: #fed7d7;
+            border-left: 4px solid #e53e3e;
+        }
+
+        .edges-container {
+            display: grid;
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .edge-card {
+            background: linear-gradient(135deg, #f6f8fb 0%, #ffffff 100%);
+            border-radius: 12px;
+            padding: 20px;
+            border-left: 5px solid #48bb78;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease;
+        }
+
+        .edge-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+        }
+
+        .edge-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: start;
+            margin-bottom: 15px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .edge-title {
+            font-size: 1.3rem;
+            font-weight: 700;
+            color: #2d3748;
+        }
+
+        .edge-badge {
+            background: #48bb78;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: 700;
+            font-size: 1.1rem;
+        }
+
+        .edge-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin: 15px 0;
+        }
+
+        .detail-box {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
+        }
+
+        .detail-label {
+            font-size: 0.85rem;
+            color: #718096;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .detail-value {
+            font-size: 1.3rem;
+            font-weight: 700;
+            color: #2d3748;
+        }
+
+        .recommendation {
+            background: #fef5e7;
+            border-left: 4px solid #f59e0b;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+        }
+
+        .recommendation-title {
+            font-weight: 700;
+            color: #92400e;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .recommendation-text {
+            color: #78350f;
+            line-height: 1.5;
+        }
+
+        .config-info {
+            background: #f7fafc;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+            font-size: 0.95rem;
+        }
+
+        .config-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .config-label {
+            color: #718096;
+        }
+
+        .config-value {
+            font-weight: 700;
+            color: #2d3748;
+        }
+
+        .no-edges {
+            text-align: center;
+            padding: 40px;
+            color: #718096;
+        }
+
+        .no-edges-icon {
+            font-size: 3rem;
+            margin-bottom: 15px;
+        }
+
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .timestamp {
+            font-size: 0.85rem;
+            color: #a0aec0;
+            margin-top: 10px;
+        }
+
+        @media (max-width: 768px) {
+            .header h1 {
+                font-size: 1.8rem;
+            }
+            
+            .controls {
+                flex-direction: column;
+                width: 100%;
+            }
+            
+            .btn {
+                width: 100%;
+                justify-content: center;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎯 Kalshi Edge Finder</h1>
+            <p>Find +EV opportunities between FanDuel and Kalshi</p>
+        </div>
+
+        <div class="card">
+            <div class="config-info" id="configInfo">
+                <div class="config-item">
+                    <span class="config-label">Min Edge:</span>
+                    <span class="config-value" id="minEdge">10%</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Bet Amount:</span>
+                    <span class="config-value" id="betAmount">$10</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">Scan Interval:</span>
+                    <span class="config-value" id="scanInterval">5 min</span>
+                </div>
+                <div class="config-item">
+                    <span class="config-label">API Status:</span>
+                    <span class="config-value" id="apiStatus">🔴 Not configured</span>
+                </div>
+            </div>
+
+            <div class="controls">
+                <button class="btn btn-primary" id="scanBtn" onclick="triggerScan()">
+                    <span id="scanBtnText">🔍 Scan Now</span>
+                </button>
+                <button class="btn btn-secondary" id="autoScanBtn" onclick="toggleAutoScan()">
+                    🔄 Enable Auto-Scan
+                </button>
+                <button class="btn" onclick="refreshEdges()" style="background: #805ad5; color: white;">
+                    ↻ Refresh
+                </button>
+            </div>
+
+            <div class="status" id="statusBox">
+                <div id="statusMessage">Ready to scan for edges</div>
+                <div class="timestamp" id="lastScan"></div>
+            </div>
+        </div>
+
+        <div class="edges-container" id="edgesContainer">
+            <div class="no-edges">
+                <div class="no-edges-icon">📊</div>
+                <h3>No edges found yet</h3>
+                <p style="margin-top: 10px;">Click "Scan Now" to search for opportunities</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let autoScanEnabled = false;
+        let refreshInterval = null;
+
+        // Load config on page load
+        window.addEventListener('load', () => {
+            loadConfig();
+            refreshEdges();
+        });
+
+        async function loadConfig() {
+            try {
+                const response = await fetch('/api/config');
+                const config = await response.json();
+                
+                document.getElementById('minEdge').textContent = config.min_edge + '%';
+                document.getElementById('betAmount').textContent = '$' + config.bet_amount;
+                document.getElementById('scanInterval').textContent = (config.scan_interval / 60) + ' min';
+                
+                const apiStatus = (config.has_odds_api_key && config.has_kalshi_api_key) ? '🟢 Connected' : 
+                                 config.has_odds_api_key ? '🟡 Partial' : '🔴 Mock Data';
+                document.getElementById('apiStatus').textContent = apiStatus;
+                
+                autoScanEnabled = config.auto_scan_enabled;
+                updateAutoScanButton();
+            } catch (error) {
+                console.error('Error loading config:', error);
+            }
+        }
+
+        async function triggerScan() {
+            const btn = document.getElementById('scanBtn');
+            const btnText = document.getElementById('scanBtnText');
+            const statusBox = document.getElementById('statusBox');
+            const statusMessage = document.getElementById('statusMessage');
+            
+            btn.disabled = true;
+            btnText.innerHTML = '<span class="spinner"></span> Scanning...';
+            statusBox.className = 'status status-running';
+            statusMessage.textContent = 'Scanning markets for edges...';
+            
+            try {
+                const response = await fetch('/api/scan', { method: 'POST' });
+                const result = await response.json();
+                
+                if (result.success) {
+                    statusBox.className = 'status status-success';
+                    statusMessage.textContent = result.message;
+                    await refreshEdges();
+                } else {
+                    statusBox.className = 'status status-error';
+                    statusMessage.textContent = 'Error: ' + result.error;
+                }
+            } catch (error) {
+                statusBox.className = 'status status-error';
+                statusMessage.textContent = 'Error: ' + error.message;
+            } finally {
+                btn.disabled = false;
+                btnText.textContent = '🔍 Scan Now';
+            }
+        }
+
+        async function refreshEdges() {
+            try {
+                const response = await fetch('/api/edges');
+                const data = await response.json();
+                
+                displayEdges(data.edges);
+                updateStatus(data.status);
+            } catch (error) {
+                console.error('Error refreshing edges:', error);
+            }
+        }
+
+        function displayEdges(edges) {
+            const container = document.getElementById('edgesContainer');
+            
+            if (edges.length === 0) {
+                container.innerHTML = `
+                    <div class="no-edges">
+                        <div class="no-edges-icon">📊</div>
+                        <h3>No edges found</h3>
+                        <p style="margin-top: 10px;">Markets are efficient right now. Try again later or lower your edge threshold.</p>
+                    </div>
+                `;
+                return;
+            }
+            
+            container.innerHTML = edges.map(edge => `
+                <div class="edge-card">
+                    <div class="edge-header">
+                        <div class="edge-title">${edge.event_name}</div>
+                        <div class="edge-badge">+${edge.edge_pct.toFixed(1)}% Edge</div>
+                    </div>
+                    
+                    <div class="edge-details">
+                        <div class="detail-box">
+                            <div class="detail-label">FanDuel</div>
+                            <div class="detail-value">${edge.fanduel_odds > 0 ? '+' : ''}${edge.fanduel_odds}</div>
+                            <div style="font-size: 0.9rem; color: #718096; margin-top: 5px;">
+                                ${edge.fanduel_prob.toFixed(1)}% implied
+                            </div>
+                        </div>
+                        
+                        <div class="detail-box">
+                            <div class="detail-label">Kalshi Price</div>
+                            <div class="detail-value">$${edge.kalshi_price.toFixed(2)}</div>
+                            <div style="font-size: 0.9rem; color: #718096; margin-top: 5px;">
+                                ${edge.kalshi_prob.toFixed(1)}% implied
+                            </div>
+                        </div>
+                        
+                        <div class="detail-box">
+                            <div class="detail-label">Expected Value</div>
+                            <div class="detail-value" style="color: #48bb78;">
+                                $${edge.expected_value.toFixed(2)}
+                            </div>
+                            <div style="font-size: 0.9rem; color: #718096; margin-top: 5px;">
+                                on $${edge.bet_amount.toFixed(0)} bet
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="recommendation">
+                        <div class="recommendation-title">
+                            💡 Recommendation
+                        </div>
+                        <div class="recommendation-text">
+                            ${edge.recommendation}
+                            <br><br>
+                            <strong>⚠️ Important:</strong> Verify odds on both platforms before trading. 
+                            Market: <code>${edge.kalshi_market}</code>
+                        </div>
+                    </div>
+                    
+                    <div class="timestamp">
+                        Found: ${new Date(edge.timestamp).toLocaleString()}
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function updateStatus(status) {
+            const lastScanEl = document.getElementById('lastScan');
+            
+            if (status.last_scan) {
+                const date = new Date(status.last_scan);
+                lastScanEl.textContent = `Last scan: ${date.toLocaleString()} | Total scans: ${status.total_scans} | Edges found: ${status.edges_found}`;
+            }
+        }
+
+        async function toggleAutoScan() {
+            autoScanEnabled = !autoScanEnabled;
+            
+            try {
+                const response = await fetch('/api/auto-scan', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enable: autoScanEnabled })
+                });
+                
+                const result = await response.json();
+                updateAutoScanButton();
+                
+                if (autoScanEnabled) {
+                    // Start refreshing every 30 seconds
+                    refreshInterval = setInterval(refreshEdges, 30000);
+                } else {
+                    // Stop refreshing
+                    if (refreshInterval) {
+                        clearInterval(refreshInterval);
+                        refreshInterval = null;
+                    }
+                }
+            } catch (error) {
+                console.error('Error toggling auto-scan:', error);
+            }
+        }
+
+        function updateAutoScanButton() {
+            const btn = document.getElementById('autoScanBtn');
+            if (autoScanEnabled) {
+                btn.textContent = '⏸️ Disable Auto-Scan';
+                btn.className = 'btn btn-danger';
+            } else {
+                btn.textContent = '🔄 Enable Auto-Scan';
+                btn.className = 'btn btn-secondary';
+            }
+        }
+    </script>
+</body>
+</html>
