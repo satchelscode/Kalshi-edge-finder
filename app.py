@@ -61,6 +61,20 @@ class KalshiAPI:
             'Content-Type': 'application/json'
         })
         
+    def check_exchange_status(self) -> bool:
+        """Check if Kalshi exchange is open for trading"""
+        try:
+            url = f"{self.base_url}/exchange/status"
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            trading_active = data.get('trading_active', False)
+            print(f"Kalshi exchange trading_active: {trading_active}")
+            return trading_active
+        except Exception as e:
+            print(f"Could not check exchange status: {e}")
+            return True  # Assume it's open if we can't check
+        
     def get_series(self) -> List[Dict]:
         """Get all available series/categories"""
         try:
@@ -91,14 +105,41 @@ class KalshiAPI:
             return []
     
     def get_markets(self, limit: int = 200, status: str = "open") -> List[Dict]:
-        """Fetch active markets from Kalshi"""
+        """Fetch active markets from Kalshi - only returns tradeable markets"""
         try:
             url = f"{self.base_url}/markets"
-            params = {'limit': limit, 'status': status}
+            params = {
+                'limit': limit,
+                'status': status,
+                'with_nested_markets': 'false'
+            }
             response = self.session.get(url, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
-            return data.get('markets', [])
+            
+            markets = data.get('markets', [])
+            
+            # Filter to only markets where trading is actually active
+            tradeable_markets = []
+            for market in markets:
+                # Check if market can be traded right now
+                if market.get('status') == 'open' and market.get('can_close_early', True):
+                    # Additional check: has the close_time passed?
+                    close_time = market.get('close_time')
+                    if close_time:
+                        try:
+                            from datetime import datetime
+                            close_dt = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
+                            now = datetime.now(close_dt.tzinfo)
+                            if close_dt > now:  # Market hasn't closed yet
+                                tradeable_markets.append(market)
+                        except:
+                            # If we can't parse time, include it
+                            tradeable_markets.append(market)
+                    else:
+                        tradeable_markets.append(market)
+            
+            return tradeable_markets
         except Exception as e:
             print(f"Error fetching Kalshi markets: {e}")
             return []
@@ -338,6 +379,9 @@ def find_edges() -> tuple[List[Dict], Dict]:
         kalshi = KalshiAPI(api_key=KALSHI_API_KEY)
         odds_api = TheOddsAPI(api_key=ODDS_API_KEY)
         
+        # Check if exchange is even open
+        kalshi.check_exchange_status()
+        
         # Get FanDuel basketball odds
         print("\n=== FETCHING FANDUEL ODDS ===")
         fanduel_odds = odds_api.get_basketball_odds()
@@ -368,22 +412,7 @@ def find_edges() -> tuple[List[Dict], Dict]:
         for market in open_markets:
             ticker = market.get('ticker', '')
             title = market.get('title', '')
-            status = market.get('status', '')
             close_time = market.get('close_time', '')
-            
-            # Skip closed/settled markets
-            if status != 'open':
-                continue
-            
-            # Skip markets that already closed (parse ISO timestamp)
-            try:
-                from datetime import datetime
-                if close_time:
-                    close_dt = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
-                    if close_dt < datetime.now(close_dt.tzinfo):
-                        continue
-            except:
-                pass  # If parsing fails, try the market anyway
             
             # Get orderbook
             orderbook = kalshi.get_orderbook(ticker)
@@ -400,7 +429,6 @@ def find_edges() -> tuple[List[Dict], Dict]:
             if title and (is_bulls_pacers or 'austin peay' in title.lower() or 'kansas state' in title.lower() or 'bucknell' in title.lower()):
                 print(f"\n🔍 DEBUG MARKET: {title}")
                 print(f"   Ticker: {ticker}")
-                print(f"   Status: {status}")
                 print(f"   Close time: {close_time}")
                 print(f"   YES asks: {yes_asks[:3] if yes_asks else 'None'}")
                 print(f"   NO asks: {no_asks[:3] if no_asks else 'None'}")
