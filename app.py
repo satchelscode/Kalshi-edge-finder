@@ -1,6 +1,6 @@
 """
-Kalshi Edge Finder - NBA FOCUSED VERSION
-Matches NBA sides, totals, moneylines, and player props between FanDuel and Kalshi
+Kalshi Edge Finder - CATEGORY-BASED VERSION
+Uses Kalshi's series/category filters to find NBA markets
 """
 
 from flask import Flask, render_template, jsonify
@@ -10,7 +10,6 @@ from datetime import datetime
 from typing import Dict, List, Optional
 import threading
 import time
-import re
 
 app = Flask(__name__)
 
@@ -31,8 +30,9 @@ class OddsConverter:
     """Convert between different odds formats"""
     
     @staticmethod
-    def american_to_implied_prob(american_odds: int) -> float:
+    def american_to_implied_prob(american_odds: int or float) -> float:
         """Convert American odds to implied probability"""
+        american_odds = float(american_odds)
         if american_odds > 0:
             return 100 / (american_odds + 100)
         else:
@@ -47,7 +47,7 @@ class OddsConverter:
 
 
 class KalshiAPI:
-    """Wrapper for Kalshi API - NBA focused"""
+    """Wrapper for Kalshi API with category/series support"""
     
     BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
     DEMO_URL = "https://demo-api.kalshi.co/trade-api/v2"
@@ -61,6 +61,35 @@ class KalshiAPI:
             'Content-Type': 'application/json'
         })
         
+    def get_series(self) -> List[Dict]:
+        """Get all available series/categories"""
+        try:
+            url = f"{self.base_url}/series"
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            return data.get('series', [])
+        except Exception as e:
+            print(f"Error fetching series: {e}")
+            return []
+    
+    def get_markets_by_series(self, series_ticker: str, limit: int = 100) -> List[Dict]:
+        """Get markets filtered by series/category"""
+        try:
+            url = f"{self.base_url}/markets"
+            params = {
+                'series_ticker': series_ticker,
+                'limit': limit,
+                'status': 'open'
+            }
+            response = self.session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            return data.get('markets', [])
+        except Exception as e:
+            print(f"Error fetching markets for series {series_ticker}: {e}")
+            return []
+    
     def get_markets(self, limit: int = 200, status: str = "open") -> List[Dict]:
         """Fetch active markets from Kalshi"""
         try:
@@ -84,36 +113,51 @@ class KalshiAPI:
         except Exception as e:
             return None
     
-    def get_nba_markets(self) -> List[Dict]:
-        """Get NBA-specific markets only"""
-        all_markets = self.get_markets(limit=200)
+    def find_basketball_series(self) -> List[str]:
+        """Find all basketball-related series"""
+        all_series = self.get_series()
+        basketball_series = []
         
-        nba_keywords = ['nba', 'lakers', 'warriors', 'celtics', 'bulls', 'heat', 
-                       'knicks', 'nets', 'sixers', '76ers', 'bucks', 'cavaliers',
-                       'mavericks', 'rockets', 'spurs', 'suns', 'clippers', 'kings',
-                       'trail blazers', 'nuggets', 'timberwolves', 'thunder', 'jazz',
-                       'grizzlies', 'pelicans', 'hornets', 'magic', 'hawks', 'wizards',
-                       'pistons', 'pacers', 'raptors', 'lebron', 'curry', 'durant',
-                       'points', 'rebounds', 'assists', 'basketball']
+        basketball_keywords = ['basketball', 'nba', 'ncaa', 'college basketball', 
+                               'pro basketball', 'hoops']
         
-        nba_markets = []
-        for market in all_markets:
-            title = market.get('title', '').lower()
-            subtitle = market.get('subtitle', '').lower()
+        for series in all_series:
+            title = series.get('title', '').lower()
+            ticker = series.get('ticker', '')
             
-            # Must contain NBA keyword
-            if any(keyword in title or keyword in subtitle for keyword in nba_keywords):
-                # Exclude non-sports (politics, economics, etc.)
-                exclude_keywords = ['president', 'election', 'congress', 'senate', 
-                                   'inflation', 'gdp', 'unemployment', 'fed', 'rate']
-                if not any(ex in title or ex in subtitle for ex in exclude_keywords):
-                    nba_markets.append(market)
+            if any(keyword in title for keyword in basketball_keywords):
+                basketball_series.append(ticker)
+                print(f"Found basketball series: {series.get('title')} ({ticker})")
         
-        return nba_markets
+        return basketball_series
+    
+    def get_all_basketball_markets(self) -> List[Dict]:
+        """Get all basketball markets using series filters"""
+        basketball_series = self.find_basketball_series()
+        
+        all_markets = []
+        for series_ticker in basketball_series:
+            markets = self.get_markets_by_series(series_ticker, limit=100)
+            all_markets.extend(markets)
+            print(f"Found {len(markets)} markets in series {series_ticker}")
+        
+        # Also try keyword search as backup
+        keyword_markets = self.get_markets(limit=200)
+        basketball_keywords = ['lakers', 'warriors', 'celtics', 'nba', 'basketball',
+                              'bulls', 'heat', 'knicks', 'nets', 'sixers', '76ers']
+        
+        for market in keyword_markets:
+            title = market.get('title', '').lower()
+            if any(keyword in title for keyword in basketball_keywords):
+                # Avoid duplicates
+                if not any(m.get('ticker') == market.get('ticker') for m in all_markets):
+                    all_markets.append(market)
+        
+        return all_markets
 
 
 class TheOddsAPI:
-    """Wrapper for The Odds API - NBA focused"""
+    """Wrapper for The Odds API - NBA + NCAA"""
     
     BASE_URL = "https://api.the-odds-api.com/v4"
     
@@ -121,167 +165,169 @@ class TheOddsAPI:
         self.api_key = api_key
         self.session = requests.Session()
     
-    def get_nba_odds(self) -> Dict[str, Dict]:
-        """Get comprehensive NBA odds from FanDuel"""
+    def get_basketball_odds(self) -> Dict[str, Dict]:
+        """Get NBA + NCAA basketball odds"""
         if not self.api_key:
-            return self._get_mock_nba_odds()
+            return self._get_mock_odds()
         
         all_odds = {}
         
-        # Get moneylines (h2h)
-        moneylines = self._get_odds_for_market('basketball_nba', 'h2h')
-        self._parse_odds(moneylines, all_odds, 'moneyline')
+        # Get NBA
+        print("Fetching NBA odds...")
+        nba_odds = self._get_sport_odds('basketball_nba')
+        all_odds.update(nba_odds)
         
-        # Get spreads
-        spreads = self._get_odds_for_market('basketball_nba', 'spreads')
-        self._parse_odds(spreads, all_odds, 'spread')
-        
-        # Get totals
-        totals = self._get_odds_for_market('basketball_nba', 'totals')
-        self._parse_odds(totals, all_odds, 'total')
-        
-        # Get player props if available
-        player_props = self._get_odds_for_market('basketball_nba', 'player_points')
-        self._parse_odds(player_props, all_odds, 'player_prop')
-        
-        time.sleep(0.5)  # Rate limiting
+        # Get NCAA Basketball
+        print("Fetching NCAA Basketball odds...")
+        ncaa_odds = self._get_sport_odds('basketball_ncaab')
+        all_odds.update(ncaa_odds)
         
         return all_odds
     
-    def _get_odds_for_market(self, sport: str, market: str) -> List[Dict]:
-        """Get odds for specific market type"""
-        if not self.api_key:
-            return []
+    def _get_sport_odds(self, sport: str) -> Dict[str, Dict]:
+        """Get odds for a specific sport"""
+        sport_odds = {}
         
-        url = f"{self.BASE_URL}/sports/{sport}/odds"
-        params = {
-            'apiKey': self.api_key,
-            'regions': 'us',
-            'markets': market,
-            'bookmakers': 'fanduel',
-            'oddsFormat': 'american'
-        }
+        # Get different market types
+        market_types = ['h2h', 'spreads', 'totals']
         
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            print(f"Error fetching {market} odds: {e}")
-            return []
-    
-    def _parse_odds(self, games_data: List[Dict], all_odds: Dict, market_type: str):
-        """Parse odds data into structured format"""
-        for game in games_data:
-            home = game.get('home_team', '')
-            away = game.get('away_team', '')
+        for market_type in market_types:
+            url = f"{self.BASE_URL}/sports/{sport}/odds"
+            params = {
+                'apiKey': self.api_key,
+                'regions': 'us',
+                'markets': market_type,
+                'bookmakers': 'fanduel',
+                'oddsFormat': 'american'
+            }
             
-            bookmakers = game.get('bookmakers', [])
-            for book in bookmakers:
-                if book.get('key') != 'fanduel':
-                    continue
+            try:
+                response = self.session.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                games = response.json()
                 
-                markets = book.get('markets', [])
-                for market in markets:
-                    outcomes = market.get('outcomes', [])
+                print(f"  {sport} {market_type}: {len(games)} games")
+                
+                for game in games:
+                    home = game.get('home_team', '')
+                    away = game.get('away_team', '')
                     
-                    for outcome in outcomes:
-                        team = outcome.get('name', '')
-                        price = outcome.get('price')
-                        point = outcome.get('point')
+                    bookmakers = game.get('bookmakers', [])
+                    for book in bookmakers:
+                        if book.get('key') != 'fanduel':
+                            continue
                         
-                        # Create multiple key formats for matching
-                        keys = [
-                            team,
-                            f"{team} Win",
-                            f"{team} to win",
-                            f"{away} at {home}" if team == home else f"{home} at {away}",
-                        ]
-                        
-                        # Add spread/total specific keys
-                        if point:
-                            keys.append(f"{team} {point:+.1f}")
-                            keys.append(f"{team} spread {point:+.1f}")
-                        
-                        for key in keys:
-                            all_odds[key] = {
-                                'odds': price,
-                                'type': market_type,
-                                'team': team,
-                                'matchup': f"{away} @ {home}",
-                                'point': point
-                            }
+                        markets = book.get('markets', [])
+                        for market in markets:
+                            outcomes = market.get('outcomes', [])
+                            
+                            for outcome in outcomes:
+                                team = outcome.get('name', '')
+                                price = outcome.get('price')
+                                point = outcome.get('point')
+                                
+                                # Create searchable keys
+                                keys = self._generate_keys(team, home, away, market_type, point)
+                                
+                                for key in keys:
+                                    sport_odds[key] = {
+                                        'odds': price,
+                                        'type': market_type,
+                                        'team': team,
+                                        'home': home,
+                                        'away': away,
+                                        'matchup': f"{away} @ {home}",
+                                        'point': point
+                                    }
+                
+                time.sleep(0.3)  # Rate limiting
+                
+            except Exception as e:
+                print(f"Error fetching {sport} {market_type}: {e}")
+        
+        return sport_odds
     
-    def _get_mock_nba_odds(self) -> Dict[str, Dict]:
-        """Mock NBA odds for testing"""
+    def _generate_keys(self, team: str, home: str, away: str, market_type: str, point) -> List[str]:
+        """Generate multiple key variations for matching"""
+        keys = [
+            team,
+            team.lower(),
+            f"{team} Win",
+            f"{team} to win",
+        ]
+        
+        # Add matchup variations
+        if team == home:
+            keys.extend([
+                f"{away} at {home}",
+                f"{away} @ {home}",
+                f"{home} vs {away}",
+            ])
+        else:
+            keys.extend([
+                f"{home} at {away}",
+                f"{home} @ {away}",
+                f"{away} vs {home}",
+            ])
+        
+        # Add spread/total specific keys
+        if point:
+            keys.extend([
+                f"{team} {point:+.1f}",
+                f"{team} spread {point:+.1f}",
+                f"{team} {abs(point)}"
+            ])
+        
+        return keys
+    
+    def _get_mock_odds(self) -> Dict[str, Dict]:
+        """Mock odds for testing"""
         return {
-            "Lakers": {'odds': -150, 'type': 'moneyline', 'team': 'Lakers', 'matchup': 'Celtics @ Lakers'},
-            "Lakers Win": {'odds': -150, 'type': 'moneyline', 'team': 'Lakers', 'matchup': 'Celtics @ Lakers'},
-            "Celtics": {'odds': +130, 'type': 'moneyline', 'team': 'Celtics', 'matchup': 'Celtics @ Lakers'},
-            "Celtics Win": {'odds': +130, 'type': 'moneyline', 'team': 'Celtics', 'matchup': 'Celtics @ Lakers'},
-            "Warriors": {'odds': -200, 'type': 'moneyline', 'team': 'Warriors', 'matchup': 'Heat @ Warriors'},
-            "Warriors Win": {'odds': -200, 'type': 'moneyline', 'team': 'Warriors', 'matchup': 'Heat @ Warriors'},
+            "Lakers": {'odds': -150, 'type': 'h2h', 'team': 'Lakers', 'matchup': 'Celtics @ Lakers'},
+            "Celtics": {'odds': +130, 'type': 'h2h', 'team': 'Celtics', 'matchup': 'Celtics @ Lakers'},
         }
 
 
-def extract_nba_teams(text: str) -> List[str]:
-    """Extract NBA team names from text"""
-    nba_teams = [
-        'lakers', 'warriors', 'celtics', 'bulls', 'heat', 'knicks', 'nets',
-        'sixers', '76ers', 'bucks', 'cavaliers', 'mavericks', 'rockets',
-        'spurs', 'suns', 'clippers', 'kings', 'blazers', 'nuggets',
-        'timberwolves', 'thunder', 'jazz', 'grizzlies', 'pelicans',
-        'hornets', 'magic', 'hawks', 'wizards', 'pistons', 'pacers', 'raptors'
-    ]
+def match_events(kalshi_title: str, fanduel_odds: Dict) -> Optional[Dict]:
+    """Match Kalshi event with FanDuel odds using fuzzy matching"""
     
-    text_lower = text.lower()
-    found_teams = []
-    
-    for team in nba_teams:
-        if team in text_lower:
-            found_teams.append(team)
-    
-    return found_teams
-
-
-def match_nba_event(kalshi_title: str, fanduel_odds: Dict) -> Optional[Dict]:
-    """Match Kalshi NBA event with FanDuel odds"""
+    kalshi_lower = kalshi_title.lower()
     
     # Direct match first
     for fd_key, fd_data in fanduel_odds.items():
-        if kalshi_title.lower() in fd_key.lower() or fd_key.lower() in kalshi_title.lower():
+        if fd_key.lower() in kalshi_lower or kalshi_lower in fd_key.lower():
             return fd_data
     
-    # Extract teams from Kalshi title
-    kalshi_teams = extract_nba_teams(kalshi_title)
+    # Extract team names and match
+    kalshi_words = set(kalshi_lower.split())
     
-    if not kalshi_teams:
-        return None
+    best_match = None
+    best_overlap = 0
     
-    # Look for matching teams in FanDuel
     for fd_key, fd_data in fanduel_odds.items():
-        fd_teams = extract_nba_teams(fd_key)
+        fd_words = set(fd_key.lower().split())
+        overlap = len(kalshi_words & fd_words)
         
-        # If we have team overlap, it's likely a match
-        overlap = set(kalshi_teams) & set(fd_teams)
-        if overlap:
-            return fd_data
+        if overlap > best_overlap and overlap >= 2:
+            best_overlap = overlap
+            best_match = fd_data
     
-    return None
+    return best_match
 
 
 def find_edges() -> tuple[List[Dict], Dict]:
-    """Find NBA betting edges"""
+    """Find basketball betting edges"""
     global scan_in_progress
     
     scan_in_progress = True
     edges = []
     debug = {
-        'kalshi_markets_total': 0,
-        'kalshi_markets_nba': 0,
-        'kalshi_markets_list': [],
-        'fanduel_odds_total': 0,
-        'fanduel_matchups': [],
+        'kalshi_total_markets': 0,
+        'kalshi_basketball_markets': 0,
+        'kalshi_series_found': [],
+        'kalshi_sample_markets': [],
+        'fanduel_total_odds': 0,
+        'fanduel_sample_matchups': [],
         'matches_found': 0,
         'match_details': [],
         'errors': []
@@ -292,19 +338,28 @@ def find_edges() -> tuple[List[Dict], Dict]:
         kalshi = KalshiAPI(api_key=KALSHI_API_KEY)
         odds_api = TheOddsAPI(api_key=ODDS_API_KEY)
         
-        # Get NBA data only
-        fanduel_odds = odds_api.get_nba_odds()
-        debug['fanduel_odds_total'] = len(fanduel_odds)
-        debug['fanduel_matchups'] = list(set([v.get('matchup', '') for v in fanduel_odds.values() if v.get('matchup')]))[:10]
+        # Get FanDuel basketball odds
+        print("\n=== FETCHING FANDUEL ODDS ===")
+        fanduel_odds = odds_api.get_basketball_odds()
+        debug['fanduel_total_odds'] = len(fanduel_odds)
         
-        # Get Kalshi NBA markets
-        all_markets = kalshi.get_markets(limit=200)
-        debug['kalshi_markets_total'] = len(all_markets)
+        # Get unique matchups for debug
+        matchups = list(set([v.get('matchup', '') for v in fanduel_odds.values() if v.get('matchup')]))
+        debug['fanduel_sample_matchups'] = matchups[:15]
         
-        markets = kalshi.get_nba_markets()
-        debug['kalshi_markets_nba'] = len(markets)
-        debug['kalshi_markets_list'] = [m.get('title', 'Unknown') for m in markets[:20]]
+        # Get Kalshi basketball markets using series
+        print("\n=== FETCHING KALSHI MARKETS ===")
+        basketball_series = kalshi.find_basketball_series()
+        debug['kalshi_series_found'] = basketball_series
         
+        markets = kalshi.get_all_basketball_markets()
+        debug['kalshi_basketball_markets'] = len(markets)
+        debug['kalshi_sample_markets'] = [m.get('title', '') for m in markets[:15]]
+        
+        print(f"\nFound {len(markets)} Kalshi basketball markets")
+        print(f"Found {len(fanduel_odds)} FanDuel odds\n")
+        
+        # Match and find edges
         for market in markets:
             ticker = market.get('ticker', '')
             title = market.get('title', '')
@@ -326,7 +381,7 @@ def find_edges() -> tuple[List[Dict], Dict]:
             kalshi_prob = kalshi_price
             
             # Match with FanDuel
-            matched = match_nba_event(title, fanduel_odds)
+            matched = match_events(title, fanduel_odds)
             
             if matched:
                 debug['matches_found'] += 1
@@ -337,13 +392,15 @@ def find_edges() -> tuple[List[Dict], Dict]:
                 
                 match_info = {
                     'kalshi_title': title,
-                    'kalshi_price': kalshi_price,
+                    'kalshi_price': round(kalshi_price, 2),
                     'fanduel_odds': fanduel_odds_value,
                     'fanduel_matchup': matched.get('matchup', ''),
                     'market_type': matched.get('type', 'unknown'),
                     'edge': round(edge, 2)
                 }
                 debug['match_details'].append(match_info)
+                
+                print(f"✓ MATCH: {title[:50]}... | Edge: {edge:.1f}%")
                 
                 if edge >= MIN_EDGE:
                     payout_if_win = 1.0 - kalshi_price
@@ -368,6 +425,7 @@ def find_edges() -> tuple[List[Dict], Dict]:
     
     except Exception as e:
         debug['errors'].append(str(e))
+        print(f"ERROR: {e}")
     
     finally:
         scan_in_progress = False
@@ -430,7 +488,7 @@ def status():
         'edges_found': len(current_edges),
         'last_scan': last_scan_time,
         'scanning': scan_in_progress,
-        'mode': 'NBA_FOCUSED'
+        'mode': 'CATEGORY_BASED_BASKETBALL'
     })
 
 
