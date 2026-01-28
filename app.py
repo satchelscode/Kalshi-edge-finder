@@ -371,13 +371,29 @@ def find_edges() -> tuple[List[Dict], Dict]:
             
             orderbook_data = orderbook.get('orderbook', {})
             yes_asks = orderbook_data.get('yes', [])
+            no_asks = orderbook_data.get('no', [])
             
-            if not yes_asks:
+            # Need either YES asks or NO bids to get YES probability
+            if not yes_asks and not no_asks:
                 continue
             
-            # Best price
-            best_ask = min(yes_asks, key=lambda x: x[0])
-            kalshi_price = best_ask[0] / 100
+            # Get best YES price (what it costs to buy YES)
+            kalshi_price = None
+            
+            if yes_asks:
+                # Best ask on YES side (lowest price to buy YES)
+                best_yes_ask = min(yes_asks, key=lambda x: x[0])
+                kalshi_price = best_yes_ask[0] / 100  # Convert cents to dollars
+            elif no_asks:
+                # If no YES asks, infer from NO side
+                # Buying NO at X means YES is priced at (1 - X)
+                best_no_ask = min(no_asks, key=lambda x: x[0])
+                kalshi_price = 1.0 - (best_no_ask[0] / 100)
+            
+            if not kalshi_price or kalshi_price <= 0.01 or kalshi_price >= 0.99:
+                # Skip markets with unrealistic prices (likely no liquidity)
+                continue
+            
             kalshi_prob = kalshi_price
             
             # Match with FanDuel
