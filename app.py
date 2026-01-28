@@ -399,8 +399,19 @@ def find_edges() -> tuple[List[Dict], Dict]:
         markets = kalshi.get_all_basketball_markets()
         debug['kalshi_basketball_markets'] = len(markets)
         
-        # Filter to only open markets
-        open_markets = [m for m in markets if m.get('status') == 'open']
+        # Debug: Show actual market structure
+        if markets:
+            sample_market = markets[0]
+            print(f"\n📝 SAMPLE MARKET STRUCTURE:")
+            print(f"   Keys: {list(sample_market.keys())}")
+            print(f"   Status: {sample_market.get('status')}")
+            print(f"   Title: {sample_market.get('title', 'N/A')[:50]}")
+            print(f"   Ticker: {sample_market.get('ticker', 'N/A')}")
+            print(f"   Close time: {sample_market.get('close_time', 'N/A')}")
+            print()
+        
+        # DON'T filter - get_markets() already did it
+        open_markets = markets
         debug['kalshi_open_markets'] = len(open_markets)
         debug['kalshi_sample_markets'] = [m.get('title', '') for m in open_markets[:15]]
         
