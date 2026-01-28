@@ -354,15 +354,36 @@ def find_edges() -> tuple[List[Dict], Dict]:
         
         markets = kalshi.get_all_basketball_markets()
         debug['kalshi_basketball_markets'] = len(markets)
-        debug['kalshi_sample_markets'] = [m.get('title', '') for m in markets[:15]]
+        
+        # Filter to only open markets
+        open_markets = [m for m in markets if m.get('status') == 'open']
+        debug['kalshi_open_markets'] = len(open_markets)
+        debug['kalshi_sample_markets'] = [m.get('title', '') for m in open_markets[:15]]
         
         print(f"\nFound {len(markets)} Kalshi basketball markets")
+        print(f"Found {len(open_markets)} OPEN markets")
         print(f"Found {len(fanduel_odds)} FanDuel odds\n")
         
         # Match and find edges
-        for market in markets:
+        for market in open_markets:
             ticker = market.get('ticker', '')
             title = market.get('title', '')
+            status = market.get('status', '')
+            close_time = market.get('close_time', '')
+            
+            # Skip closed/settled markets
+            if status != 'open':
+                continue
+            
+            # Skip markets that already closed (parse ISO timestamp)
+            try:
+                from datetime import datetime
+                if close_time:
+                    close_dt = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
+                    if close_dt < datetime.now(close_dt.tzinfo):
+                        continue
+            except:
+                pass  # If parsing fails, try the market anyway
             
             # Get orderbook
             orderbook = kalshi.get_orderbook(ticker)
@@ -373,6 +394,17 @@ def find_edges() -> tuple[List[Dict], Dict]:
             yes_asks = orderbook_data.get('yes', [])
             no_asks = orderbook_data.get('no', [])
             
+            # DEBUG: Log what we got
+            is_bulls_pacers = 'chicago' in title.lower() and 'indiana' in title.lower()
+            
+            if title and (is_bulls_pacers or 'austin peay' in title.lower() or 'kansas state' in title.lower() or 'bucknell' in title.lower()):
+                print(f"\n🔍 DEBUG MARKET: {title}")
+                print(f"   Ticker: {ticker}")
+                print(f"   Status: {status}")
+                print(f"   Close time: {close_time}")
+                print(f"   YES asks: {yes_asks[:3] if yes_asks else 'None'}")
+                print(f"   NO asks: {no_asks[:3] if no_asks else 'None'}")
+            
             # Need either YES asks or NO bids to get YES probability
             if not yes_asks and not no_asks:
                 continue
@@ -382,16 +414,38 @@ def find_edges() -> tuple[List[Dict], Dict]:
             
             if yes_asks:
                 # Best ask on YES side (lowest price to buy YES)
-                best_yes_ask = min(yes_asks, key=lambda x: x[0])
-                kalshi_price = best_yes_ask[0] / 100  # Convert cents to dollars
+                try:
+                    # Orderbook format might be: [[price_cents, quantity], ...]
+                    best_yes_ask = min(yes_asks, key=lambda x: x[0])
+                    price_cents = best_yes_ask[0]
+                    kalshi_price = price_cents / 100  # Convert cents to dollars
+                    
+                    if title and ('austin peay' in title.lower() or 'kansas state' in title.lower()):
+                        print(f"   ✓ YES price: {price_cents} cents = ${kalshi_price}")
+                except Exception as e:
+                    print(f"   ❌ Error parsing YES asks: {e}")
+                    continue
+                    
             elif no_asks:
                 # If no YES asks, infer from NO side
-                # Buying NO at X means YES is priced at (1 - X)
-                best_no_ask = min(no_asks, key=lambda x: x[0])
-                kalshi_price = 1.0 - (best_no_ask[0] / 100)
+                try:
+                    best_no_ask = min(no_asks, key=lambda x: x[0])
+                    no_price_cents = best_no_ask[0]
+                    kalshi_price = 1.0 - (no_price_cents / 100)
+                    
+                    if title and ('austin peay' in title.lower() or 'kansas state' in title.lower()):
+                        print(f"   ✓ NO price: {no_price_cents} cents, YES inferred: ${kalshi_price}")
+                except Exception as e:
+                    print(f"   ❌ Error parsing NO asks: {e}")
+                    continue
             
-            if not kalshi_price or kalshi_price <= 0.01 or kalshi_price >= 0.99:
-                # Skip markets with unrealistic prices (likely no liquidity)
+            if not kalshi_price:
+                continue
+                
+            # Filter unrealistic prices but log them
+            if kalshi_price <= 0.01 or kalshi_price >= 0.99:
+                if is_bulls_pacers or (title and ('austin peay' in title.lower() or 'kansas state' in title.lower())):
+                    print(f"   ⚠️ SKIPPED: Price ${kalshi_price} too extreme (no liquidity?)")
                 continue
             
             kalshi_prob = kalshi_price
