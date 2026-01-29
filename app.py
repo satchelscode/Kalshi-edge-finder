@@ -538,12 +538,22 @@ def find_edges() -> tuple[List[Dict], Dict]:
             # Match with FanDuel
             matched = match_events(title, fanduel_odds)
             
-            # DEBUG: Show matching attempts for first 5 markets
-            if debug['matches_found'] < 5 and not matched:
-                print(f"\n❌ NO MATCH: {title[:60]}")
-                print(f"   Sample FanDuel keys: {list(fanduel_odds.keys())[:5]}")
+            # DEBUG: Show matching attempts for interesting markets
+            is_detroit_gsw = 'detroit' in title.lower() or 'golden state' in title.lower()
+            should_debug = debug['matches_found'] < 3 or is_detroit_gsw
+            
+            if should_debug and not matched:
+                print(f"\n❌ NO MATCH: '{title}'")
+                # Show what FanDuel has that might match
+                relevant_fd = [k for k in list(fanduel_odds.keys())[:20] if 'detroit' in k.lower() or 'warriors' in k.lower() or 'golden' in k.lower()]
+                if relevant_fd:
+                    print(f"   Relevant FD keys: {relevant_fd}")
+                else:
+                    print(f"   Sample FD keys: {list(fanduel_odds.keys())[:8]}")
             
             if matched:
+                if is_detroit_gsw:
+                    print(f"\n✅ MATCHED: '{title}' → {matched.get('team', 'Unknown')}")
                 debug['matches_found'] += 1
                 
                 fanduel_odds_value = matched['odds']
