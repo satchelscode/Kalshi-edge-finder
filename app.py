@@ -273,18 +273,19 @@ def find_edges(kalshi_api: KalshiAPI, fanduel_odds: Dict, min_edge: float = 0.00
             print(f"   ❌ No orderbook data")
             continue
         
-        # Extract YES price from orderbook
+        # Extract YES price from orderbook (using BIDS, not asks!)
         orderbook_data = orderbook.get('orderbook', {})
-        yes_asks = orderbook_data.get('yes', [])
+        yes_bids = orderbook_data.get('yes', [])
         
-        if not yes_asks:
-            print(f"   ❌ No YES asks in orderbook")
+        if not yes_bids:
+            print(f"   ❌ No YES bids in orderbook")
             continue
         
-        # Get best YES ask price
-        best_yes_ask = min(yes_asks, key=lambda x: x[0])
-        kalshi_price = best_yes_ask[0] / 100
-        print(f"   Kalshi price: ${kalshi_price:.2f}")
+        # Get best YES bid price (highest price someone will pay)
+        # Format: [[price_cents, quantity], ...]
+        best_yes_bid = max(yes_bids, key=lambda x: x[0])
+        kalshi_price = best_yes_bid[0] / 100  # Convert cents to dollars
+        print(f"   Kalshi price: ${kalshi_price:.2f} (from YES bid: {best_yes_bid[0]}¢)")
         
         # Skip illiquid markets
         if kalshi_price <= 0.01 or kalshi_price >= 0.99:
