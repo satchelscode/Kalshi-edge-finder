@@ -231,6 +231,14 @@ def find_edges(kalshi_api: KalshiAPI, fanduel_odds: Dict, min_edge: float = 0.00
     
     print(f"   Kalshi markets: {len(kalshi_markets)}")
     print(f"   FanDuel odds: {len(fanduel_odds)}")
+    
+    # DEBUG: Show ALL market titles
+    print(f"\n📋 ALL KALSHI MARKETS:")
+    for i, market in enumerate(kalshi_markets[:20], 1):
+        title = market.get('title', '')
+        ticker = market.get('ticker', '')
+        print(f"   {i}. {title} ({ticker})")
+    
     print()
     
     matches_found = 0
