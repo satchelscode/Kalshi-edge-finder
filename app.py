@@ -270,65 +270,79 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005):
         print(f"   {team1_name} wins: ${team1_best_price:.2f} ({team1_method})")
         print(f"   {team2_name} wins: ${team2_best_price:.2f} ({team2_method})")
         
-        # Check edges
+        # Check for ARBITRAGE opportunities
+        # We ALWAYS bet on Kalshi, and hedge the OPPOSITE outcome on FanDuel
         for team_name, best_price, method in [
             (team1_name, team1_best_price, team1_method),
             (team2_name, team2_best_price, team2_method)
         ]:
-            if team_name not in fanduel_odds:
+            # Determine the OPPOSITE team (for FanDuel hedge)
+            opposite_team = team2_name if team_name == team1_name else team1_name
+            
+            # Check if BOTH teams exist in FanDuel
+            if team_name not in fanduel_odds or opposite_team not in fanduel_odds:
                 continue
             
-            fd_odds = fanduel_odds[team_name]['odds']
+            # Get FanDuel odds for the OPPOSITE outcome (our hedge)
+            fd_opposite_odds = fanduel_odds[opposite_team]['odds']
+            fd_opposite_prob = converter.decimal_to_implied_prob(fd_opposite_odds)
             
-            # Calculate Kalshi fees using the correct formula:
-            # Fee = round_up(0.07 × C × P × (1-P))
-            # Where C = contracts, P = price
-            # We'll calculate per-contract effective price
+            # Calculate Kalshi probability AFTER fees
+            P = best_price  # Price per contract
+            C = 100  # Calculate for 100 contracts
             
-            P = best_price  # Price per contract (e.g., 0.18)
-            C = 100  # Calculate for 100 contracts as baseline
-            
-            # Kalshi fee formula
+            # Kalshi fee formula: round_up(0.07 × C × P × (1-P))
             import math
-            fee_total = math.ceil(0.07 * C * P * (1 - P) * 100) / 100  # Round up to nearest cent
+            fee_total = math.ceil(0.07 * C * P * (1 - P) * 100) / 100
             fee_per_contract = fee_total / C
-            
-            # Effective cost per contract after fees
             effective_cost = P + fee_per_contract
             
-            # Calculate probabilities and edge
             kalshi_prob_after_fees = effective_cost
-            fd_prob = converter.decimal_to_implied_prob(fd_odds)
-            edge = (fd_prob / kalshi_prob_after_fees) - 1
             
-            # Edge before fees (for comparison)
-            edge_before_fees = (fd_prob / P) - 1
+            # ARBITRAGE CHECK:
+            # We bet Team A on Kalshi (kalshi_prob_after_fees)
+            # We bet Team B on FanDuel (fd_opposite_prob)
+            # For arbitrage: kalshi_prob + fd_opposite_prob < 100%
             
-            print(f"\n   📊 {team_name}:")
-            print(f"      Kalshi: ${P:.2f} ({P*100:.1f}%) - {method}")
-            print(f"      Kalshi fee: ${fee_per_contract:.4f}/contract (${fee_total:.2f} per 100 contracts)")
-            print(f"      Kalshi after fees: ${effective_cost:.4f} ({kalshi_prob_after_fees*100:.2f}%)")
-            print(f"      FanDuel: {fd_odds:.2f} ({fd_prob*100:.1f}%)")
-            print(f"      Edge before fees: {edge_before_fees*100:.2f}%")
-            print(f"      Edge after fees: {edge*100:.2f}%")
+            total_prob = kalshi_prob_after_fees + fd_opposite_prob
             
-            if edge >= min_edge:
+            # Calculate arbitrage profit
+            if total_prob < 1.0:  # True arbitrage exists!
+                arbitrage_profit = (1.0 / total_prob) - 1
+                
+                print(f"\n   📊 {team_name}:")
+                print(f"      Kalshi: ${P:.2f} ({P*100:.1f}%) - {method}")
+                print(f"      Kalshi fee: ${fee_per_contract:.4f}/contract (${fee_total:.2f} per 100 contracts)")
+                print(f"      Kalshi after fees: ${effective_cost:.4f} ({kalshi_prob_after_fees*100:.2f}%)")
+                print(f"      FanDuel {opposite_team}: {fd_opposite_odds:.2f} ({fd_opposite_prob*100:.2f}%)")
+                print(f"      Total implied prob: {total_prob*100:.2f}%")
+                print(f"      🎯 ARBITRAGE: {arbitrage_profit*100:.2f}% guaranteed profit")
+                print(f"      ✅ ARBITRAGE FOUND!")
+                
                 edges.append({
                     'game': f"{team1_name} vs {team2_name}",
                     'team': team_name,
+                    'opposite_team': opposite_team,
                     'kalshi_price': best_price,
                     'kalshi_fee_per_contract': fee_per_contract,
                     'kalshi_price_after_fees': effective_cost,
-                    'kalshi_prob': P * 100,
                     'kalshi_prob_after_fees': kalshi_prob_after_fees * 100,
                     'kalshi_method': method,
-                    'fanduel_odds': fd_odds,
-                    'fanduel_prob': fd_prob * 100,
-                    'edge_before_fees': edge_before_fees * 100,
-                    'edge_after_fees': edge * 100,
-                    'recommendation': f"Buy {method} at ${P:.2f} (${effective_cost:.4f} after fees)"
+                    'fanduel_opposite_team': opposite_team,
+                    'fanduel_opposite_odds': fd_opposite_odds,
+                    'fanduel_opposite_prob': fd_opposite_prob * 100,
+                    'total_implied_prob': total_prob * 100,
+                    'arbitrage_profit': arbitrage_profit * 100,
+                    'recommendation': f"Bet ${best_price:.2f} on {method} (Kalshi) + hedge on {opposite_team} at {fd_opposite_odds:.2f} (FanDuel)",
+                    'strategy': f"1. Buy {method} on Kalshi\n2. Bet {opposite_team} ML on FanDuel"
                 })
-                print(f"      ✅ EDGE FOUND!")
+            else:
+                # No arbitrage
+                print(f"\n   📊 {team_name}:")
+                print(f"      Kalshi after fees: ${effective_cost:.4f} ({kalshi_prob_after_fees*100:.2f}%)")
+                print(f"      FanDuel {opposite_team}: {fd_opposite_odds:.2f} ({fd_opposite_prob*100:.2f}%)")
+                print(f"      Total implied prob: {total_prob*100:.2f}%")
+                print(f"      ❌ No arbitrage (total > 100%)")
         
         print()
     
@@ -510,8 +524,16 @@ def debug_view():
                     <span class="value">{edge['fanduel_odds']:.2f} ({edge['fanduel_prob']:.1f}%)</span>
                 </div>
                 <div class="row">
-                    <span class="label">Edge (After Fees):</span>
-                    <span class="positive">{edge['edge_after_fees']:.2f}%</span>
+                    <span class="label">Arbitrage Profit:</span>
+                    <span class="positive">{edge['arbitrage_profit']:.2f}% guaranteed</span>
+                </div>
+                <div class="row">
+                    <span class="label">Hedge on FanDuel:</span>
+                    <span class="value">{edge['opposite_team']} at {edge['fanduel_opposite_odds']:.2f} ({edge['fanduel_opposite_prob']:.1f}%)</span>
+                </div>
+                <div class="row">
+                    <span class="label">Total Probability:</span>
+                    <span class="value">{edge['total_implied_prob']:.2f}%</span>
                 </div>
                 <div class="method">💡 {edge['recommendation']}</div>
             </div>
