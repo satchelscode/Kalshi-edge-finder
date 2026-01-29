@@ -271,6 +271,16 @@ def find_edges(kalshi_api: KalshiAPI, fanduel_odds: Dict, min_edge: float = 0.00
         
         print(f"\n📊 Market #{markets_checked}: {title}")
         
+        # Parse ticker to determine which team this market is betting on
+        # Format: KXNBAGAME-26JAN29DETPHX-PHX means betting on Phoenix to win
+        ticker_parts = ticker.split('-')
+        if len(ticker_parts) >= 3:
+            team_abbrev = ticker_parts[-1]  # e.g., "PHX", "DET"
+            print(f"   Market is betting on: {team_abbrev}")
+        else:
+            print(f"   ⚠️  Could not parse ticker")
+            continue
+        
         # Get orderbook for this market
         orderbook = kalshi_api.get_orderbook(ticker)
         if not orderbook:
