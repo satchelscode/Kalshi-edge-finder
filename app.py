@@ -272,10 +272,10 @@ def find_edges(kalshi_api: KalshiAPI, fanduel_odds: Dict, min_edge: float = 0.00
         print(f"\n📊 Market #{markets_checked}: {title}")
         
         # Parse ticker to determine which team this market is betting on
-        # Format: KXNBAGAME-26JAN29DETPHX-PHX means betting on Phoenix to win
+        # Format: KXNBAGAME-26JAN29MIACHI-MIA means betting on Miami to win
         ticker_parts = ticker.split('-')
         if len(ticker_parts) >= 3:
-            team_abbrev = ticker_parts[-1]  # e.g., "PHX", "DET"
+            team_abbrev = ticker_parts[-1]  # e.g., "MIA", "CHI"
             print(f"   Market is betting on: {team_abbrev}")
         else:
             print(f"   ⚠️  Could not parse ticker")
@@ -296,23 +296,61 @@ def find_edges(kalshi_api: KalshiAPI, fanduel_odds: Dict, min_edge: float = 0.00
             continue
         
         # Get best YES bid price (highest price someone will pay)
-        # Format: [[price_cents, quantity], ...]
         best_yes_bid = max(yes_bids, key=lambda x: x[0])
         kalshi_price = best_yes_bid[0] / 100  # Convert cents to dollars
-        print(f"   Kalshi price: ${kalshi_price:.2f} (from YES bid: {best_yes_bid[0]}¢)")
+        print(f"   Kalshi price: ${kalshi_price:.2f} (YES on {team_abbrev})")
         
         # Skip illiquid markets
         if kalshi_price <= 0.01 or kalshi_price >= 0.99:
             print(f"   ⚠️  Illiquid (price too extreme)")
             continue
         
-        # Match with FanDuel
-        fd_match = match_kalshi_to_fanduel(title, fanduel_odds)
+        # Map team abbreviation to full team name
+        team_abbrev_map = {
+            'MIA': 'Miami Heat',
+            'CHI': 'Chicago Bulls',
+            'MIL': 'Milwaukee Bucks',
+            'WAS': 'Washington Wizards',
+            'PHI': 'Philadelphia 76ers',
+            'SAC': 'Sacramento Kings',
+            'ATL': 'Atlanta Hawks',
+            'HOU': 'Houston Rockets',
+            'DAL': 'Dallas Mavericks',
+            'CHA': 'Charlotte Hornets',
+            'DET': 'Detroit Pistons',
+            'PHX': 'Phoenix Suns',
+            'BKN': 'Brooklyn Nets',
+            'DEN': 'Denver Nuggets',
+            'MIN': 'Minnesota Timberwolves',
+            'OKC': 'Oklahoma City Thunder',
+            'BOS': 'Boston Celtics',
+            'NYK': 'New York Knicks',
+            'POR': 'Portland Trail Blazers',
+            'LAL': 'Los Angeles Lakers',
+            'LAC': 'LA Clippers',
+            'GSW': 'Golden State Warriors',
+            'UTA': 'Utah Jazz',
+            'MEM': 'Memphis Grizzlies',
+            'NOP': 'New Orleans Pelicans',
+            'ORL': 'Orlando Magic',
+            'TOR': 'Toronto Raptors',
+            'CLE': 'Cleveland Cavaliers',
+        }
         
-        if not fd_match:
+        team_full_name = team_abbrev_map.get(team_abbrev)
+        if not team_full_name:
+            print(f"   ❌ Unknown team abbreviation: {team_abbrev}")
             continue
         
+        # Match with FanDuel by team name
+        if team_full_name not in fanduel_odds:
+            print(f"   ❌ {team_full_name} not in FanDuel odds")
+            continue
+        
+        fd_match = fanduel_odds[team_full_name]
         matches_found += 1
+        
+        print(f"   ✅ Matched: {team_full_name}")
         
         # Calculate edge
         fd_odds = fd_match['odds']
