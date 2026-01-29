@@ -14,8 +14,8 @@ app = Flask(__name__)
 
 # Environment variables
 ODDS_API_KEY = os.getenv('ODDS_API_KEY', '')
-KALSHI_EMAIL = os.getenv('KALSHI_EMAIL', '')
-KALSHI_PASSWORD = os.getenv('KALSHI_PASSWORD', '')
+KALSHI_API_KEY_ID = os.getenv('KALSHI_API_KEY_ID', '')
+KALSHI_PRIVATE_KEY = os.getenv('KALSHI_PRIVATE_KEY', '')
 
 
 class OddsConverter:
@@ -29,47 +29,33 @@ class OddsConverter:
 
 
 class KalshiAuthAPI:
-    """Authenticated Kalshi API client"""
+    """Authenticated Kalshi API client using API keys"""
     
     BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
     
-    def __init__(self, email: str, password: str):
-        self.email = email
-        self.password = password
-        self.token = None
-        self.member_id = None
+    def __init__(self, api_key_id: str, private_key: str):
+        self.api_key_id = api_key_id
+        self.private_key = private_key
         self.session = requests.Session()
         
-        if email and password:
-            self._login()
+        if api_key_id and private_key:
+            self._setup_auth()
     
-    def _login(self):
-        """Authenticate with Kalshi"""
+    def _setup_auth(self):
+        """Setup API key authentication"""
         try:
-            url = f"{self.BASE_URL}/login"
-            payload = {
-                "email": self.email,
-                "password": self.password
-            }
-            response = requests.post(url, json=payload, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            self.token = data.get('token')
-            self.member_id = data.get('member_id')
-            
-            # Set authorization header
+            # Kalshi uses API key ID in the header
             self.session.headers.update({
-                'Authorization': f'Bearer {self.token}',
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
+                'Authorization': f'KALSHI-API-KEY {self.api_key_id}',
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
             })
             
-            print(f"✅ Kalshi authenticated: {self.email}")
+            print(f"✅ Kalshi API configured with key: {self.api_key_id[:8]}...")
             return True
             
         except Exception as e:
-            print(f"❌ Kalshi authentication failed: {e}")
+            print(f"❌ Kalshi API setup failed: {e}")
             return False
     
     def get_markets(self, series_ticker: str = None, limit: int = 200, status: str = 'open') -> List[Dict]:
@@ -292,7 +278,7 @@ def status():
     return jsonify({
         'status': 'running',
         'odds_api_configured': bool(ODDS_API_KEY),
-        'kalshi_configured': bool(KALSHI_EMAIL and KALSHI_PASSWORD),
+        'kalshi_configured': bool(KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY),
         'timestamp': datetime.utcnow().isoformat()
     })
 
@@ -316,15 +302,12 @@ def get_edges():
         if not ODDS_API_KEY:
             return jsonify({'error': 'ODDS_API_KEY not configured'}), 500
         
-        if not (KALSHI_EMAIL and KALSHI_PASSWORD):
-            return jsonify({'error': 'Kalshi credentials not configured'}), 500
+        if not (KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY):
+            return jsonify({'error': 'Kalshi API keys not configured'}), 500
         
         # Initialize APIs
-        print("\n=== AUTHENTICATING ===")
-        kalshi = KalshiAuthAPI(KALSHI_EMAIL, KALSHI_PASSWORD)
-        
-        if not kalshi.token:
-            return jsonify({'error': 'Kalshi authentication failed'}), 500
+        print("\n=== CONFIGURING KALSHI API ===")
+        kalshi = KalshiAuthAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
         
         print("\n=== FETCHING FANDUEL ODDS ===")
         fanduel = FanDuelAPI(ODDS_API_KEY)
