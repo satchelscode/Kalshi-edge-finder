@@ -61,34 +61,50 @@ class KalshiAPI:
     
     def get_markets(self, series_ticker: str = None, limit: int = 200, status: str = 'open') -> List[Dict]:
         """
-        Get markets
+        Get markets with pagination support
         GET /markets
         """
+        all_markets = []
+        cursor = None
+        
         try:
-            url = f"{self.BASE_URL}/markets"
-            params = {
-                'limit': limit,
-                'status': status
-            }
+            while True:
+                url = f"{self.BASE_URL}/markets"
+                params = {
+                    'limit': limit,
+                    'status': status
+                }
+                
+                if series_ticker:
+                    params['series_ticker'] = series_ticker
+                
+                if cursor:
+                    params['cursor'] = cursor
+                
+                response = self.session.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                
+                markets = data.get('markets', [])
+                all_markets.extend(markets)
+                
+                # Check if there's more data
+                cursor = data.get('cursor')
+                if not cursor:
+                    break  # No more pages
+                
+                print(f"   Fetched {len(markets)} markets (total: {len(all_markets)})...")
             
-            if series_ticker:
-                params['series_ticker'] = series_ticker
-            
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            markets = data.get('markets', [])
             series_info = f" from {series_ticker}" if series_ticker else ""
-            print(f"   Fetched {len(markets)} markets{series_info}")
-            return markets
+            print(f"   ✅ Total: {len(all_markets)} markets{series_info}")
+            return all_markets
             
         except requests.exceptions.HTTPError as e:
             print(f"   HTTP Error {e.response.status_code}: {e}")
-            return []
+            return all_markets  # Return what we have so far
         except Exception as e:
             print(f"   Error fetching markets: {e}")
-            return []
+            return all_markets
     
     def get_orderbook(self, ticker: str) -> Optional[Dict]:
         """
