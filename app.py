@@ -3,11 +3,13 @@
 import os
 import requests
 from flask import Flask, render_template, jsonify, request
+from flask_cors import CORS
 from datetime import datetime
 from typing import Dict, List, Optional
 import json
 
 app = Flask(__name__)
+CORS(app)
 
 # Configuration
 ODDS_API_KEY = os.environ.get('ODDS_API_KEY')
@@ -279,26 +281,54 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005):
                 continue
             
             fd_odds = fanduel_odds[team_name]['odds']
-            kalshi_prob = best_price
+            
+            # Calculate Kalshi fees using the correct formula:
+            # Fee = round_up(0.07 × C × P × (1-P))
+            # Where C = contracts, P = price
+            # We'll calculate per-contract effective price
+            
+            P = best_price  # Price per contract (e.g., 0.18)
+            C = 100  # Calculate for 100 contracts as baseline
+            
+            # Kalshi fee formula
+            import math
+            fee_total = math.ceil(0.07 * C * P * (1 - P) * 100) / 100  # Round up to nearest cent
+            fee_per_contract = fee_total / C
+            
+            # Effective cost per contract after fees
+            effective_cost = P + fee_per_contract
+            
+            # Calculate probabilities and edge
+            kalshi_prob_after_fees = effective_cost
             fd_prob = converter.decimal_to_implied_prob(fd_odds)
-            edge = (fd_prob / kalshi_prob) - 1
+            edge = (fd_prob / kalshi_prob_after_fees) - 1
+            
+            # Edge before fees (for comparison)
+            edge_before_fees = (fd_prob / P) - 1
             
             print(f"\n   📊 {team_name}:")
-            print(f"      Kalshi: ${best_price:.2f} ({kalshi_prob*100:.1f}%) - {method}")
+            print(f"      Kalshi: ${P:.2f} ({P*100:.1f}%) - {method}")
+            print(f"      Kalshi fee: ${fee_per_contract:.4f}/contract (${fee_total:.2f} per 100 contracts)")
+            print(f"      Kalshi after fees: ${effective_cost:.4f} ({kalshi_prob_after_fees*100:.2f}%)")
             print(f"      FanDuel: {fd_odds:.2f} ({fd_prob*100:.1f}%)")
-            print(f"      Edge: {edge*100:.2f}%")
+            print(f"      Edge before fees: {edge_before_fees*100:.2f}%")
+            print(f"      Edge after fees: {edge*100:.2f}%")
             
             if edge >= min_edge:
                 edges.append({
                     'game': f"{team1_name} vs {team2_name}",
                     'team': team_name,
                     'kalshi_price': best_price,
-                    'kalshi_prob': kalshi_prob * 100,
+                    'kalshi_fee_per_contract': fee_per_contract,
+                    'kalshi_price_after_fees': effective_cost,
+                    'kalshi_prob': P * 100,
+                    'kalshi_prob_after_fees': kalshi_prob_after_fees * 100,
                     'kalshi_method': method,
                     'fanduel_odds': fd_odds,
                     'fanduel_prob': fd_prob * 100,
-                    'edge': edge * 100,
-                    'recommendation': f"Buy {method} at ${best_price:.2f}"
+                    'edge_before_fees': edge_before_fees * 100,
+                    'edge_after_fees': edge * 100,
+                    'recommendation': f"Buy {method} at ${P:.2f} (${effective_cost:.4f} after fees)"
                 })
                 print(f"      ✅ EDGE FOUND!")
         
