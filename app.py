@@ -260,7 +260,11 @@ def find_edges(kalshi_api: KalshiAPI, fanduel_odds: Dict, min_edge: float = 0.00
     matches_found = 0
     markets_checked = 0
     
-    for market in kalshi_markets[:10]:  # Check first 10 for debugging
+    # Filter for TODAY's games only (26JAN29)
+    today_markets = [m for m in kalshi_markets if '26JAN29' in m.get('ticker', '')]
+    print(f"\n🗓️  TODAY's markets (26JAN29): {len(today_markets)}")
+    
+    for market in today_markets[:20]:  # Check first 20 TODAY's games
         title = market.get('title', '')
         ticker = market.get('ticker', '')
         markets_checked += 1
@@ -378,6 +382,12 @@ def get_edges():
         
         if not fanduel_odds:
             return jsonify({'error': 'Could not fetch FanDuel odds'}), 500
+        
+        # DEBUG: Show FanDuel games
+        print(f"\n📋 FANDUEL GAMES:")
+        for team, data in list(fanduel_odds.items())[:10]:
+            print(f"   - {team}: {data['odds']}")
+        print()
         
         edges = find_edges(kalshi, fanduel_odds, min_edge)
         
