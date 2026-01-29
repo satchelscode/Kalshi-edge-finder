@@ -379,13 +379,14 @@ def find_edges(kalshi_api: KalshiAPI, fanduel_odds: Dict, min_edge: float = 0.00
             edges.append({
                 'kalshi_market': title,
                 'kalshi_ticker': ticker,
+                'kalshi_team': team_full_name,
                 'kalshi_price': kalshi_price,
                 'kalshi_prob': kalshi_prob * 100,
-                'fanduel_team': fd_match['team'],
+                'fanduel_team': team_full_name,
                 'fanduel_odds': fd_odds,
                 'fanduel_prob': fd_prob * 100,
                 'edge': edge * 100,
-                'recommendation': f"Buy YES on Kalshi at ${kalshi_price:.2f}"
+                'recommendation': f"Buy YES on {team_full_name} at ${kalshi_price:.2f} on Kalshi"
             })
     
     print(f"\n✅ RESULTS:")
