@@ -29,6 +29,19 @@ class OddsConverter:
             return 100 / (odds + 100)
         else:
             return abs(odds) / (abs(odds) + 100)
+    
+    @staticmethod
+    def decimal_to_implied_prob(odds: float) -> float:
+        """Convert decimal odds to implied probability"""
+        return 1 / odds
+    
+    @staticmethod
+    def prob_to_american(prob: float) -> int:
+        """Convert probability to American odds"""
+        if prob >= 0.5:
+            return int(-100 * prob / (1 - prob))
+        else:
+            return int(100 * (1 - prob) / prob)
 
 
 class KalshiAPI:
@@ -355,7 +368,7 @@ def find_edges(kalshi_api: KalshiAPI, fanduel_odds: Dict, min_edge: float = 0.00
         # Calculate edge
         fd_odds = fd_match['odds']
         kalshi_prob = kalshi_price
-        fd_prob = converter.american_to_implied_prob(fd_odds)
+        fd_prob = converter.decimal_to_implied_prob(fd_odds)  # Odds API returns DECIMAL odds!
         
         edge = (fd_prob / kalshi_prob) - 1
         
