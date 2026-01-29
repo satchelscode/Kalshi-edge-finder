@@ -45,8 +45,16 @@ class FanDuelAPI:
     
     def get_nba_odds(self) -> Dict:
         """Fetch NBA odds from FanDuel via The Odds API"""
+        return self._get_odds('basketball_nba')
+    
+    def get_ncaab_odds(self) -> Dict:
+        """Fetch NCAAB (college basketball) odds from FanDuel via The Odds API"""
+        return self._get_odds('basketball_ncaab')
+    
+    def _get_odds(self, sport: str) -> Dict:
+        """Generic method to fetch odds for any sport"""
         try:
-            url = f"{self.base_url}/sports/basketball_nba/odds/"
+            url = f"{self.base_url}/sports/{sport}/odds/"
             params = {
                 'apiKey': self.api_key,
                 'regions': 'us',
@@ -73,7 +81,7 @@ class FanDuelAPI:
                                         'team': team_name
                                     }
             
-            print(f"   Fetched {len(odds_dict)} FanDuel NBA odds")
+            print(f"   Fetched {len(odds_dict)} FanDuel {sport.upper()} odds")
             return odds_dict
             
         except Exception as e:
@@ -162,7 +170,7 @@ class KalshiAPI:
             return None
 
 
-def find_edges(kalshi_api, fanduel_odds, min_edge=0.005):
+def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAME'):
     """
     OPTIMIZED: Find arbitrage opportunities by checking BOTH ways to bet on each outcome.
     
@@ -171,6 +179,9 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005):
     2. Buy NO on their opponent
     
     We pick the CHEAPER option and compare against FanDuel.
+    
+    Args:
+        series_ticker: 'KXNBAGAME' for NBA, 'KXNCAABGAME' for NCAA basketball
     """
     converter = OddsConverter()
     edges = []
@@ -191,8 +202,8 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005):
     
     print("\n🔍 FINDING EDGES (OPTIMIZED)")
     
-    # Get all NBA markets
-    kalshi_markets = kalshi_api.get_markets(series_ticker='KXNBAGAME', limit=200)
+    # Get all markets for the specified series
+    kalshi_markets = kalshi_api.get_markets(series_ticker=series_ticker, limit=200)
     
     # Filter for TODAY only
     today_markets = [m for m in kalshi_markets if '26JAN29' in m.get('ticker', '')]
@@ -353,8 +364,9 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005):
 
 @app.route('/')
 def index():
-    """Serve the main page"""
-    return render_template('index.html')
+    """Redirect to debug view (working UI)"""
+    from flask import redirect
+    return redirect('/debug')
 
 
 @app.route('/api/status')
@@ -375,7 +387,7 @@ def scan():
 
 @app.route('/api/edges')
 def get_edges():
-    """Main endpoint - fetch and return edges"""
+    """Main endpoint - fetch and return edges for both NBA and NCAA"""
     try:
         min_edge = float(request.args.get('min_edge', 0.005))
         
@@ -391,15 +403,29 @@ def get_edges():
         
         print("\n=== FETCHING FANDUEL ODDS ===")
         fanduel = FanDuelAPI(ODDS_API_KEY)
-        fanduel_odds = fanduel.get_nba_odds()
         
-        if not fanduel_odds:
-            return jsonify({'error': 'Could not fetch FanDuel odds'}), 500
+        # Fetch both NBA and NCAA odds
+        nba_odds = fanduel.get_nba_odds()
+        ncaab_odds = fanduel.get_ncaab_odds()
         
-        edges = find_edges(kalshi, fanduel_odds, min_edge)
+        all_edges = []
+        
+        # Find NBA arbitrage opportunities
+        if nba_odds:
+            print("\n🏀 CHECKING NBA...")
+            nba_edges = find_edges(kalshi, nba_odds, min_edge, series_ticker='KXNBAGAME')
+            all_edges.extend(nba_edges)
+        
+        # Find NCAA arbitrage opportunities
+        if ncaab_odds:
+            print("\n🏀 CHECKING NCAA BASKETBALL...")
+            ncaab_edges = find_edges(kalshi, ncaab_odds, min_edge, series_ticker='KXNCAABGAME')
+            all_edges.extend(ncaab_edges)
         
         return jsonify({
-            'edges': edges,
+            'edges': all_edges,
+            'nba_count': len([e for e in all_edges if 'NBA' in e.get('sport', 'NBA')]),
+            'ncaab_count': len([e for e in all_edges if 'NCAA' in e.get('sport', '')]),
             'timestamp': datetime.utcnow().isoformat(),
             'min_edge': min_edge
         })
@@ -417,14 +443,33 @@ def debug_view():
     try:
         kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
         fanduel = FanDuelAPI(ODDS_API_KEY)
-        fanduel_odds = fanduel.get_nba_odds()
-        edges = find_edges(kalshi, fanduel_odds, 0.005)
+        
+        # Fetch both NBA and NCAA odds
+        nba_odds = fanduel.get_nba_odds()
+        ncaab_odds = fanduel.get_ncaab_odds()
+        
+        all_edges = []
+        
+        # Find NBA arbitrage
+        if nba_odds:
+            nba_edges = find_edges(kalshi, nba_odds, 0.005, series_ticker='KXNBAGAME')
+            for edge in nba_edges:
+                edge['sport'] = 'NBA'
+            all_edges.extend(nba_edges)
+        
+        # Find NCAA arbitrage
+        if ncaab_odds:
+            ncaab_edges = find_edges(kalshi, ncaab_odds, 0.005, series_ticker='KXNCAABGAME')
+            for edge in ncaab_edges:
+                edge['sport'] = 'NCAA'
+            all_edges.extend(ncaab_edges)
         
         html = """
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Kalshi Edge Finder - Debug View</title>
+            <title>Kalshi Arbitrage Finder - Live</title>
+            <meta http-equiv="refresh" content="30">
             <style>
                 body { 
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
@@ -497,45 +542,69 @@ def debug_view():
                     background: #0f3460;
                     border-radius: 8px;
                 }
+                .sport-badge {
+                    display: inline-block;
+                    padding: 4px 10px;
+                    border-radius: 4px;
+                    font-size: 0.75em;
+                    font-weight: bold;
+                    margin-left: 10px;
+                }
+                .sport-nba { background: #e74c3c; color: white; }
+                .sport-ncaa { background: #3498db; color: white; }
+                .no-arb {
+                    text-align: center;
+                    padding: 60px 20px;
+                    color: #888;
+                    font-size: 1.2em;
+                }
+                .no-arb p { margin: 15px 0; }
             </style>
         </head>
         <body>
             <div class="container">
-                <h1>🎯 Kalshi Edge Finder</h1>
-                <div class="subtitle">Real-time arbitrage opportunities with Kalshi fees included</div>
-                <div class="count">Found <strong style="color: #00ff88;">{count}</strong> profitable edges</div>
-        """.format(count=len(edges))
+                <h1>🎯 Kalshi Arbitrage Finder</h1>
+                <div class="subtitle">TRUE arbitrage opportunities (guaranteed profit) • NBA + NCAA Basketball • Auto-refreshes every 30 seconds</div>
+                <div class="count">
+                    {count_msg}
+                </div>
+        """.format(
+            count_msg=f"Found <strong style='color: #00ff88;'>{len(all_edges)}</strong> arbitrage opportunities! 🎉" if all_edges else "⏳ No arbitrage opportunities right now"
+        )
         
-        for edge in edges:
-            html += f"""
+        if all_edges:
+            for edge in all_edges:
+                sport = edge.get('sport', 'NBA')
+                sport_badge = f"<span class='sport-badge sport-{sport.lower()}'>{sport}</span>"
+                html += f"""
             <div class="edge">
-                <div class="game">{edge['game']}</div>
+                <div class="game">{edge['game']}{sport_badge}</div>
                 <div class="team">{edge['team']}</div>
                 <div class="row">
-                    <span class="label">Kalshi Price:</span>
-                    <span class="value">${edge['kalshi_price']:.2f} ({edge['kalshi_prob']:.1f}%)</span>
+                    <span class="label">Kalshi:</span>
+                    <span class="value">${edge['kalshi_price']:.2f} → ${edge['kalshi_price_after_fees']:.4f} after fees ({edge['kalshi_prob_after_fees']:.2f}%)</span>
                 </div>
                 <div class="row">
-                    <span class="label">Kalshi After Fees:</span>
-                    <span class="value">${edge['kalshi_price_after_fees']:.4f} ({edge['kalshi_prob_after_fees']:.2f}%)</span>
-                </div>
-                <div class="row">
-                    <span class="label">FanDuel:</span>
-                    <span class="value">{edge['fanduel_odds']:.2f} ({edge['fanduel_prob']:.1f}%)</span>
-                </div>
-                <div class="row">
-                    <span class="label">Arbitrage Profit:</span>
-                    <span class="positive">{edge['arbitrage_profit']:.2f}% guaranteed</span>
-                </div>
-                <div class="row">
-                    <span class="label">Hedge on FanDuel:</span>
+                    <span class="label">FanDuel Hedge:</span>
                     <span class="value">{edge['opposite_team']} at {edge['fanduel_opposite_odds']:.2f} ({edge['fanduel_opposite_prob']:.1f}%)</span>
                 </div>
                 <div class="row">
                     <span class="label">Total Probability:</span>
                     <span class="value">{edge['total_implied_prob']:.2f}%</span>
                 </div>
+                <div class="row">
+                    <span class="label">Arbitrage Profit:</span>
+                    <span class="positive">{edge['arbitrage_profit']:.2f}% GUARANTEED</span>
+                </div>
                 <div class="method">💡 {edge['recommendation']}</div>
+            </div>
+            """
+        else:
+            html += """
+            <div class="no-arb">
+                <p>🔍 All markets are currently efficient</p>
+                <p style="font-size: 0.95em; color: #aaa;">No arbitrage opportunities available right now.</p>
+                <p style="font-size: 0.9em; margin-top: 25px; color: #666;">💡 Best times to find arbitrage: during live games (7-10 PM ET)</p>
             </div>
             """
         
