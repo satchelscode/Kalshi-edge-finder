@@ -155,29 +155,36 @@ class KalshiAPI:
             return None
     
     def find_basketball_series(self) -> List[str]:
-        """Find all basketball-related series"""
+        """Find ONLY game series (not awards/props) to avoid rate limits"""
         all_series = self.get_series()
+        
+        # ONLY get actual game markets - reduces from 150+ series to ~3
+        game_keywords = [
+            'Professional Basketball Game',  # KXNBAGAME - NBA games  
+            'College Basketball Game',       # NCAA games
+        ]
+        
         basketball_series = []
-        
-        basketball_keywords = ['basketball', 'nba', 'ncaa', 'college basketball', 
-                               'pro basketball', 'hoops']
-        
         for series in all_series:
-            title = series.get('title', '').lower()
+            title = series.get('title', '')
             ticker = series.get('ticker', '')
             
-            if any(keyword in title for keyword in basketball_keywords):
+            # Exact match only for games
+            if any(keyword in title for keyword in game_keywords):
                 basketball_series.append(ticker)
-                print(f"Found basketball series: {series.get('title')} ({ticker})")
+                print(f"Found game series: {title} ({ticker})")
         
         return basketball_series
     
     def get_all_basketball_markets(self) -> List[Dict]:
-        """Get all basketball markets using series filters"""
+        """Get all basketball GAME markets (not props/awards)"""
         basketball_series = self.find_basketball_series()
+        
+        print(f"\n🏀 Fetching markets from {len(basketball_series)} game series")
         
         all_markets = []
         for series_ticker in basketball_series:
+            time.sleep(0.5)  # Rate limiting - very important!
             markets = self.get_markets_by_series(series_ticker, limit=100)
             all_markets.extend(markets)
             print(f"Found {len(markets)} markets in series {series_ticker}")
@@ -530,6 +537,11 @@ def find_edges() -> tuple[List[Dict], Dict]:
             
             # Match with FanDuel
             matched = match_events(title, fanduel_odds)
+            
+            # DEBUG: Show matching attempts for first 5 markets
+            if debug['matches_found'] < 5 and not matched:
+                print(f"\n❌ NO MATCH: {title[:60]}")
+                print(f"   Sample FanDuel keys: {list(fanduel_odds.keys())[:5]}")
             
             if matched:
                 debug['matches_found'] += 1
