@@ -361,31 +361,73 @@ def match_events(kalshi_title: str, fanduel_odds: Dict) -> Optional[Dict]:
     """Match Kalshi event with FanDuel odds using fuzzy matching"""
     import re
     
+    # NBA team city/nickname mapping
+    nba_teams = {
+        'atlanta': ['hawks', 'atlanta hawks'],
+        'boston': ['celtics', 'boston celtics'],
+        'brooklyn': ['nets', 'brooklyn nets'],
+        'charlotte': ['hornets', 'charlotte hornets'],
+        'chicago': ['bulls', 'chicago bulls'],
+        'cleveland': ['cavaliers', 'cavs', 'cleveland cavaliers'],
+        'dallas': ['mavericks', 'mavs', 'dallas mavericks'],
+        'denver': ['nuggets', 'denver nuggets'],
+        'detroit': ['pistons', 'detroit pistons'],
+        'golden state': ['warriors', 'golden state warriors'],
+        'houston': ['rockets', 'houston rockets'],
+        'indiana': ['pacers', 'indiana pacers'],
+        'los angeles c': ['clippers', 'la clippers', 'los angeles clippers'],
+        'los angeles l': ['lakers', 'la lakers', 'los angeles lakers'],
+        'memphis': ['grizzlies', 'memphis grizzlies'],
+        'miami': ['heat', 'miami heat'],
+        'milwaukee': ['bucks', 'milwaukee bucks'],
+        'minnesota': ['timberwolves', 'wolves', 'minnesota timberwolves'],
+        'new orleans': ['pelicans', 'new orleans pelicans'],
+        'new york': ['knicks', 'new york knicks'],
+        'oklahoma city': ['thunder', 'okc thunder', 'oklahoma city thunder'],
+        'orlando': ['magic', 'orlando magic'],
+        'philadelphia': ['76ers', 'sixers', 'philadelphia 76ers'],
+        'phoenix': ['suns', 'phoenix suns'],
+        'portland': ['trail blazers', 'blazers', 'portland trail blazers'],
+        'sacramento': ['kings', 'sacramento kings'],
+        'san antonio': ['spurs', 'san antonio spurs'],
+        'toronto': ['raptors', 'toronto raptors'],
+        'utah': ['jazz', 'utah jazz'],
+        'washington': ['wizards', 'washington wizards'],
+    }
+    
     kalshi_lower = kalshi_title.lower()
     
-    # FIRST: Try to extract player name from Kalshi title
-    # Pattern: "Will [PLAYER NAME] win/make/be/score..."
+    # FIRST: Try NBA team matching for game markets
+    # Extract city names from Kalshi title (e.g., "Detroit at Phoenix Winner?")
+    for city, team_variations in nba_teams.items():
+        if city in kalshi_lower:
+            # Try to match with FanDuel using team variations
+            for fd_key, fd_data in fanduel_odds.items():
+                fd_lower = fd_key.lower()
+                # Check if any team variation appears in FanDuel key
+                for variation in team_variations:
+                    if variation in fd_lower:
+                        return fd_data
+    
+    # SECOND: Try to extract player name from Kalshi title
     player_match = re.search(r'Will\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+[A-Z][a-z]+)?)\s+(?:win|make|be|score|have)', kalshi_title, re.IGNORECASE)
     
     if player_match:
         player_name = player_match.group(1).strip().lower()
-        # Try to match this player name with FanDuel
         for fd_key, fd_data in fanduel_odds.items():
             fd_key_lower = fd_key.lower()
-            # Check if player name appears in FanDuel key
             if player_name in fd_key_lower or fd_key_lower in player_name:
-                # Additional check: make sure words overlap significantly
                 player_words = set(player_name.split())
                 fd_words = set(fd_key_lower.split())
                 if len(player_words & fd_words) >= min(2, len(player_words)):
                     return fd_data
     
-    # SECOND: Direct match 
+    # THIRD: Direct match 
     for fd_key, fd_data in fanduel_odds.items():
         if fd_key.lower() in kalshi_lower or kalshi_lower in fd_key.lower():
             return fd_data
     
-    # THIRD: Word overlap matching
+    # FOURTH: Word overlap matching
     kalshi_words = set(kalshi_lower.split())
     
     best_match = None
