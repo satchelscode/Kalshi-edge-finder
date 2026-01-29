@@ -1,24 +1,20 @@
-"""
-Kalshi Edge Finder - CORRECT API Key Implementation
-Based on Kalshi API v2 documentation
-"""
+# Copy the entire app_kalshi_correct.py content first, then replace the find_edges function
 
 import os
 import requests
-import time
-import hmac
-import hashlib
-import base64
+from flask import Flask, render_template, jsonify, request
+from flask_cors import CORS
 from datetime import datetime
 from typing import Dict, List, Optional
-from flask import Flask, jsonify, render_template, request
+import json
 
 app = Flask(__name__)
+CORS(app)
 
-# Environment variables
-ODDS_API_KEY = os.getenv('ODDS_API_KEY', '')
-KALSHI_API_KEY_ID = os.getenv('KALSHI_API_KEY_ID', '')
-KALSHI_PRIVATE_KEY = os.getenv('KALSHI_PRIVATE_KEY', '')
+# Configuration
+ODDS_API_KEY = os.environ.get('ODDS_API_KEY')
+KALSHI_API_KEY_ID = os.environ.get('KALSHI_API_KEY_ID')
+KALSHI_PRIVATE_KEY = os.environ.get('KALSHI_PRIVATE_KEY')
 
 
 class OddsConverter:
@@ -44,31 +40,66 @@ class OddsConverter:
             return int(100 * (1 - prob) / prob)
 
 
+class FanDuelAPI:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.the-odds-api.com/v4"
+    
+    def get_nba_odds(self) -> Dict:
+        """Fetch NBA odds from FanDuel via The Odds API"""
+        try:
+            url = f"{self.base_url}/sports/basketball_nba/odds/"
+            params = {
+                'apiKey': self.api_key,
+                'regions': 'us',
+                'markets': 'h2h',
+                'bookmakers': 'fanduel',
+                'oddsFormat': 'decimal'
+            }
+            
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            odds_dict = {}
+            for game in data:
+                for bookmaker in game.get('bookmakers', []):
+                    if bookmaker['key'] == 'fanduel':
+                        for market in bookmaker.get('markets', []):
+                            if market['key'] == 'h2h':
+                                for outcome in market.get('outcomes', []):
+                                    team_name = outcome['name']
+                                    odds = outcome['price']
+                                    odds_dict[team_name] = {
+                                        'odds': odds,
+                                        'team': team_name
+                                    }
+            
+            print(f"   Fetched {len(odds_dict)} FanDuel NBA odds")
+            return odds_dict
+            
+        except Exception as e:
+            print(f"   Error fetching FanDuel odds: {e}")
+            return {}
+
+
 class KalshiAPI:
-    """
-    Kalshi API client using API Key authentication
-    Docs: https://trading-api.readme.io/reference/getting-started
-    """
-    
-    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-    
     def __init__(self, api_key_id: str = None, private_key: str = None):
+        self.BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
         self.api_key_id = api_key_id
         self.private_key = private_key
         self.session = requests.Session()
         
-        # Setup headers
+        # Setup headers (works without authentication for public endpoints)
         headers = {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
+            'Accept': 'application/json'
         }
         
-        # Add API key if provided
         if api_key_id:
             headers['KALSHI-ACCESS-KEY'] = api_key_id
-            print(f"✅ Kalshi API configured with key: {api_key_id[:12]}...")
+            print("   ✅ Using authenticated Kalshi API")
         else:
-            print("⚠️  Using Kalshi public API (no authentication)")
+            print("   ⚠️  Using Kalshi public API (no authentication)")
         
         self.session.headers.update(headers)
     
@@ -121,7 +152,7 @@ class KalshiAPI:
     
     def get_orderbook(self, ticker: str) -> Optional[Dict]:
         """
-        Get orderbook for a market
+        Get orderbook for a specific market
         GET /markets/{ticker}/orderbook
         """
         try:
@@ -131,293 +162,175 @@ class KalshiAPI:
             return response.json()
         except Exception as e:
             return None
+
+
+def find_edges(kalshi_api, fanduel_odds, min_edge=0.005):
+    """
+    OPTIMIZED: Find arbitrage opportunities by checking BOTH ways to bet on each outcome.
     
-    def get_market(self, ticker: str) -> Optional[Dict]:
-        """
-        Get single market details
-        GET /markets/{ticker}
-        """
-        try:
-            url = f"{self.BASE_URL}/markets/{ticker}"
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            return data.get('market')
-        except Exception as e:
-            return None
-
-
-class FanDuelAPI:
-    """Fetch odds from The Odds API for FanDuel"""
+    For each team winning, we can either:
+    1. Buy YES on that team
+    2. Buy NO on their opponent
     
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base_url = "https://api.the-odds-api.com/v4"
-    
-    def get_nba_odds(self) -> Dict:
-        """Get NBA odds from FanDuel"""
-        all_odds = {}
-        
-        try:
-            url = f"{self.base_url}/sports/basketball_nba/odds"
-            params = {
-                'apiKey': self.api_key,
-                'regions': 'us',
-                'markets': 'h2h',
-                'bookmakers': 'fanduel'
-            }
-            response = requests.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            games = response.json()
-            
-            for game in games:
-                for bookmaker in game.get('bookmakers', []):
-                    if bookmaker.get('key') == 'fanduel':
-                        for market in bookmaker.get('markets', []):
-                            if market.get('key') == 'h2h':
-                                for outcome in market.get('outcomes', []):
-                                    team_name = outcome.get('name')
-                                    odds = outcome.get('price')
-                                    
-                                    all_odds[team_name] = {
-                                        'team': team_name,
-                                        'odds': odds,
-                                        'game_id': game.get('id'),
-                                        'commence_time': game.get('commence_time')
-                                    }
-            
-            print(f"   Fetched {len(all_odds)} FanDuel NBA odds")
-            return all_odds
-            
-        except Exception as e:
-            print(f"   Error fetching FanDuel odds: {e}")
-            return {}
-
-
-# NBA team city to full name mapping
-NBA_TEAMS = {
-    'atlanta': 'Atlanta Hawks',
-    'boston': 'Boston Celtics',
-    'brooklyn': 'Brooklyn Nets',
-    'charlotte': 'Charlotte Hornets',
-    'chicago': 'Chicago Bulls',
-    'cleveland': 'Cleveland Cavaliers',
-    'dallas': 'Dallas Mavericks',
-    'denver': 'Denver Nuggets',
-    'detroit': 'Detroit Pistons',
-    'golden state': 'Golden State Warriors',
-    'houston': 'Houston Rockets',
-    'indiana': 'Indiana Pacers',
-    'memphis': 'Memphis Grizzlies',
-    'miami': 'Miami Heat',
-    'milwaukee': 'Milwaukee Bucks',
-    'minnesota': 'Minnesota Timberwolves',
-    'new orleans': 'New Orleans Pelicans',
-    'new york': 'New York Knicks',
-    'oklahoma city': 'Oklahoma City Thunder',
-    'orlando': 'Orlando Magic',
-    'philadelphia': 'Philadelphia 76ers',
-    'phoenix': 'Phoenix Suns',
-    'portland': 'Portland Trail Blazers',
-    'sacramento': 'Sacramento Kings',
-    'san antonio': 'San Antonio Spurs',
-    'toronto': 'Toronto Raptors',
-    'utah': 'Utah Jazz',
-    'washington': 'Washington Wizards',
-    'los angeles': 'Los Angeles Lakers',
-    'la': 'Los Angeles Lakers',
-}
-
-
-def match_kalshi_to_fanduel(kalshi_title: str, fanduel_odds: Dict) -> Optional[Dict]:
-    """Match Kalshi market title to FanDuel team"""
-    title_lower = kalshi_title.lower()
-    
-    # Debug first 3 matches
-    print(f"   Matching: '{kalshi_title[:50]}'")
-    
-    # Try to find city name in title
-    for city, team_name in NBA_TEAMS.items():
-        if city in title_lower:
-            # Check if this team exists in FanDuel
-            if team_name in fanduel_odds:
-                print(f"      ✅ Matched: {city} → {team_name}")
-                return fanduel_odds[team_name]
-    
-    print(f"      ❌ No match found")
-    return None
-
-
-def find_edges(kalshi_api: KalshiAPI, fanduel_odds: Dict, min_edge: float = 0.005) -> List[Dict]:
-    """Find arbitrage edges"""
-    edges = []
+    We pick the CHEAPER option and compare against FanDuel.
+    """
     converter = OddsConverter()
+    edges = []
     
-    print("\n🔍 FINDING EDGES")
+    # Team abbreviation mapping
+    TEAM_MAP = {
+        'MIA': 'Miami Heat', 'CHI': 'Chicago Bulls', 'MIL': 'Milwaukee Bucks',
+        'WAS': 'Washington Wizards', 'PHI': 'Philadelphia 76ers', 'SAC': 'Sacramento Kings',
+        'ATL': 'Atlanta Hawks', 'HOU': 'Houston Rockets', 'DAL': 'Dallas Mavericks',
+        'CHA': 'Charlotte Hornets', 'DET': 'Detroit Pistons', 'PHX': 'Phoenix Suns',
+        'BKN': 'Brooklyn Nets', 'DEN': 'Denver Nuggets', 'MIN': 'Minnesota Timberwolves',
+        'OKC': 'Oklahoma City Thunder', 'BOS': 'Boston Celtics', 'NYK': 'New York Knicks',
+        'POR': 'Portland Trail Blazers', 'LAL': 'Los Angeles Lakers', 'LAC': 'LA Clippers',
+        'GSW': 'Golden State Warriors', 'UTA': 'Utah Jazz', 'MEM': 'Memphis Grizzlies',
+        'NOP': 'New Orleans Pelicans', 'ORL': 'Orlando Magic', 'TOR': 'Toronto Raptors',
+        'CLE': 'Cleveland Cavaliers',
+    }
     
-    # Get NBA game markets from Kalshi
+    print("\n🔍 FINDING EDGES (OPTIMIZED)")
+    
+    # Get all NBA markets
     kalshi_markets = kalshi_api.get_markets(series_ticker='KXNBAGAME', limit=200)
     
-    print(f"   Kalshi markets: {len(kalshi_markets)}")
-    print(f"   FanDuel odds: {len(fanduel_odds)}")
-    
-    # DEBUG: Show ALL market titles
-    print(f"\n📋 ALL KALSHI MARKETS:")
-    for i, market in enumerate(kalshi_markets[:20], 1):
-        title = market.get('title', '')
-        ticker = market.get('ticker', '')
-        print(f"   {i}. {title} ({ticker})")
-    
-    print()
-    
-    matches_found = 0
-    markets_checked = 0
-    
-    # Filter for TODAY's games only (26JAN29)
+    # Filter for TODAY only
     today_markets = [m for m in kalshi_markets if '26JAN29' in m.get('ticker', '')]
-    print(f"\n🗓️  TODAY's markets (26JAN29): {len(today_markets)}")
+    print(f"\n🗓️  TODAY's markets: {len(today_markets)}")
     
-    for market in today_markets[:20]:  # Check first 20 TODAY's games
-        title = market.get('title', '')
+    # Group markets by game
+    games = {}
+    for market in today_markets:
         ticker = market.get('ticker', '')
-        markets_checked += 1
-        
-        print(f"\n📊 Market #{markets_checked}: {title}")
-        
-        # Parse ticker to determine which team this market is betting on
-        # Format: KXNBAGAME-26JAN29MIACHI-MIA means betting on Miami to win
-        ticker_parts = ticker.split('-')
-        if len(ticker_parts) >= 3:
-            team_abbrev = ticker_parts[-1]  # e.g., "MIA", "CHI"
-            print(f"   Market is betting on: {team_abbrev}")
-        else:
-            print(f"   ⚠️  Could not parse ticker")
+        parts = ticker.split('-')
+        if len(parts) < 3:
             continue
         
-        # Get orderbook for this market
-        orderbook = kalshi_api.get_orderbook(ticker)
-        if not orderbook:
-            print(f"   ❌ No orderbook data")
-            continue
+        game_code = parts[1][7:]  # Extract game identifier
+        team_abbrev = parts[2]
         
-        # Extract YES price from orderbook (using BIDS, not asks!)
-        orderbook_data = orderbook.get('orderbook', {})
-        yes_bids = orderbook_data.get('yes', [])
-        
-        if not yes_bids:
-            print(f"   ❌ No YES bids in orderbook")
-            continue
-        
-        # Get best YES bid price (highest price someone will pay)
-        best_yes_bid = max(yes_bids, key=lambda x: x[0])
-        kalshi_price = best_yes_bid[0] / 100  # Convert cents to dollars
-        print(f"   Kalshi price: ${kalshi_price:.2f} (YES on {team_abbrev})")
-        
-        # Skip illiquid markets
-        if kalshi_price <= 0.01 or kalshi_price >= 0.99:
-            print(f"   ⚠️  Illiquid (price too extreme)")
-            continue
-        
-        # Map team abbreviation to full team name
-        team_abbrev_map = {
-            'MIA': 'Miami Heat',
-            'CHI': 'Chicago Bulls',
-            'MIL': 'Milwaukee Bucks',
-            'WAS': 'Washington Wizards',
-            'PHI': 'Philadelphia 76ers',
-            'SAC': 'Sacramento Kings',
-            'ATL': 'Atlanta Hawks',
-            'HOU': 'Houston Rockets',
-            'DAL': 'Dallas Mavericks',
-            'CHA': 'Charlotte Hornets',
-            'DET': 'Detroit Pistons',
-            'PHX': 'Phoenix Suns',
-            'BKN': 'Brooklyn Nets',
-            'DEN': 'Denver Nuggets',
-            'MIN': 'Minnesota Timberwolves',
-            'OKC': 'Oklahoma City Thunder',
-            'BOS': 'Boston Celtics',
-            'NYK': 'New York Knicks',
-            'POR': 'Portland Trail Blazers',
-            'LAL': 'Los Angeles Lakers',
-            'LAC': 'LA Clippers',
-            'GSW': 'Golden State Warriors',
-            'UTA': 'Utah Jazz',
-            'MEM': 'Memphis Grizzlies',
-            'NOP': 'New Orleans Pelicans',
-            'ORL': 'Orlando Magic',
-            'TOR': 'Toronto Raptors',
-            'CLE': 'Cleveland Cavaliers',
-        }
-        
-        team_full_name = team_abbrev_map.get(team_abbrev)
-        if not team_full_name:
-            print(f"   ❌ Unknown team abbreviation: {team_abbrev}")
-            continue
-        
-        # Match with FanDuel by team name
-        if team_full_name not in fanduel_odds:
-            print(f"   ❌ {team_full_name} not in FanDuel odds")
-            continue
-        
-        fd_match = fanduel_odds[team_full_name]
-        matches_found += 1
-        
-        print(f"   ✅ Matched: {team_full_name}")
-        
-        # Calculate edge
-        fd_odds = fd_match['odds']
-        kalshi_prob = kalshi_price
-        fd_prob = converter.decimal_to_implied_prob(fd_odds)  # Odds API returns DECIMAL odds!
-        
-        edge = (fd_prob / kalshi_prob) - 1
-        
-        print(f"   FanDuel odds: {fd_odds} ({fd_prob*100:.1f}%)")
-        print(f"   Edge: {edge*100:.2f}%")
-        
-        if edge >= min_edge:
-            edges.append({
-                'kalshi_market': title,
-                'kalshi_ticker': ticker,
-                'kalshi_team': team_full_name,
-                'kalshi_price': kalshi_price,
-                'kalshi_prob': kalshi_prob * 100,
-                'fanduel_team': team_full_name,
-                'fanduel_odds': fd_odds,
-                'fanduel_prob': fd_prob * 100,
-                'edge': edge * 100,
-                'recommendation': f"Buy YES on {team_full_name} at ${kalshi_price:.2f} on Kalshi"
-            })
+        if game_code not in games:
+            games[game_code] = {}
+        games[game_code][team_abbrev] = market
     
-    print(f"\n✅ RESULTS:")
-    print(f"   Markets checked: {markets_checked}")
-    print(f"   Matches found: {matches_found}")
-    print(f"   Edges found: {len(edges)}")
+    print(f"🏀 Found {len(games)} unique games\n")
     
-    # Sort by edge
-    edges.sort(key=lambda x: x['edge'], reverse=True)
+    # Process each game
+    for game_code, team_markets in games.items():
+        if len(team_markets) != 2:
+            continue
+        
+        team_abbrevs = list(team_markets.keys())
+        team1_abbrev, team2_abbrev = team_abbrevs[0], team_abbrevs[1]
+        team1_name = TEAM_MAP.get(team1_abbrev, team1_abbrev)
+        team2_name = TEAM_MAP.get(team2_abbrev, team2_abbrev)
+        
+        print(f"{'='*60}")
+        print(f"🏀 {team1_name} vs {team2_name}")
+        
+        # Get orderbooks
+        ob1 = kalshi_api.get_orderbook(team_markets[team1_abbrev]['ticker'])
+        ob2 = kalshi_api.get_orderbook(team_markets[team2_abbrev]['ticker'])
+        
+        if not ob1 or not ob2:
+            print(f"   ❌ Missing orderbook\n")
+            continue
+        
+        # Extract prices
+        def get_prices(ob):
+            data = ob.get('orderbook', {})
+            yes_bids = data.get('yes', [])
+            no_bids = data.get('no', [])
+            if not yes_bids or not no_bids:
+                return None, None
+            yes_price = max(yes_bids, key=lambda x: x[0])[0] / 100
+            no_price = max(no_bids, key=lambda x: x[0])[0] / 100
+            return yes_price, no_price
+        
+        team1_yes, team1_no = get_prices(ob1)
+        team2_yes, team2_no = get_prices(ob2)
+        
+        if None in [team1_yes, team1_no, team2_yes, team2_no]:
+            print(f"   ❌ Incomplete prices\n")
+            continue
+        
+        print(f"   {team1_name}: YES={team1_yes:.2f}, NO={team1_no:.2f}")
+        print(f"   {team2_name}: YES={team2_yes:.2f}, NO={team2_no:.2f}")
+        
+        # Find BEST price for each outcome
+        # Team1 winning: buy Team1 YES OR Team2 NO (pick cheaper)
+        team1_best_price = min(team1_yes, team2_no)
+        team1_method = f"YES on {team1_name}" if team1_yes <= team2_no else f"NO on {team2_name}"
+        
+        # Team2 winning: buy Team2 YES OR Team1 NO (pick cheaper)
+        team2_best_price = min(team2_yes, team1_no)
+        team2_method = f"YES on {team2_name}" if team2_yes <= team1_no else f"NO on {team1_name}"
+        
+        print(f"\n   💰 BEST PRICES:")
+        print(f"   {team1_name} wins: ${team1_best_price:.2f} ({team1_method})")
+        print(f"   {team2_name} wins: ${team2_best_price:.2f} ({team2_method})")
+        
+        # Check edges
+        for team_name, best_price, method in [
+            (team1_name, team1_best_price, team1_method),
+            (team2_name, team2_best_price, team2_method)
+        ]:
+            if team_name not in fanduel_odds:
+                continue
+            
+            fd_odds = fanduel_odds[team_name]['odds']
+            kalshi_prob = best_price
+            fd_prob = converter.decimal_to_implied_prob(fd_odds)
+            edge = (fd_prob / kalshi_prob) - 1
+            
+            print(f"\n   📊 {team_name}:")
+            print(f"      Kalshi: ${best_price:.2f} ({kalshi_prob*100:.1f}%) - {method}")
+            print(f"      FanDuel: {fd_odds:.2f} ({fd_prob*100:.1f}%)")
+            print(f"      Edge: {edge*100:.2f}%")
+            
+            if edge >= min_edge:
+                edges.append({
+                    'game': f"{team1_name} vs {team2_name}",
+                    'team': team_name,
+                    'kalshi_price': best_price,
+                    'kalshi_prob': kalshi_prob * 100,
+                    'kalshi_method': method,
+                    'fanduel_odds': fd_odds,
+                    'fanduel_prob': fd_prob * 100,
+                    'edge': edge * 100,
+                    'recommendation': f"Buy {method} at ${best_price:.2f}"
+                })
+                print(f"      ✅ EDGE FOUND!")
+        
+        print()
     
+    print(f"{'='*60}")
+    print(f"✅ Found {len(edges)} edges\n")
     return edges
 
 
 @app.route('/')
 def index():
+    """Serve the main page"""
     return render_template('index.html')
 
 
 @app.route('/api/status')
 def status():
+    """Health check endpoint"""
     return jsonify({
-        'status': 'running',
+        'status': 'ok',
         'odds_api_configured': bool(ODDS_API_KEY),
-        'kalshi_configured': bool(KALSHI_API_KEY_ID),
-        'timestamp': datetime.utcnow().isoformat()
+        'kalshi_authenticated': bool(KALSHI_API_KEY_ID)
     })
 
 
 @app.route('/api/scan', methods=['POST'])
-def start_scan():
-    return jsonify({'status': 'scanning'})
+def scan():
+    """Trigger a new scan"""
+    return jsonify({'message': 'Scan started'})
 
 
 @app.route('/api/edges')
@@ -430,11 +343,9 @@ def get_edges():
         print("STARTING EDGE SCAN")
         print("="*60)
         
-        # Check configuration
         if not ODDS_API_KEY:
             return jsonify({'error': 'ODDS_API_KEY not configured'}), 500
         
-        # Initialize APIs (Kalshi works with or without API key)
         print("\n=== INITIALIZING KALSHI API ===")
         kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
         
@@ -444,12 +355,6 @@ def get_edges():
         
         if not fanduel_odds:
             return jsonify({'error': 'Could not fetch FanDuel odds'}), 500
-        
-        # DEBUG: Show FanDuel games
-        print(f"\n📋 FANDUEL GAMES:")
-        for team, data in list(fanduel_odds.items())[:10]:
-            print(f"   - {team}: {data['odds']}")
-        print()
         
         edges = find_edges(kalshi, fanduel_odds, min_edge)
         
@@ -467,5 +372,4 @@ def get_edges():
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
