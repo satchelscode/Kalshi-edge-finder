@@ -397,5 +397,136 @@ def get_edges():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/debug')
+def debug_view():
+    """Simple HTML view of edges"""
+    try:
+        kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+        fanduel = FanDuelAPI(ODDS_API_KEY)
+        fanduel_odds = fanduel.get_nba_odds()
+        edges = find_edges(kalshi, fanduel_odds, 0.005)
+        
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Kalshi Edge Finder - Debug View</title>
+            <style>
+                body { 
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+                    margin: 0;
+                    padding: 20px;
+                    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    color: #eee;
+                    min-height: 100vh;
+                }
+                .container { max-width: 1200px; margin: 0 auto; }
+                h1 { 
+                    color: #00ff88; 
+                    text-align: center;
+                    font-size: 2.5em;
+                    margin-bottom: 10px;
+                }
+                .subtitle {
+                    text-align: center;
+                    color: #aaa;
+                    margin-bottom: 30px;
+                    font-size: 1.1em;
+                }
+                .edge { 
+                    background: #16213e; 
+                    padding: 20px;
+                    margin: 15px 0; 
+                    border-radius: 12px;
+                    border-left: 4px solid #00ff88;
+                    box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+                }
+                .edge:hover {
+                    transform: translateY(-2px);
+                    box-shadow: 0 6px 12px rgba(0,255,136,0.2);
+                    transition: all 0.3s ease;
+                }
+                .game { 
+                    font-size: 0.9em; 
+                    color: #888; 
+                    margin-bottom: 8px;
+                }
+                .team { 
+                    font-weight: bold; 
+                    color: #ff6b6b; 
+                    font-size: 1.3em;
+                    margin-bottom: 10px;
+                }
+                .row {
+                    display: flex;
+                    justify-content: space-between;
+                    margin: 8px 0;
+                    padding: 8px 0;
+                    border-bottom: 1px solid #2a2a3e;
+                }
+                .label { color: #aaa; }
+                .value { font-weight: 600; }
+                .positive { color: #00ff88; font-weight: bold; font-size: 1.1em; }
+                .method { 
+                    background: #0f3460;
+                    padding: 6px 12px;
+                    border-radius: 6px;
+                    display: inline-block;
+                    margin-top: 10px;
+                    font-size: 0.95em;
+                }
+                .count {
+                    text-align: center;
+                    font-size: 1.2em;
+                    margin: 20px 0;
+                    padding: 15px;
+                    background: #0f3460;
+                    border-radius: 8px;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🎯 Kalshi Edge Finder</h1>
+                <div class="subtitle">Real-time arbitrage opportunities with Kalshi fees included</div>
+                <div class="count">Found <strong style="color: #00ff88;">{count}</strong> profitable edges</div>
+        """.format(count=len(edges))
+        
+        for edge in edges:
+            html += f"""
+            <div class="edge">
+                <div class="game">{edge['game']}</div>
+                <div class="team">{edge['team']}</div>
+                <div class="row">
+                    <span class="label">Kalshi Price:</span>
+                    <span class="value">${edge['kalshi_price']:.2f} ({edge['kalshi_prob']:.1f}%)</span>
+                </div>
+                <div class="row">
+                    <span class="label">Kalshi After Fees:</span>
+                    <span class="value">${edge['kalshi_price_after_fees']:.4f} ({edge['kalshi_prob_after_fees']:.2f}%)</span>
+                </div>
+                <div class="row">
+                    <span class="label">FanDuel:</span>
+                    <span class="value">{edge['fanduel_odds']:.2f} ({edge['fanduel_prob']:.1f}%)</span>
+                </div>
+                <div class="row">
+                    <span class="label">Edge (After Fees):</span>
+                    <span class="positive">{edge['edge_after_fees']:.2f}%</span>
+                </div>
+                <div class="method">💡 {edge['recommendation']}</div>
+            </div>
+            """
+        
+        html += """
+            </div>
+        </body>
+        </html>
+        """
+        return html
+        
+    except Exception as e:
+        return f"<h1 style='color: red;'>Error:</h1><pre>{str(e)}</pre>", 500
+
+
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
