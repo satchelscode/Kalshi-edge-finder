@@ -569,7 +569,7 @@ def debug_view():
         <html>
         <head>
             <title>Kalshi Arbitrage Finder - Live</title>
-            <meta http-equiv="refresh" content="60">
+            <meta http-equiv="refresh" content="300">
             <style>
                 body { 
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
@@ -664,7 +664,7 @@ def debug_view():
         <body>
             <div class="container">
                 <h1>🎯 Kalshi Arbitrage Finder</h1>
-                <div class="subtitle">TRUE arbitrage opportunities (guaranteed profit) • NBA + NCAA Basketball • Auto-refreshes every 30 seconds</div>
+                <div class="subtitle">TRUE arbitrage opportunities (guaranteed profit) • NBA + NCAA Basketball • Auto-refreshes every 5 minutes</div>
                 <div class="count">
         """
         
