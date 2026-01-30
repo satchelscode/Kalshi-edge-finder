@@ -237,8 +237,19 @@ class KalshiAPI:
             url = f"{self.BASE_URL}/markets/{ticker}/orderbook"
             response = self.session.get(url, timeout=10)
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            
+            # Debug: Print first orderbook structure to understand format
+            if not hasattr(self, '_logged_orderbook_structure'):
+                print(f"   🔍 DEBUG Orderbook structure for {ticker}:")
+                print(f"      Keys: {list(data.keys())}")
+                if 'orderbook' in data:
+                    print(f"      Nested under 'orderbook': {list(data['orderbook'].keys())}")
+                self._logged_orderbook_structure = True
+            
+            return data
         except Exception as e:
+            print(f"   ❌ Orderbook error for {ticker}: {e}")
             return None
 
 
@@ -516,11 +527,11 @@ def get_edges():
             nba_edges = find_edges(kalshi, nba_odds, min_edge, series_ticker='KXNBAGAME')
             all_edges.extend(nba_edges)
         
-        # Find NCAA arbitrage
-        if ncaab_odds:
-            print("\n🏀 CHECKING NCAA BASKETBALL...")
-            ncaab_edges = find_edges(kalshi, ncaab_odds, min_edge, series_ticker='KXNCAAMBGAME')
-            all_edges.extend(ncaab_edges)
+        # NCAA temporarily disabled due to Kalshi rate limits
+        # if ncaab_odds:
+        #     print("\n🏀 CHECKING NCAA BASKETBALL...")
+        #     ncaab_edges = find_edges(kalshi, ncaab_odds, min_edge, series_ticker='KXNCAAMBGAME')
+        #     all_edges.extend(ncaab_edges)
         
         return jsonify({
             'edges': all_edges,
@@ -550,19 +561,17 @@ def debug_view():
         
         all_edges = []
         
-        # Find NBA arbitrage
+        # Find NBA arbitrage opportunities
         if nba_odds:
-            nba_edges = find_edges(kalshi, nba_odds, 0.005, series_ticker='KXNBAGAME')
-            for edge in nba_edges:
-                edge['sport'] = 'NBA'
+            print("\n🏀 CHECKING NBA...")
+            nba_edges = find_edges(kalshi, nba_odds, min_edge, series_ticker='KXNBAGAME')
             all_edges.extend(nba_edges)
         
-        # Find NCAA arbitrage
-        if ncaab_odds:
-            ncaab_edges = find_edges(kalshi, ncaab_odds, 0.005, series_ticker='KXNCAAMBGAME')
-            for edge in ncaab_edges:
-                edge['sport'] = 'NCAA'
-            all_edges.extend(ncaab_edges)
+        # NCAA temporarily disabled due to Kalshi rate limits
+        # if ncaab_odds:
+        #     print("\n🏀 CHECKING NCAA BASKETBALL...")
+        #     ncaab_edges = find_edges(kalshi, ncaab_odds, min_edge, series_ticker='KXNCAAMBGAME')
+        #     all_edges.extend(ncaab_edges)
         
         html = """
         <!DOCTYPE html>
@@ -664,7 +673,7 @@ def debug_view():
         <body>
             <div class="container">
                 <h1>🎯 Kalshi Arbitrage Finder</h1>
-                <div class="subtitle">TRUE arbitrage opportunities (guaranteed profit) • NBA + NCAA Basketball • Auto-refreshes every 5 minutes</div>
+                <div class="subtitle">TRUE arbitrage opportunities (guaranteed profit) • NBA Only • Auto-refreshes every 5 minutes</div>
                 <div class="count">
         """
         
