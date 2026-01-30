@@ -6,6 +6,7 @@ from flask import Flask, render_template, jsonify, request
 from datetime import datetime
 from typing import Dict, List, Optional
 import json
+from difflib import SequenceMatcher
 
 app = Flask(__name__)
 
@@ -13,6 +14,73 @@ app = Flask(__name__)
 ODDS_API_KEY = os.environ.get('ODDS_API_KEY')
 KALSHI_API_KEY_ID = os.environ.get('KALSHI_API_KEY_ID')
 KALSHI_PRIVATE_KEY = os.environ.get('KALSHI_PRIVATE_KEY')
+
+# Team name mapping cache (auto-learned over time)
+TEAM_NAME_CACHE_FILE = '/tmp/team_name_cache.json'
+
+def load_team_name_cache():
+    """Load previously learned team name mappings"""
+    try:
+        if os.path.exists(TEAM_NAME_CACHE_FILE):
+            with open(TEAM_NAME_CACHE_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Error loading cache: {e}")
+    return {}
+
+def save_team_name_cache(cache):
+    """Save learned team name mappings"""
+    try:
+        with open(TEAM_NAME_CACHE_FILE, 'w') as f:
+            json.dump(cache, f)
+    except Exception as e:
+        print(f"Error saving cache: {e}")
+
+TEAM_NAME_CACHE = load_team_name_cache()
+
+def fuzzy_match_team(kalshi_name: str, fanduel_teams: List[str], threshold: float = 0.6) -> Optional[str]:
+    """
+    Fuzzy match Kalshi team name to FanDuel team name.
+    Returns the best match if confidence is above threshold.
+    """
+    # Check cache first
+    if kalshi_name in TEAM_NAME_CACHE:
+        cached_match = TEAM_NAME_CACHE[kalshi_name]
+        if cached_match in fanduel_teams:
+            print(f"   📚 Cache hit: {kalshi_name} → {cached_match}")
+            return cached_match
+    
+    best_match = None
+    best_score = 0
+    
+    for fd_team in fanduel_teams:
+        # Calculate similarity
+        score = SequenceMatcher(None, kalshi_name.lower(), fd_team.lower()).ratio()
+        
+        # Also check if kalshi abbreviation appears in fanduel name
+        if kalshi_name.lower() in fd_team.lower():
+            score = max(score, 0.8)
+        
+        # Check if fanduel name contains kalshi name as substring
+        kalshi_words = kalshi_name.lower().split()
+        fd_words = fd_team.lower().split()
+        word_matches = sum(1 for kw in kalshi_words if any(kw in fw for fw in fd_words))
+        if word_matches > 0:
+            score = max(score, 0.5 + (word_matches * 0.2))
+        
+        if score > best_score:
+            best_score = score
+            best_match = fd_team
+    
+    if best_score >= threshold:
+        # Auto-learn this mapping
+        TEAM_NAME_CACHE[kalshi_name] = best_match
+        save_team_name_cache(TEAM_NAME_CACHE)
+        print(f"   🔍 Fuzzy match ({best_score:.2f}): {kalshi_name} → {best_match} [LEARNED]")
+        return best_match
+    
+    print(f"   ❌ No match for {kalshi_name} (best: {best_match} at {best_score:.2f})")
+    return None
 
 
 class OddsConverter:
@@ -296,12 +364,26 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
             # Determine the OPPOSITE team (for FanDuel hedge)
             opposite_team = team2_name if team_name == team1_name else team1_name
             
-            # Check if BOTH teams exist in FanDuel
-            if team_name not in fanduel_odds or opposite_team not in fanduel_odds:
-                continue
+            # Try exact match first, then fuzzy match
+            fd_team_name = team_name
+            fd_opposite_name = opposite_team
+            
+            if team_name not in fanduel_odds:
+                # Try fuzzy matching
+                matched = fuzzy_match_team(team_name, list(fanduel_odds.keys()))
+                if not matched:
+                    continue
+                fd_team_name = matched
+            
+            if opposite_team not in fanduel_odds:
+                # Try fuzzy matching for opposite team
+                matched = fuzzy_match_team(opposite_team, list(fanduel_odds.keys()))
+                if not matched:
+                    continue
+                fd_opposite_name = matched
             
             # Get FanDuel odds for the OPPOSITE outcome (our hedge)
-            fd_opposite_odds = fanduel_odds[opposite_team]['odds']
+            fd_opposite_odds = fanduel_odds[fd_opposite_name]['odds']
             fd_opposite_prob = converter.decimal_to_implied_prob(fd_opposite_odds)
             
             # Calculate Kalshi probability AFTER fees
@@ -331,7 +413,7 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
                 print(f"      Kalshi: ${P:.2f} ({P*100:.1f}%) - {method}")
                 print(f"      Kalshi fee: ${fee_per_contract:.4f}/contract (${fee_total:.2f} per 100 contracts)")
                 print(f"      Kalshi after fees: ${effective_cost:.4f} ({kalshi_prob_after_fees*100:.2f}%)")
-                print(f"      FanDuel {opposite_team}: {fd_opposite_odds:.2f} ({fd_opposite_prob*100:.2f}%)")
+                print(f"      FanDuel {fd_opposite_name}: {fd_opposite_odds:.2f} ({fd_opposite_prob*100:.2f}%)")
                 print(f"      Total implied prob: {total_prob*100:.2f}%")
                 print(f"      🎯 ARBITRAGE: {arbitrage_profit*100:.2f}% guaranteed profit")
                 print(f"      ✅ ARBITRAGE FOUND!")
@@ -339,19 +421,19 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
                 edges.append({
                     'game': f"{team1_name} vs {team2_name}",
                     'team': team_name,
-                    'opposite_team': opposite_team,
+                    'opposite_team': fd_opposite_name,
                     'kalshi_price': best_price,
                     'kalshi_fee_per_contract': fee_per_contract,
                     'kalshi_price_after_fees': effective_cost,
                     'kalshi_prob_after_fees': kalshi_prob_after_fees * 100,
                     'kalshi_method': method,
-                    'fanduel_opposite_team': opposite_team,
+                    'fanduel_opposite_team': fd_opposite_name,
                     'fanduel_opposite_odds': fd_opposite_odds,
                     'fanduel_opposite_prob': fd_opposite_prob * 100,
                     'total_implied_prob': total_prob * 100,
                     'arbitrage_profit': arbitrage_profit * 100,
-                    'recommendation': f"Bet ${best_price:.2f} on {method} (Kalshi) + hedge on {opposite_team} at {fd_opposite_odds:.2f} (FanDuel)",
-                    'strategy': f"1. Buy {method} on Kalshi\n2. Bet {opposite_team} ML on FanDuel"
+                    'recommendation': f"Bet ${best_price:.2f} on {method} (Kalshi) + hedge on {fd_opposite_name} at {fd_opposite_odds:.2f} (FanDuel)",
+                    'strategy': f"1. Buy {method} on Kalshi\n2. Bet {fd_opposite_name} ML on FanDuel"
                 })
             else:
                 # No arbitrage
