@@ -144,6 +144,10 @@ class KalshiAPI:
                     break  # No more pages
                 
                 print(f"   Fetched {len(markets)} markets (total: {len(all_markets)})...")
+                
+                # Add small delay to avoid rate limits
+                import time
+                time.sleep(0.5)  # 500ms delay between requests
             
             series_info = f" from {series_ticker}" if series_ticker else ""
             print(f"   ✅ Total: {len(all_markets)} markets{series_info}")
