@@ -272,7 +272,11 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
         'CLE': 'Cleveland Cavaliers',
     }
     
-    print("\n🔍 FINDING EDGES (OPTIMIZED)")
+    print("\n🔍 FINDING EDGES (OPTIMIZED - FanDuel games only)")
+    
+    # OPTIMIZATION: Only check Kalshi games that exist on FanDuel
+    # This dramatically reduces API calls for NCAA
+    print(f"   🎯 FanDuel has {len(fanduel_odds)} teams - only checking these on Kalshi")
     
     # Get all markets for the specified series
     kalshi_markets = kalshi_api.get_markets(series_ticker=series_ticker, limit=200)
@@ -309,6 +313,14 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
         team1_abbrev, team2_abbrev = team_abbrevs[0], team_abbrevs[1]
         team1_name = TEAM_MAP.get(team1_abbrev, team1_abbrev)
         team2_name = TEAM_MAP.get(team2_abbrev, team2_abbrev)
+        
+        # SKIP if neither team is on FanDuel (saves API calls)
+        team1_on_fd = team1_name in fanduel_odds or fuzzy_match_team(team1_name, list(fanduel_odds.keys()), threshold=0.6)
+        team2_on_fd = team2_name in fanduel_odds or fuzzy_match_team(team2_name, list(fanduel_odds.keys()), threshold=0.6)
+        
+        if not team1_on_fd and not team2_on_fd:
+            print(f"   ⏭️  Skipping {team1_name} vs {team2_name} - not on FanDuel")
+            continue
         
         print(f"{'='*60}")
         print(f"🏀 {team1_name} vs {team2_name}")
