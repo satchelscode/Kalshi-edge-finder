@@ -14,6 +14,8 @@ app = Flask(__name__)
 ODDS_API_KEY = os.environ.get('ODDS_API_KEY')
 KALSHI_API_KEY_ID = os.environ.get('KALSHI_API_KEY_ID')
 KALSHI_PRIVATE_KEY = os.environ.get('KALSHI_PRIVATE_KEY')
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 # Team name mapping cache (auto-learned over time)
 TEAM_NAME_CACHE_FILE = '/tmp/team_name_cache.json'
@@ -81,6 +83,59 @@ def fuzzy_match_team(kalshi_name: str, fanduel_teams: List[str], threshold: floa
     
     print(f"   ❌ No match for {kalshi_name} (best: {best_match} at {best_score:.2f})")
     return None
+
+
+def send_telegram_notification(edge: Dict):
+    """Send Telegram notification for an arbitrage opportunity"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("   ⚠️  Telegram not configured - skipping notification")
+        return
+    
+    try:
+        # Format the message
+        profit_pct = edge['arbitrage_profit']
+        game = edge['game']
+        team = edge['team']
+        kalshi_method = edge['kalshi_method']
+        kalshi_price = edge['kalshi_price']
+        fd_team = edge['fanduel_opposite_team']
+        fd_odds = edge['fanduel_opposite_odds']
+        total_prob = edge['total_implied_prob']
+        
+        message = f"""
+🚨 **ARBITRAGE OPPORTUNITY FOUND!** 🚨
+
+**Game:** {game}
+**Profit:** {profit_pct:.2f}% guaranteed
+
+**Strategy:**
+1️⃣ Kalshi: {kalshi_method} at ${kalshi_price:.2f}
+2️⃣ FanDuel: Bet {fd_team} at {fd_odds:.2f} (HEDGE ONLY IF NEEDED)
+
+**Details:**
+• Total implied probability: {total_prob:.2f}%
+• Kalshi after fees: {edge['kalshi_prob_after_fees']:.2f}%
+• FanDuel opposite: {edge['fanduel_opposite_prob']:.2f}%
+
+🔗 https://kalshi-edge-finder.onrender.com
+"""
+        
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': 'Markdown'
+        }
+        
+        response = requests.post(url, json=payload, timeout=10)
+        
+        if response.status_code == 200:
+            print(f"   ✅ Telegram notification sent!")
+        else:
+            print(f"   ❌ Telegram error: {response.status_code} - {response.text}")
+            
+    except Exception as e:
+        print(f"   ❌ Telegram notification failed: {e}")
 
 
 class OddsConverter:
@@ -441,7 +496,7 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
                 print(f"      🎯 ARBITRAGE: {arbitrage_profit*100:.2f}% guaranteed profit")
                 print(f"      ✅ ARBITRAGE FOUND!")
                 
-                edges.append({
+                edge_data = {
                     'game': f"{team1_name} vs {team2_name}",
                     'team': team_name,
                     'opposite_team': fd_opposite_name,
@@ -457,7 +512,12 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
                     'arbitrage_profit': arbitrage_profit * 100,
                     'recommendation': f"Bet ${best_price:.2f} on {method} (Kalshi) + hedge on {fd_opposite_name} at {fd_opposite_odds:.2f} (FanDuel)",
                     'strategy': f"1. Buy {method} on Kalshi\n2. Bet {fd_opposite_name} ML on FanDuel"
-                })
+                }
+                
+                edges.append(edge_data)
+                
+                # Send Telegram notification
+                send_telegram_notification(edge_data)
             else:
                 # No arbitrage
                 print(f"\n   📊 {team_name}:")
