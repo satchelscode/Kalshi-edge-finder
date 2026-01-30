@@ -560,6 +560,7 @@ def debug_view():
         ncaab_odds = fanduel.get_ncaab_odds()
         
         all_edges = []
+        min_edge = 0.005  # Default threshold
         
         # Find NBA arbitrage opportunities
         if nba_odds:
