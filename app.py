@@ -418,10 +418,10 @@ def get_edges():
             nba_edges = find_edges(kalshi, nba_odds, min_edge, series_ticker='KXNBAGAME')
             all_edges.extend(nba_edges)
         
-        # Find NCAA arbitrage opportunities
+        # Find NCAA arbitrage
         if ncaab_odds:
             print("\n🏀 CHECKING NCAA BASKETBALL...")
-            ncaab_edges = find_edges(kalshi, ncaab_odds, min_edge, series_ticker='KXNCAABGAME')
+            ncaab_edges = find_edges(kalshi, ncaab_odds, min_edge, series_ticker='KXNCAAMBGAME')
             all_edges.extend(ncaab_edges)
         
         return jsonify({
@@ -461,7 +461,7 @@ def debug_view():
         
         # Find NCAA arbitrage
         if ncaab_odds:
-            ncaab_edges = find_edges(kalshi, ncaab_odds, 0.005, series_ticker='KXNCAABGAME')
+            ncaab_edges = find_edges(kalshi, ncaab_odds, 0.005, series_ticker='KXNCAAMBGAME')
             for edge in ncaab_edges:
                 edge['sport'] = 'NCAA'
             all_edges.extend(ncaab_edges)
@@ -471,7 +471,7 @@ def debug_view():
         <html>
         <head>
             <title>Kalshi Arbitrage Finder - Live</title>
-            <meta http-equiv="refresh" content="30">
+            <meta http-equiv="refresh" content="60">
             <style>
                 body { 
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
