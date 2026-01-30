@@ -175,15 +175,24 @@ class FanDuelAPI:
         return self._get_odds('basketball_ncaab')
     
     def _get_odds(self, sport: str) -> Dict:
-        """Generic method to fetch odds for any sport"""
+        """Generic method to fetch odds for any sport - filtered to TODAY's games only"""
         try:
+            # Filter to only today's games (UTC) to avoid matching
+            # today's Kalshi markets with tomorrow's FanDuel games
+            from datetime import datetime, timezone, timedelta
+            now_utc = datetime.now(timezone.utc)
+            start_of_today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_of_today = start_of_today + timedelta(days=1)
+
             url = f"{self.base_url}/sports/{sport}/odds/"
             params = {
                 'apiKey': self.api_key,
                 'regions': 'us',
                 'markets': 'h2h',
                 'bookmakers': 'fanduel',
-                'oddsFormat': 'decimal'
+                'oddsFormat': 'decimal',
+                'commenceTimeFrom': start_of_today.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'commenceTimeTo': end_of_today.strftime('%Y-%m-%dT%H:%M:%SZ')
             }
             
             response = requests.get(url, params=params, timeout=10)
@@ -204,7 +213,7 @@ class FanDuelAPI:
                                         'team': team_name
                                     }
             
-            print(f"   Fetched {len(odds_dict)} FanDuel {sport.upper()} odds")
+            print(f"   Fetched {len(odds_dict)} FanDuel {sport.upper()} odds (today only: {start_of_today.strftime('%Y-%m-%d')})")
             return odds_dict
             
         except Exception as e:
