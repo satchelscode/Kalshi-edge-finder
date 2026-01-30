@@ -3,11 +3,13 @@
 import os
 import requests
 from flask import Flask, render_template, jsonify, request
+from flask_cors import CORS
 from datetime import datetime
 from typing import Dict, List, Optional
 import json
 
 app = Flask(__name__)
+CORS(app)
 
 # Configuration
 ODDS_API_KEY = os.environ.get('ODDS_API_KEY')
@@ -205,9 +207,11 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
     # Get all markets for the specified series
     kalshi_markets = kalshi_api.get_markets(series_ticker=series_ticker, limit=200)
     
-    # Filter for TODAY only
-    today_markets = [m for m in kalshi_markets if '26JAN29' in m.get('ticker', '')]
-    print(f"\n🗓️  TODAY's markets: {len(today_markets)}")
+    # Filter for TODAY only - dynamically generate today's date code
+    from datetime import datetime
+    today_str = datetime.utcnow().strftime('%y%b%d').upper()  # e.g., "26JAN30"
+    today_markets = [m for m in kalshi_markets if today_str in m.get('ticker', '')]
+    print(f"\n🗓️  TODAY's markets ({today_str}): {len(today_markets)}")
     
     # Group markets by game
     games = {}
@@ -566,11 +570,17 @@ def debug_view():
                 <h1>🎯 Kalshi Arbitrage Finder</h1>
                 <div class="subtitle">TRUE arbitrage opportunities (guaranteed profit) • NBA + NCAA Basketball • Auto-refreshes every 30 seconds</div>
                 <div class="count">
-                    {count_msg}
+        """
+        
+        # Add count message
+        if all_edges:
+            html += f"Found <strong style='color: #00ff88;'>{len(all_edges)}</strong> arbitrage opportunities! 🎉"
+        else:
+            html += "⏳ No arbitrage opportunities right now"
+        
+        html += """
                 </div>
-        """.format(
-            count_msg=f"Found <strong style='color: #00ff88;'>{len(all_edges)}</strong> arbitrage opportunities! 🎉" if all_edges else "⏳ No arbitrage opportunities right now"
-        )
+        """
         
         if all_edges:
             for edge in all_edges:
