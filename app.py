@@ -2974,6 +2974,10 @@ def history_page():
 
         settlements = kalshi.get_settlements()
 
+        # Only show settlements from Jan 31, 2026 onwards (when bot started)
+        bot_start = '2026-01-31T00:00:00Z'
+        settlements = [s for s in settlements if (s.get('settled_time', '') or '') >= bot_start]
+
         # Fetch market details for readable names (batch, with caching)
         market_cache = {}
         for s in settlements[:100]:  # Limit API calls
