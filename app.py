@@ -1932,15 +1932,50 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
         return f"<h1 style='color:red'>Error</h1><pre>{e}</pre>", 500
 
 
+def _lookup_team_name(abbrev: str) -> Optional[str]:
+    """Look up full team name from abbreviation across all sport configs."""
+    for sports_map in [MONEYLINE_SPORTS, SPREAD_SPORTS]:
+        for _, v in sports_map.items():
+            tmap = v[2] if len(v) > 2 else {}
+            if abbrev in tmap:
+                return tmap[abbrev]
+    return None
+
+
+def _parse_ticker_teams(ticker: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Parse ticker to extract team abbreviation, opponent abbreviation, and game name.
+    e.g. KXNCAAMBGAME-26JAN31BALLTOL-TOL -> ('TOL', 'BALL', 'Ball St. at Toledo')
+    Returns (team_abbrev, opp_abbrev, game_display) or (None, None, None)."""
+    parts = ticker.split('-')
+    if len(parts) < 3:
+        return None, None, None
+
+    team_abbrev = parts[-1]
+    game_part = parts[1]
+
+    date_match = re.match(r'\d{2}[A-Z]{3}\d{2}', game_part)
+    if not date_match:
+        return team_abbrev, None, None
+
+    teams_str = game_part[len(date_match.group(0)):]
+    opp_abbrev = teams_str.replace(team_abbrev, '', 1).strip()
+    if not opp_abbrev:
+        return team_abbrev, None, None
+
+    team_name = _lookup_team_name(team_abbrev) or team_abbrev
+    opp_name = _lookup_team_name(opp_abbrev) or opp_abbrev
+
+    return team_abbrev, opp_abbrev, f"{opp_name} at {team_name}"
+
+
 def _describe_position(market_info: Optional[Dict], ticker: str, side: str) -> Tuple[str, str, str]:
     """Build human-readable bet description from market info and side.
-    Returns (bet_description, market_type_tag, subtitle)."""
+    Returns (bet_description, market_type_tag, game_subtitle)."""
     if not market_info:
         return f"{side} · {ticker}", '', ''
 
     title = market_info.get('title', '') or ''
     subtitle = market_info.get('subtitle', '') or ''
-    event_ticker = market_info.get('event_ticker', '') or ''
     series_ticker = (market_info.get('series_ticker', '') or ticker).upper()
 
     # Determine market type from series ticker
@@ -1955,65 +1990,80 @@ def _describe_position(market_info: Optional[Dict], ticker: str, side: str) -> T
     else:
         mtype = 'Prop' if ':' in title else 'Market'
 
-    # For moneyline: title is usually the team name like "Toledo Rockets"
-    # YES on Toledo = Toledo ML. NO on Toledo = opponent ML.
-    if side == 'NO' and mtype == 'Moneyline':
-        # Try to get the opponent from the event (ticker has both team abbrevs)
-        # e.g., KXNCAAMBGAME-26JAN31BALLTOL-TOL -> the other team is BALL
-        parts = ticker.split('-')
-        if len(parts) >= 3:
-            team_abbrev = parts[-1]
-            game_part = parts[1] if len(parts) >= 2 else ''
-            # Remove date prefix from game_part to get team codes
-            date_match = re.match(r'\d{2}[A-Z]{3}\d{2}', game_part)
-            if date_match:
-                teams_str = game_part[len(date_match.group(0)):]
-                # teams_str is like "BALLTOL" and team_abbrev is "TOL"
-                opp_abbrev = teams_str.replace(team_abbrev, '', 1).strip()
-                if opp_abbrev:
-                    # Look up full name from any team map
-                    opp_name = None
-                    for sports_map in [MONEYLINE_SPORTS, SPREAD_SPORTS]:
-                        for _, v in sports_map.items():
-                            tmap = v[2] if len(v) > 2 else {}
-                            if opp_abbrev in tmap:
-                                opp_name = tmap[opp_abbrev]
-                                break
-                        if opp_name:
-                            break
-                    desc = f"{opp_name or opp_abbrev} ML"
-                    return desc, mtype, subtitle or title
-        desc = f"NOT {title}" if title else f"NO · {ticker}"
-        return desc, mtype, subtitle
+    # Parse teams from ticker for moneyline/total/spread
+    team_abbrev, opp_abbrev, game_display = _parse_ticker_teams(ticker)
 
-    elif side == 'YES' and mtype == 'Moneyline':
-        return f"{title} ML" if title else f"YES · {ticker}", mtype, subtitle
+    if mtype == 'Moneyline':
+        if side == 'NO' and opp_abbrev:
+            # NO on TOL = betting on BALL (opponent wins)
+            opp_name = _lookup_team_name(opp_abbrev) or opp_abbrev
+            return f"{opp_name} ML", mtype, game_display or subtitle
+        elif side == 'YES' and team_abbrev:
+            team_name = _lookup_team_name(team_abbrev) or team_abbrev
+            return f"{team_name} ML", mtype, game_display or subtitle
+        # Fallback: use title
+        if side == 'NO':
+            return f"NOT {title}", mtype, subtitle
+        return f"{title} ML", mtype, subtitle
 
     elif mtype == 'Spread':
+        # title from Kalshi is usually like "Team wins by X+"
         if side == 'YES':
-            return f"{title}" if title else f"YES · {ticker}", mtype, subtitle
+            return title or f"YES · {ticker}", mtype, game_display or subtitle
         else:
-            return f"NOT {title}" if title else f"NO · {ticker}", mtype, subtitle
+            return f"NOT {title}" if title else f"NO · {ticker}", mtype, game_display or subtitle
 
     elif mtype == 'Total':
-        # title might be like "Over 231.5" or subtitle has the line
-        if side == 'YES':
-            return f"Over {subtitle or title}", mtype, ''
+        # Extract line from ticker: KXNBATOTAL-26JAN31SASCHA-231 -> 231 -> 231.5
+        parts = ticker.split('-')
+        line_str = parts[-1] if len(parts) >= 3 else ''
+        try:
+            line = float(line_str) + 0.5
+            line_display = f"{line:g}"
+        except ValueError:
+            line_display = subtitle or title
+
+        # Build game name from ticker teams
+        if len(parts) >= 3:
+            gp = parts[1]
+            dm = re.match(r'\d{2}[A-Z]{3}\d{2}', gp)
+            if dm:
+                teams_str = gp[len(dm.group(0)):]
+                # For totals, teams_str is like "SASCHA" - split into two team abbrevs
+                # Try all known abbrevs to split
+                game_name = None
+                for length in range(2, len(teams_str) - 1):
+                    t1 = teams_str[:length]
+                    t2 = teams_str[length:]
+                    n1 = _lookup_team_name(t1)
+                    n2 = _lookup_team_name(t2)
+                    if n1 and n2:
+                        game_name = f"{n1} at {n2}"
+                        break
+                if not game_name:
+                    game_name = game_display or subtitle
+            else:
+                game_name = subtitle
         else:
-            return f"Under {subtitle or title}", mtype, ''
+            game_name = subtitle
+
+        if side == 'YES':
+            return f"Over {line_display}", mtype, game_name or ''
+        else:
+            return f"Under {line_display}", mtype, game_name or ''
 
     elif mtype == 'BTTS':
         if side == 'YES':
-            return "Both Teams Score", mtype, subtitle or title
+            return "Both Teams Score", mtype, game_display or subtitle or title
         else:
-            return "Both Teams Don't Score", mtype, subtitle or title
+            return "Both Teams Don't Score", mtype, game_display or subtitle or title
 
     elif ':' in title:
         # Player prop like "Stephon Castle: 8+"
         if side == 'YES':
-            return f"{title}", 'Prop', subtitle
+            return title, 'Prop', game_display or subtitle
         else:
-            return f"NOT {title}", 'Prop', subtitle
+            return f"NOT {title}", 'Prop', game_display or subtitle
 
     # Fallback
     return f"{side} · {title or ticker}", mtype, subtitle
