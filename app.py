@@ -188,6 +188,22 @@ class OrderTracker:
     def has_position(self, ticker: str) -> bool:
         return ticker in self._session_tickers or ticker in self._api_tickers
 
+    def has_game_position(self, ticker: str) -> bool:
+        """Check if we already have ANY position in this game/event.
+        Prevents betting both sides of the same game.
+        e.g. if we have KXNBAGAME-26JAN31SASCHA-SAS, this returns True
+        for KXNBAGAME-26JAN31SASCHA-CHA (same game, different team)."""
+        # Extract game code: everything except the last segment after the last dash
+        parts = ticker.split('-')
+        if len(parts) < 3:
+            return self.has_position(ticker)
+        game_prefix = '-'.join(parts[:-1])  # e.g. KXNBAGAME-26JAN31SASCHA
+        all_tickers = self._session_tickers | self._api_tickers
+        for t in all_tickers:
+            if t.startswith(game_prefix):
+                return True
+        return False
+
     def can_trade(self) -> bool:
         total = len(self._session_tickers | self._api_tickers)
         return total < MAX_POSITIONS
@@ -446,8 +462,9 @@ def auto_trade_edge(edge: Dict, kalshi_api) -> Optional[Dict]:
     if not ticker or not side:
         return None
 
-    # Skip if we already have a position on this ticker
-    if _order_tracker.has_position(ticker):
+    # Skip if we already have a position on this ticker or same game
+    # (prevents betting both sides of the same game)
+    if _order_tracker.has_game_position(ticker):
         return None
 
     # Check position limit
@@ -1138,6 +1155,8 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
             entries.append((t2_name, t1_no, f"NO on {t1_name}", fd_t1,
                            team_markets[abbrevs[0]]['ticker'], 'no'))
 
+        # Evaluate both entries, pick only the best edge per game
+        game_edges = []
         for name, best_p, method, fd_opp, trade_ticker, trade_side in entries:
             fee = kalshi_fee(best_p)
             eff = best_p + fee
@@ -1165,9 +1184,15 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                     'is_live': game_live,
                     'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (FanDuel: {fd_opp} at {fanduel_odds[fd_opp]['odds']:.2f})",
                 }
-                edges.append(edge)
-                send_telegram_notification(edge)
-                auto_trade_edge(edge, kalshi_api)
+                game_edges.append(edge)
+
+        # Only trade the best edge per game (don't bet both sides)
+        if game_edges:
+            game_edges.sort(key=lambda e: e['arbitrage_profit'], reverse=True)
+            best_edge = game_edges[0]
+            edges.append(best_edge)
+            send_telegram_notification(best_edge)
+            auto_trade_edge(best_edge, kalshi_api)
     return edges
 
 
@@ -1975,6 +2000,7 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
             entries.append((p2['name'], p1_no, f"NO on {p1['name']}", fd_p1_name,
                            p1['market']['ticker'], 'no'))
 
+        match_edges = []
         for name, best_p, method, fd_opp_name, trade_ticker, trade_side in entries:
             fee = kalshi_fee(best_p)
             eff = best_p + fee
@@ -2005,9 +2031,14 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
                     'is_live': game_live,
                     'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (FanDuel: {fd_opp_name} at {fd_opp_data['odds']:.2f})",
                 }
-                edges.append(edge)
-                send_telegram_notification(edge)
-                auto_trade_edge(edge, kalshi_api)
+                match_edges.append(edge)
+        # Only trade the best edge per match to avoid betting both sides
+        if match_edges:
+            match_edges.sort(key=lambda e: e['arbitrage_profit'], reverse=True)
+            best_edge = match_edges[0]
+            edges.append(best_edge)
+            send_telegram_notification(best_edge)
+            auto_trade_edge(best_edge, kalshi_api)
 
     return edges
 
