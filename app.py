@@ -5,6 +5,7 @@ import time
 import re
 import base64
 import hashlib
+import threading
 from flask import Flask, render_template, jsonify, request, redirect
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -178,6 +179,18 @@ class OrderTracker:
 
 # Global order tracker instance
 _order_tracker = OrderTracker()
+
+# Background scanner state
+_scan_lock = threading.Lock()
+_scan_cache = {
+    'edges': [],
+    'sports_scanned': [],
+    'sports_with_games': [],
+    'timestamp': None,
+    'scan_count': 0,
+    'is_scanning': False,
+}
+SCAN_REST_SECONDS = 30  # Rest between scans
 
 # Team name mapping cache
 TEAM_NAME_CACHE_FILE = '/tmp/team_name_cache.json'
@@ -468,6 +481,7 @@ class OddsConverter:
     @staticmethod
     def decimal_to_implied_prob(odds: float) -> float:
         return 1 / odds
+
 
 
 class FanDuelAPI:
@@ -1714,6 +1728,54 @@ def scan_all_sports(kalshi_api, fanduel_api):
 
 
 # ============================================================
+# BACKGROUND SCANNER
+# ============================================================
+
+def _background_scan_loop():
+    """Runs continuously in a background thread. Scans, rests 30s, repeats."""
+    global _scan_cache
+    print("Background scanner started")
+    while True:
+        try:
+            with _scan_lock:
+                _scan_cache['is_scanning'] = True
+
+            kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+            fanduel = FanDuelAPI(ODDS_API_KEY)
+            all_edges, scanned, active = scan_all_sports(kalshi, fanduel)
+
+            with _scan_lock:
+                _scan_cache['edges'] = all_edges
+                _scan_cache['sports_scanned'] = scanned
+                _scan_cache['sports_with_games'] = active
+                _scan_cache['timestamp'] = datetime.utcnow().isoformat()
+                _scan_cache['scan_count'] += 1
+                _scan_cache['is_scanning'] = False
+
+            print(f"Background scan #{_scan_cache['scan_count']} complete: {len(all_edges)} edges. Resting {SCAN_REST_SECONDS}s...")
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Background scan error: {e}")
+            with _scan_lock:
+                _scan_cache['is_scanning'] = False
+
+        time.sleep(SCAN_REST_SECONDS)
+
+
+def start_background_scanner():
+    """Start the background scanner thread (called once on app boot)."""
+    t = threading.Thread(target=_background_scan_loop, daemon=True)
+    t.start()
+    print("Background scanner thread launched")
+
+
+# Start scanner when module loads (gunicorn will call this)
+start_background_scanner()
+
+
+# ============================================================
 # ROUTES
 # ============================================================
 
@@ -1738,29 +1800,29 @@ def status():
 
 @app.route('/api/edges')
 def get_edges():
-    try:
-        kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
-        fanduel = FanDuelAPI(ODDS_API_KEY)
-        all_edges, scanned, active = scan_all_sports(kalshi, fanduel)
-        return jsonify({
-            'edges': all_edges,
-            'total_count': len(all_edges),
-            'sports_scanned': scanned,
-            'sports_with_games': active,
-            'timestamp': datetime.utcnow().isoformat(),
-        })
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+    with _scan_lock:
+        cache = dict(_scan_cache)
+    return jsonify({
+        'edges': cache['edges'],
+        'total_count': len(cache['edges']),
+        'sports_scanned': cache['sports_scanned'],
+        'sports_with_games': cache['sports_with_games'],
+        'timestamp': cache['timestamp'],
+        'scan_count': cache['scan_count'],
+        'is_scanning': cache['is_scanning'],
+    })
 
 
 @app.route('/debug')
 def debug_view():
     try:
-        kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
-        fanduel = FanDuelAPI(ODDS_API_KEY)
-        all_edges, scanned, active = scan_all_sports(kalshi, fanduel)
+        with _scan_lock:
+            all_edges = list(_scan_cache['edges'])
+            scanned = list(_scan_cache['sports_scanned'])
+            active = list(_scan_cache['sports_with_games'])
+            scan_ts = _scan_cache['timestamp']
+            scan_count = _scan_cache['scan_count']
+            is_scanning = _scan_cache['is_scanning']
 
         type_colors = {
             'Moneyline': '#e74c3c', 'Spread': '#3498db',
@@ -1771,7 +1833,7 @@ def debug_view():
         html = f"""<!DOCTYPE html>
 <html><head>
 <title>Kalshi Edge Finder</title>
-<meta http-equiv="refresh" content="300">
+<meta http-equiv="refresh" content="30">
 <style>
 body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #1a1a2e, #16213e); color: #eee; min-height: 100vh; }}
 .container {{ max-width: 1200px; margin: 0 auto; }}
@@ -1791,7 +1853,7 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
 .no-edge {{ text-align: center; padding: 50px 20px; color: #888; }}
 </style></head><body><div class="container">
 <h1>Kalshi Edge Finder</h1>
-<div class="sub">Moneylines + Spreads + Totals + Player Props + BTTS | Auto-refresh 5min | <a href="/orders" style="color:#3498db">View Orders ({_order_tracker.get_open_count()})</a></div>
+<div class="sub">Background Scanner: Scan #{scan_count} {'🔄 SCANNING...' if is_scanning else '✓ idle'} | Last: {scan_ts[:19] if scan_ts else 'waiting...'} | <a href="/orders" style="color:#3498db">Orders ({_order_tracker.get_open_count()})</a></div>
 <div class="info">Scanning: {', '.join(scanned)} | Active: {', '.join(active) if active else 'None'}</div>
 <div class="count">"""
 
