@@ -151,8 +151,9 @@ TENNIS_SPORTS = {
 
 # Auto-trade configuration
 AUTO_TRADE_ENABLED = True
-MAX_POSITIONS = 40
+MAX_POSITIONS = 999  # No practical limit
 TARGET_PROFIT = 1.00  # Target $1 profit per trade
+MIN_EDGE_PERCENT = 1.5  # Skip edges below this % (fees/slippage eat small edges)
 
 # Track which edges we've already notified about
 _notified_edges = set()
@@ -187,6 +188,22 @@ class OrderTracker:
 
     def has_position(self, ticker: str) -> bool:
         return ticker in self._session_tickers or ticker in self._api_tickers
+
+    def has_game_position(self, ticker: str) -> bool:
+        """Check if we already have ANY position in this game/event.
+        Prevents betting both sides of the same game.
+        e.g. if we have KXNBAGAME-26JAN31SASCHA-SAS, this returns True
+        for KXNBAGAME-26JAN31SASCHA-CHA (same game, different team)."""
+        # Extract game code: everything except the last segment after the last dash
+        parts = ticker.split('-')
+        if len(parts) < 3:
+            return self.has_position(ticker)
+        game_prefix = '-'.join(parts[:-1])  # e.g. KXNBAGAME-26JAN31SASCHA
+        all_tickers = self._session_tickers | self._api_tickers
+        for t in all_tickers:
+            if t.startswith(game_prefix):
+                return True
+        return False
 
     def can_trade(self) -> bool:
         total = len(self._session_tickers | self._api_tickers)
@@ -317,11 +334,16 @@ def _match_player_name(kalshi_name: str, fd_name: str) -> bool:
     f_parts = f.split()
     if k_parts and f_parts:
         if k_parts[-1] == f_parts[-1]:  # Same last name
-            # Also check first initial or first name
-            if k_parts[0][0] == f_parts[0][0]:
+            # Require first name to match (not just initial) to avoid
+            # false matches like Amen Thompson vs Ausar Thompson
+            if k_parts[0] == f_parts[0]:
                 return True
+            # Allow match if first 3+ chars match (handles nicknames)
+            if len(k_parts[0]) >= 3 and len(f_parts[0]) >= 3 and k_parts[0][:3] == f_parts[0][:3]:
+                return True
+    # Strict fuzzy match as last resort
     score = SequenceMatcher(None, k, f).ratio()
-    return score >= 0.75
+    return score >= 0.85
 
 
 def kalshi_fee(price: float, contracts: int = 100) -> float:
@@ -366,6 +388,9 @@ def are_odds_stale(commence_time_str: str, last_update_str: str) -> bool:
 
 def send_telegram_notification(edge: Dict):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    # Don't notify for edges below the minimum threshold
+    if edge.get('arbitrage_profit', 0) < MIN_EDGE_PERCENT:
         return
     edge_key = f"{edge.get('market_type','')}{edge['game']}_{edge['team']}_{edge['arbitrage_profit']:.1f}"
     if edge_key in _notified_edges:
@@ -441,8 +466,15 @@ def auto_trade_edge(edge: Dict, kalshi_api) -> Optional[Dict]:
     if not ticker or not side:
         return None
 
-    # Skip if we already have a position on this ticker
-    if _order_tracker.has_position(ticker):
+    # Skip if we already have a position on this ticker or same game
+    # (prevents betting both sides of the same game)
+    if _order_tracker.has_game_position(ticker):
+        return None
+
+    # Skip edges below minimum threshold
+    edge_pct = edge.get('arbitrage_profit', 0)
+    if edge_pct < MIN_EDGE_PERCENT:
+        print(f"   >>> Edge {edge_pct:.2f}% below minimum {MIN_EDGE_PERCENT}%, skipping {ticker}")
         return None
 
     # Check position limit
@@ -1133,6 +1165,8 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
             entries.append((t2_name, t1_no, f"NO on {t1_name}", fd_t1,
                            team_markets[abbrevs[0]]['ticker'], 'no'))
 
+        # Evaluate both entries, pick only the best edge per game
+        game_edges = []
         for name, best_p, method, fd_opp, trade_ticker, trade_side in entries:
             fee = kalshi_fee(best_p)
             eff = best_p + fee
@@ -1160,9 +1194,15 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                     'is_live': game_live,
                     'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (FanDuel: {fd_opp} at {fanduel_odds[fd_opp]['odds']:.2f})",
                 }
-                edges.append(edge)
-                send_telegram_notification(edge)
-                auto_trade_edge(edge, kalshi_api)
+                game_edges.append(edge)
+
+        # Only trade the best edge per game (don't bet both sides)
+        if game_edges:
+            game_edges.sort(key=lambda e: e['arbitrage_profit'], reverse=True)
+            best_edge = game_edges[0]
+            edges.append(best_edge)
+            send_telegram_notification(best_edge)
+            auto_trade_edge(best_edge, kalshi_api)
     return edges
 
 
@@ -1970,6 +2010,7 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
             entries.append((p2['name'], p1_no, f"NO on {p1['name']}", fd_p1_name,
                            p1['market']['ticker'], 'no'))
 
+        match_edges = []
         for name, best_p, method, fd_opp_name, trade_ticker, trade_side in entries:
             fee = kalshi_fee(best_p)
             eff = best_p + fee
@@ -2000,9 +2041,14 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
                     'is_live': game_live,
                     'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (FanDuel: {fd_opp_name} at {fd_opp_data['odds']:.2f})",
                 }
-                edges.append(edge)
-                send_telegram_notification(edge)
-                auto_trade_edge(edge, kalshi_api)
+                match_edges.append(edge)
+        # Only trade the best edge per match to avoid betting both sides
+        if match_edges:
+            match_edges.sort(key=lambda e: e['arbitrage_profit'], reverse=True)
+            best_edge = match_edges[0]
+            edges.append(best_edge)
+            send_telegram_notification(best_edge)
+            auto_trade_edge(best_edge, kalshi_api)
 
     return edges
 
