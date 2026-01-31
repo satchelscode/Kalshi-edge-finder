@@ -181,6 +181,17 @@ def kalshi_fee(price: float, contracts: int = 100) -> float:
     return fee_total / contracts
 
 
+def is_game_live(commence_time_str: str) -> bool:
+    """Check if a game is currently live based on commence_time."""
+    if not commence_time_str:
+        return False
+    try:
+        ct = datetime.fromisoformat(commence_time_str.replace('Z', '+00:00'))
+        return ct <= datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
 def send_telegram_notification(edge: Dict):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -191,7 +202,8 @@ def send_telegram_notification(edge: Dict):
     try:
         market_type = edge.get('market_type', 'Moneyline')
         sport = edge.get('sport', '')
-        message = f"""+EV OPPORTUNITY ({sport} - {market_type})
+        live_tag = " 🔴 LIVE" if edge.get('is_live') else ""
+        message = f"""+EV OPPORTUNITY ({sport} - {market_type}{live_tag})
 
 {edge['game']}
 {edge['recommendation']}
@@ -257,7 +269,7 @@ class FanDuelAPI:
             home = game.get('home_team', '')
             away = game.get('away_team', '')
             if home and away:
-                games_dict[game_id] = {'home': home, 'away': away}
+                games_dict[game_id] = {'home': home, 'away': away, 'commence_time': game.get('commence_time', '')}
             for bm in game.get('bookmakers', []):
                 if bm['key'] == 'fanduel':
                     for mkt in bm.get('markets', []):
@@ -277,7 +289,7 @@ class FanDuelAPI:
             home = game.get('home_team', '')
             away = game.get('away_team', '')
             if home and away:
-                games_dict[game_id] = {'home': home, 'away': away}
+                games_dict[game_id] = {'home': home, 'away': away, 'commence_time': game.get('commence_time', '')}
             for bm in game.get('bookmakers', []):
                 if bm['key'] == 'fanduel':
                     for mkt in bm.get('markets', []):
@@ -303,7 +315,7 @@ class FanDuelAPI:
             home = game.get('home_team', '')
             away = game.get('away_team', '')
             if home and away:
-                games_dict[game_id] = {'home': home, 'away': away}
+                games_dict[game_id] = {'home': home, 'away': away, 'commence_time': game.get('commence_time', '')}
             for bm in game.get('bookmakers', []):
                 if bm['key'] == 'fanduel':
                     for mkt in bm.get('markets', []):
@@ -360,7 +372,7 @@ class FanDuelAPI:
             home = event.get('home_team', '')
             away = event.get('away_team', '')
             if home and away:
-                games_dict[event_id] = {'home': home, 'away': away}
+                games_dict[event_id] = {'home': home, 'away': away, 'commence_time': event.get('commence_time', '')}
 
             try:
                 url = f"{self.base_url}/sports/{sport_key}/events/{event_id}/odds"
@@ -506,9 +518,10 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         t1_name = team_map.get(abbrevs[0], abbrevs[0])
         t2_name = team_map.get(abbrevs[1], abbrevs[1])
 
-        fd_t1, fd_t2, _ = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games)
+        fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games)
         if not fd_t1 or fd_t1 not in fanduel_odds or fd_t2 not in fanduel_odds:
             continue
+        game_live = is_game_live(fanduel_games.get(matched_gid, {}).get('commence_time', ''))
 
         ob1 = kalshi_api.get_orderbook(team_markets[abbrevs[0]]['ticker'])
         time.sleep(0.3)
@@ -551,6 +564,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                     'fanduel_opposite_prob': fd_prob * 100,
                     'total_implied_prob': total * 100,
                     'arbitrage_profit': profit,
+                    'is_live': game_live,
                     'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (FanDuel: {fd_opp} at {fanduel_odds[fd_opp]['odds']:.2f})",
                 }
                 edges.append(edge)
@@ -636,7 +650,8 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
             continue
 
         fd_game_spreads = fd_spreads[matched_game_id]
-        print(f"   Spread match: {t1_name} vs {t2_name} -> {fd_t1} vs {fd_t2}")
+        game_live = is_game_live(fd_games.get(matched_game_id, {}).get('commence_time', ''))
+        print(f"   Spread match: {t1_name} vs {t2_name} -> {fd_t1} vs {fd_t2}{' [LIVE]' if game_live else ''}")
 
         # Step 3: For each market in this game, compare to FanDuel spread
         for mk in markets:
@@ -717,6 +732,7 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                     'fanduel_opposite_prob': fd_opposite_prob * 100,
                     'total_implied_prob': total_implied * 100,
                     'arbitrage_profit': profit,
+                    'is_live': game_live,
                     'recommendation': f"Buy YES {team_name} -{floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel: {fd_opposite_name} {fd_opposite_spread['point']} at {fd_opposite_odds:.2f})",
                 }
                 edges.append(edge)
@@ -804,6 +820,7 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
         fd_total = fd_totals[matched_game_id]
         fd_line = fd_total['point']
         game_name = f"{fd_games[matched_game_id]['away']} at {fd_games[matched_game_id]['home']}"
+        game_live = is_game_live(fd_games.get(matched_game_id, {}).get('commence_time', ''))
 
         # Step 3: For each total market in this game, compare to FanDuel
         for mk in group['markets']:
@@ -851,6 +868,7 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                         'fanduel_opposite_prob': fd_under_prob * 100,
                         'total_implied_prob': total_implied * 100,
                         'arbitrage_profit': profit,
+                        'is_live': game_live,
                         'recommendation': f"Buy YES Over {floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel Under {fd_line} at {fd_total['under_odds']:.2f})",
                     }
                     edges.append(edge)
@@ -880,6 +898,7 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                         'fanduel_opposite_prob': fd_over_prob * 100,
                         'total_implied_prob': total_implied * 100,
                         'arbitrage_profit': profit,
+                        'is_live': game_live,
                         'recommendation': f"Buy NO (Under {floor_strike}) on Kalshi at ${under_cost:.2f} (FanDuel Over {fd_line} at {fd_total['over_odds']:.2f})",
                     }
                     edges.append(edge)
@@ -979,6 +998,7 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
             game_id = best_fd_match['game_id']
             game_info = fd_games.get(game_id, {})
             game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
+            game_live = is_game_live(game_info.get('commence_time', ''))
 
             edge = {
                 'market_type': 'Player Prop',
@@ -995,6 +1015,7 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
                 'fanduel_opposite_prob': fd_over_prob * 100,
                 'total_implied_prob': (eff + (1 - fd_over_prob)) * 100,
                 'arbitrage_profit': edge_pct,
+                'is_live': game_live,
                 'recommendation': f"Buy YES {player_name} {kalshi_line}+ on Kalshi at ${yes_price:.2f} (FanDuel Over {best_fd_match['point']} at {best_fd_match['over_odds']:.2f})",
             }
             edges.append(edge)
@@ -1170,8 +1191,9 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
             for e in all_edges:
                 mt = e.get('market_type', 'Moneyline')
                 bc = type_colors.get(mt, '#666')
+                live_badge = '<span class="badge" style="background:#e74c3c">LIVE</span>' if e.get('is_live') else ''
                 html += f"""<div class="edge">
-<div class="game">{e['game']}<span class="badge" style="background:{bc}">{mt}</span><span class="badge" style="background:#444">{e['sport']}</span></div>
+<div class="game">{e['game']}<span class="badge" style="background:{bc}">{mt}</span><span class="badge" style="background:#444">{e['sport']}</span>{live_badge}</div>
 <div class="team">{e['team']}</div>
 <div class="row"><span class="label">Kalshi:</span><span class="value">${e['kalshi_price']:.2f} -> ${e['kalshi_price_after_fees']:.4f} after fees ({e['kalshi_prob_after_fees']:.1f}%)</span></div>
 <div class="row"><span class="label">FanDuel:</span><span class="value">{e['fanduel_opposite_team']} at {e['fanduel_opposite_odds']:.2f} ({e['fanduel_opposite_prob']:.1f}%)</span></div>
