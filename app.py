@@ -318,11 +318,31 @@ def is_game_live(commence_time_str: str) -> bool:
         return False
 
 
+def are_odds_stale(commence_time_str: str, last_update_str: str) -> bool:
+    """Check if FanDuel odds are stale for a live game.
+    Returns True if the game has started but FD odds haven't updated since before
+    the game started (pre-game odds frozen during live play).
+    Returns False for pre-game games or if we can't determine staleness."""
+    if not commence_time_str or not last_update_str:
+        return False
+    try:
+        ct = datetime.fromisoformat(commence_time_str.replace('Z', '+00:00'))
+        lu = datetime.fromisoformat(last_update_str.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        # Game hasn't started yet — odds are fine
+        if ct > now:
+            return False
+        # Game is live: odds are stale if last_update is before game start
+        # or more than 15 minutes old (FD stopped updating through the API)
+        if lu < ct or (now - lu) > timedelta(minutes=15):
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def send_telegram_notification(edge: Dict):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    # Skip live games — odds are likely stale, don't spam false alerts
-    if edge.get('is_live'):
         return
     edge_key = f"{edge.get('market_type','')}{edge['game']}_{edge['team']}_{edge['arbitrage_profit']:.1f}"
     if edge_key in _notified_edges:
@@ -331,7 +351,7 @@ def send_telegram_notification(edge: Dict):
     try:
         market_type = edge.get('market_type', 'Moneyline')
         sport = edge.get('sport', '')
-        live_tag = ""
+        live_tag = " 🔴 LIVE" if edge.get('is_live') else ""
         message = f"""+EV OPPORTUNITY ({sport} - {market_type}{live_tag})
 
 {edge['game']}
@@ -391,12 +411,6 @@ def auto_trade_edge(edge: Dict, kalshi_api) -> Optional[Dict]:
     global _order_tracker
 
     if not AUTO_TRADE_ENABLED:
-        return None
-
-    # Skip live games — The Odds API doesn't reliably update live odds,
-    # so edges on live games are likely false positives from stale data
-    if edge.get('is_live'):
-        print(f"   >>> Skipping live game edge: {edge.get('game', '?')} (stale odds)")
         return None
 
     ticker = edge.get('kalshi_ticker')
@@ -541,10 +555,12 @@ class FanDuelAPI:
                 games_dict[game_id] = {'home': home, 'away': away, 'commence_time': game.get('commence_time', '')}
             for bm in game.get('bookmakers', []):
                 if bm['key'] == 'fanduel':
+                    bm_last_update = bm.get('last_update', '')
                     for mkt in bm.get('markets', []):
                         if mkt['key'] == 'h2h':
+                            mkt_last_update = mkt.get('last_update', '') or bm_last_update
                             for o in mkt.get('outcomes', []):
-                                odds_dict[o['name']] = {'odds': o['price'], 'game_id': game_id}
+                                odds_dict[o['name']] = {'odds': o['price'], 'game_id': game_id, 'last_update': mkt_last_update}
         print(f"   FanDuel {sport_key} moneyline: {len(odds_dict)} outcomes in {len(games_dict)} games")
         return {'odds': odds_dict, 'games': games_dict}
 
@@ -561,15 +577,17 @@ class FanDuelAPI:
                 games_dict[game_id] = {'home': home, 'away': away, 'commence_time': game.get('commence_time', '')}
             for bm in game.get('bookmakers', []):
                 if bm['key'] == 'fanduel':
+                    bm_last_update = bm.get('last_update', '')
                     for mkt in bm.get('markets', []):
                         if mkt['key'] == 'spreads':
-                            game_spreads = {}
+                            mkt_last_update = mkt.get('last_update', '') or bm_last_update
+                            game_spreads = {'_last_update': mkt_last_update}
                             for o in mkt.get('outcomes', []):
                                 game_spreads[o['name']] = {
                                     'point': o.get('point', 0),
                                     'odds': o['price']
                                 }
-                            if game_spreads:
+                            if len(game_spreads) > 1:  # more than just _last_update
                                 spreads[game_id] = game_spreads
         print(f"   FanDuel {sport_key} spreads: {len(spreads)} games")
         return {'spreads': spreads, 'games': games_dict}
@@ -587,9 +605,11 @@ class FanDuelAPI:
                 games_dict[game_id] = {'home': home, 'away': away, 'commence_time': game.get('commence_time', '')}
             for bm in game.get('bookmakers', []):
                 if bm['key'] == 'fanduel':
+                    bm_last_update = bm.get('last_update', '')
                     for mkt in bm.get('markets', []):
                         if mkt['key'] == 'totals':
-                            game_total = {}
+                            mkt_last_update = mkt.get('last_update', '') or bm_last_update
+                            game_total = {'_last_update': mkt_last_update}
                             for o in mkt.get('outcomes', []):
                                 if o['name'] == 'Over':
                                     game_total['over_odds'] = o['price']
@@ -656,9 +676,11 @@ class FanDuelAPI:
 
                 for bm in data.get('bookmakers', []):
                     if bm['key'] == 'fanduel':
+                        bm_last_update = bm.get('last_update', '')
                         for mkt in bm.get('markets', []):
                             if mkt['key'] == 'btts':
-                                game_btts = {}
+                                mkt_last_update = mkt.get('last_update', '') or bm_last_update
+                                game_btts = {'_last_update': mkt_last_update}
                                 for o in mkt.get('outcomes', []):
                                     if o['name'] == 'Yes':
                                         game_btts['yes_odds'] = o['price']
@@ -714,8 +736,13 @@ class FanDuelAPI:
 
                 for bm in data.get('bookmakers', []):
                     if bm['key'] == 'fanduel':
+                        bm_last_update = bm.get('last_update', '')
                         for mkt in bm.get('markets', []):
                             if mkt['key'] == market_key:
+                                mkt_last_update = mkt.get('last_update', '') or bm_last_update
+                                # Store last_update in games_dict for staleness check
+                                if event_id in games_dict:
+                                    games_dict[event_id]['_last_update'] = mkt_last_update
                                 # Group by player+point to pair Over/Under
                                 paired = {}  # (player, point) -> {over_odds, under_odds}
                                 for o in mkt.get('outcomes', []):
@@ -1004,7 +1031,14 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games, kalshi_date_str=today_str)
         if not fd_t1 or fd_t1 not in fanduel_odds or fd_t2 not in fanduel_odds:
             continue
-        game_live = is_game_live(fanduel_games.get(matched_gid, {}).get('commence_time', ''))
+        commence_str = fanduel_games.get(matched_gid, {}).get('commence_time', '')
+        game_live = is_game_live(commence_str)
+
+        # Check if FD odds are stale (pre-game odds frozen during live play)
+        fd_last_update = fanduel_odds.get(fd_t1, {}).get('last_update', '') or fanduel_odds.get(fd_t2, {}).get('last_update', '')
+        if are_odds_stale(commence_str, fd_last_update):
+            print(f"   Skipping {t1_name} vs {t2_name}: FD odds stale (last update: {fd_last_update})")
+            continue
 
         ob1 = kalshi_api.get_orderbook(team_markets[abbrevs[0]]['ticker'])
         time.sleep(0.3)
@@ -1146,7 +1180,11 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
             continue
 
         fd_game_spreads = fd_spreads[matched_game_id]
-        game_live = is_game_live(fd_games.get(matched_game_id, {}).get('commence_time', ''))
+        commence_str = fd_games.get(matched_game_id, {}).get('commence_time', '')
+        game_live = is_game_live(commence_str)
+        if are_odds_stale(commence_str, fd_game_spreads.get('_last_update', '')):
+            print(f"   Skipping spread {t1_name} vs {t2_name}: FD odds stale")
+            continue
         print(f"   Spread match: {t1_name} vs {t2_name} -> {fd_t1} vs {fd_t2}{' [LIVE]' if game_live else ''}")
 
         # Step 3: For each market in this game, compare to FanDuel spread
@@ -1319,7 +1357,11 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
         fd_total = fd_totals[matched_game_id]
         fd_line = fd_total['point']
         game_name = f"{fd_games[matched_game_id]['away']} at {fd_games[matched_game_id]['home']}"
-        game_live = is_game_live(fd_games.get(matched_game_id, {}).get('commence_time', ''))
+        commence_str = fd_games.get(matched_game_id, {}).get('commence_time', '')
+        game_live = is_game_live(commence_str)
+        if are_odds_stale(commence_str, fd_total.get('_last_update', '')):
+            print(f"   Skipping total {game_name}: FD odds stale")
+            continue
 
         # Step 3: For each total market in this game, compare to FanDuel
         for mk in group['markets']:
@@ -1506,7 +1548,11 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
             game_id = best_fd_match['game_id']
             game_info = fd_games.get(game_id, {})
             game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
-            game_live = is_game_live(game_info.get('commence_time', ''))
+            commence_str = game_info.get('commence_time', '')
+            game_live = is_game_live(commence_str)
+            if are_odds_stale(commence_str, game_info.get('_last_update', '')):
+                print(f"   Skipping prop {player_name}: FD odds stale")
+                continue
 
             edge = {
                 'market_type': 'Player Prop',
@@ -1607,7 +1653,11 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
         fd_game_btts = fd_btts[matched_game_id]
         game_info = fd_games.get(matched_game_id, {})
         game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
-        game_live = is_game_live(game_info.get('commence_time', ''))
+        commence_str = game_info.get('commence_time', '')
+        game_live = is_game_live(commence_str)
+        if are_odds_stale(commence_str, fd_game_btts.get('_last_update', '')):
+            print(f"   Skipping BTTS {game_name}: FD odds stale")
+            continue
 
         fd_yes_prob = converter.decimal_to_implied_prob(fd_game_btts['yes_odds'])
         fd_no_prob = converter.decimal_to_implied_prob(fd_game_btts['no_odds'])
