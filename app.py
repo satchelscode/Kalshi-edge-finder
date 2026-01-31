@@ -321,6 +321,9 @@ def is_game_live(commence_time_str: str) -> bool:
 def send_telegram_notification(edge: Dict):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+    # Skip live games — odds are likely stale, don't spam false alerts
+    if edge.get('is_live'):
+        return
     edge_key = f"{edge.get('market_type','')}{edge['game']}_{edge['team']}_{edge['arbitrage_profit']:.1f}"
     if edge_key in _notified_edges:
         return
@@ -328,7 +331,7 @@ def send_telegram_notification(edge: Dict):
     try:
         market_type = edge.get('market_type', 'Moneyline')
         sport = edge.get('sport', '')
-        live_tag = " 🔴 LIVE" if edge.get('is_live') else ""
+        live_tag = ""
         message = f"""+EV OPPORTUNITY ({sport} - {market_type}{live_tag})
 
 {edge['game']}
@@ -388,6 +391,12 @@ def auto_trade_edge(edge: Dict, kalshi_api) -> Optional[Dict]:
     global _order_tracker
 
     if not AUTO_TRADE_ENABLED:
+        return None
+
+    # Skip live games — The Odds API doesn't reliably update live odds,
+    # so edges on live games are likely false positives from stale data
+    if edge.get('is_live'):
+        print(f"   >>> Skipping live game edge: {edge.get('game', '?')} (stale odds)")
         return None
 
     ticker = edge.get('kalshi_ticker')
@@ -2019,10 +2028,25 @@ def _describe_position(market_info: Optional[Dict], ticker: str, side: str) -> T
     team_abbrev, opp_abbrev, game_display = _parse_ticker_teams(ticker)
 
     if mtype == 'Moneyline':
-        # title from Kalshi API for a contract is the team name (e.g. "Vanderbilt Commodores")
-        # subtitle is usually the event name (e.g. "Ole Miss at Vanderbilt Winner?")
-        # Clean event name: strip " Winner?" suffix for game display
-        event_name = subtitle.replace(' Winner?', '').replace(' winner?', '') if subtitle else ''
+        # Kalshi API structure varies by sport:
+        # - NBA/NHL: title = team name (e.g. "Boston Celtics"), subtitle = event (e.g. "Boston at Miami Winner?")
+        # - NCAAMB/soccer: title = event question (e.g. "Marquette at Seton Hall Winner?"), subtitle = empty
+        # Detect which case we're in by checking if title contains team separators
+        title_has_teams = any(sep in (title or '') for sep in [' at ', ' vs ', ' vs. '])
+
+        if subtitle:
+            # subtitle has event name, title has team name
+            event_source = subtitle
+            contract_team_title = title
+        elif title_has_teams:
+            # title IS the event name (NCAAMB/soccer pattern), no separate team name
+            event_source = title
+            contract_team_title = None
+        else:
+            event_source = ''
+            contract_team_title = title
+
+        event_name = event_source.replace(' Winner?', '').replace(' winner?', '') if event_source else ''
         game_line = event_name or game_display
 
         # Parse event name into two teams for name resolution
@@ -2032,20 +2056,53 @@ def _describe_position(market_info: Optional[Dict], ticker: str, side: str) -> T
                 event_teams = [t.strip() for t in event_name.split(sep)]
                 break
 
+        def _match_abbrev_to_team(abbrev: str, teams: list) -> Optional[str]:
+            """Match a ticker abbreviation to one of the event team names.
+            Uses multiple strategies: initials, prefix, word-start, consonant matching."""
+            if not abbrev or not teams:
+                return None
+            ab = abbrev.lower()
+            best_match = None
+            best_score = 0
+            for t in teams:
+                tl = t.lower()
+                words = tl.split()
+                initials = ''.join(w[0] for w in words if w)
+                score = 0
+                # Exact initials match (e.g. SH -> Seton Hall)
+                if ab == initials:
+                    score = 10
+                # Prefix of full name (e.g. MARQ -> Marquette, TOL -> Toledo)
+                elif len(ab) >= 3 and tl.replace(' ', '').startswith(ab):
+                    score = 9
+                # Prefix of first word (e.g. VAN -> Vanderbilt)
+                elif len(ab) >= 3 and words and words[0].startswith(ab):
+                    score = 8
+                # Abbreviation starts with initials (e.g. SHU -> Seton Hall University)
+                elif len(ab) > len(initials) and ab.startswith(initials):
+                    score = 7
+                # First word starts with abbreviation letters
+                elif len(ab) >= 2 and any(w.startswith(ab) for w in words):
+                    score = 6
+                if score > best_score:
+                    best_score = score
+                    best_match = t
+            return best_match
+
         if side == 'YES':
             # YES on this contract = betting this team wins
             team_name = _lookup_team_name(team_abbrev, sport_prefix) if team_abbrev else None
             if not team_name and event_teams and team_abbrev:
-                # No team map — figure out which event team matches this contract's abbrev
-                # The ticker ends with the team abbrev. Match by checking if abbrev appears
-                # in the event team name or title
-                tl = (title or '').lower()
-                for et in event_teams:
-                    if et.lower() in tl or tl in et.lower() or (tl.split()[0] == et.lower().split()[0] if tl and et else False):
-                        team_name = et
-                        break
-            bet_name = team_name or title or team_abbrev or ticker
-            # Clean up "Winner?" from bet name if present
+                # No team map — match ticker abbreviation to event team
+                team_name = _match_abbrev_to_team(team_abbrev, event_teams)
+                if not team_name and contract_team_title:
+                    # Fall back to matching contract title against event teams
+                    ctl = contract_team_title.lower()
+                    for et in event_teams:
+                        if et.lower() in ctl or ctl in et.lower():
+                            team_name = et
+                            break
+            bet_name = team_name or contract_team_title or title or team_abbrev or ticker
             bet_name = bet_name.replace(' Winner?', '').replace(' winner?', '')
             return f"{bet_name} ML", mtype, game_line
 
@@ -2054,15 +2111,22 @@ def _describe_position(market_info: Optional[Dict], ticker: str, side: str) -> T
             opp_name = _lookup_team_name(opp_abbrev, sport_prefix) if opp_abbrev else None
             if opp_name:
                 return f"{opp_name} ML", mtype, game_line
-            # No team map — use event name to figure out opponent
+            # No team map — figure out which team the contract is for, then pick the other
             if event_teams and len(event_teams) == 2:
-                tl = (title or '').lower()
-                t0 = event_teams[0].lower()
-                t1 = event_teams[1].lower()
-                # Check if title matches team 0
-                t0_match = (tl in t0) or (t0 in tl) or (t0.split()[0] == tl.split()[0] if tl and t0 else False)
-                opp = event_teams[1] if t0_match else event_teams[0]
-                return f"{opp} ML", mtype, game_line
+                contract_team = _match_abbrev_to_team(team_abbrev, event_teams)
+                if contract_team:
+                    opp = event_teams[1] if contract_team == event_teams[0] else event_teams[0]
+                    return f"{opp} ML", mtype, game_line
+                # Last resort: try matching contract_team_title
+                if contract_team_title:
+                    ctl = contract_team_title.lower()
+                    t0_match = event_teams[0].lower() in ctl or ctl in event_teams[0].lower()
+                    opp = event_teams[1] if t0_match else event_teams[0]
+                    return f"{opp} ML", mtype, game_line
+                # If we still can't figure it out, use opp_abbrev from ticker
+                if opp_abbrev:
+                    opp = _match_abbrev_to_team(opp_abbrev, event_teams) or opp_abbrev
+                    return f"{opp} ML", mtype, game_line
             return f"NOT {title} ML" if title else f"NO · {ticker}", mtype, game_line
 
     elif mtype == 'Spread':
