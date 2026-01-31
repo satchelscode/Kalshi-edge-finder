@@ -85,10 +85,15 @@ TOTAL_SPORTS = {
 
 # Player prop markets: kalshi_series -> (odds_api_sport, odds_api_market, display_name)
 PLAYER_PROP_SPORTS = {
+    # NBA
     'KXNBAPTS': ('basketball_nba', 'player_points', 'NBA Points'),
     'KXNBAREB': ('basketball_nba', 'player_rebounds', 'NBA Rebounds'),
     'KXNBAAST': ('basketball_nba', 'player_assists', 'NBA Assists'),
     'KXNBA3PT': ('basketball_nba', 'player_threes', 'NBA 3-Pointers'),
+    # NHL
+    'KXNHLPTS': ('icehockey_nhl', 'player_points', 'NHL Points'),
+    'KXNHLAST': ('icehockey_nhl', 'player_assists', 'NHL Assists'),
+    'KXNHLSAVES': ('icehockey_nhl', 'player_total_saves', 'NHL Saves'),
 }
 
 # Track which edges we've already notified about
@@ -141,8 +146,18 @@ def _name_matches(kalshi_name: str, fd_name: str, threshold: float = 0.55) -> bo
     return False
 
 
-def match_kalshi_to_fanduel_game(team1_name, team2_name, fd_games):
-    """Match BOTH Kalshi teams to the SAME FanDuel game."""
+def match_kalshi_to_fanduel_game(team1_name, team2_name, fd_games, kalshi_date_str=None):
+    """Match BOTH Kalshi teams to the SAME FanDuel game.
+    If kalshi_date_str is provided (e.g., '26JAN31'), prefer games on that date."""
+    # Parse Kalshi date if provided, to filter FD games by date
+    kalshi_date = None
+    if kalshi_date_str:
+        try:
+            kalshi_date = datetime.strptime(kalshi_date_str, '%y%b%d').replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+
+    candidates = []
     for game_id, game_info in fd_games.items():
         fd_home = game_info['home']
         fd_away = game_info['away']
@@ -150,11 +165,30 @@ def match_kalshi_to_fanduel_game(team1_name, team2_name, fd_games):
         t1a = _name_matches(team1_name, fd_away)
         t2h = _name_matches(team2_name, fd_home)
         t2a = _name_matches(team2_name, fd_away)
+        matched = None
         if t1h and t2a:
-            return fd_home, fd_away, game_id
-        if t1a and t2h:
-            return fd_away, fd_home, game_id
-    return None, None, None
+            matched = (fd_home, fd_away, game_id)
+        elif t1a and t2h:
+            matched = (fd_away, fd_home, game_id)
+        if matched:
+            # Score by date proximity if we have both dates
+            if kalshi_date and game_info.get('commence_time'):
+                try:
+                    ct = datetime.fromisoformat(game_info['commence_time'].replace('Z', '+00:00'))
+                    # Game should be on the Kalshi date (allow same day or next day early AM)
+                    day_diff = abs((ct.date() - kalshi_date.date()).days)
+                    candidates.append((day_diff, matched))
+                except Exception:
+                    candidates.append((0, matched))
+            else:
+                candidates.append((0, matched))
+
+    if not candidates:
+        return None, None, None
+
+    # Return the closest date match
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
 
 
 def _match_player_name(kalshi_name: str, fd_name: str) -> bool:
@@ -232,11 +266,11 @@ class FanDuelAPI:
         self.base_url = "https://api.the-odds-api.com/v4"
 
     def _fetch(self, sport_key: str, markets: str = 'h2h') -> list:
-        """Base fetch method with today-only filtering."""
+        """Fetch odds for today and tomorrow (covers US evening + next day games)."""
         try:
             now_utc = datetime.now(timezone.utc)
             start_of_today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_of_today = start_of_today + timedelta(days=1)
+            end_of_window = start_of_today + timedelta(days=2)  # Today + tomorrow
 
             url = f"{self.base_url}/sports/{sport_key}/odds/"
             params = {
@@ -246,7 +280,7 @@ class FanDuelAPI:
                 'bookmakers': 'fanduel',
                 'oddsFormat': 'decimal',
                 'commenceTimeFrom': start_of_today.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                'commenceTimeTo': end_of_today.strftime('%Y-%m-%dT%H:%M:%SZ')
+                'commenceTimeTo': end_of_window.strftime('%Y-%m-%dT%H:%M:%SZ')
             }
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
@@ -333,17 +367,17 @@ class FanDuelAPI:
         return {'totals': totals, 'games': games_dict}
 
     def get_events(self, sport_key: str) -> list:
-        """Get today's event IDs for a sport (used for per-event prop fetching)."""
+        """Get event IDs for today and tomorrow (used for per-event prop fetching)."""
         try:
             now_utc = datetime.now(timezone.utc)
             start_of_today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_of_today = start_of_today + timedelta(days=1)
+            end_of_window = start_of_today + timedelta(days=2)
 
             url = f"{self.base_url}/sports/{sport_key}/events/"
             params = {
                 'apiKey': self.api_key,
                 'commenceTimeFrom': start_of_today.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                'commenceTimeTo': end_of_today.strftime('%Y-%m-%dT%H:%M:%SZ')
+                'commenceTimeTo': end_of_window.strftime('%Y-%m-%dT%H:%M:%SZ')
             }
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
@@ -518,7 +552,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         t1_name = team_map.get(abbrevs[0], abbrevs[0])
         t2_name = team_map.get(abbrevs[1], abbrevs[1])
 
-        fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games)
+        fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games, kalshi_date_str=today_str)
         if not fd_t1 or fd_t1 not in fanduel_odds or fd_t2 not in fanduel_odds:
             continue
         game_live = is_game_live(fanduel_games.get(matched_gid, {}).get('commence_time', ''))
@@ -645,7 +679,7 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
         t2_name = team_map.get(team_abbrevs[1], team_abbrevs[1])
 
         # Require BOTH teams match the SAME FanDuel game
-        fd_t1, fd_t2, matched_game_id = match_kalshi_to_fanduel_game(t1_name, t2_name, fd_games)
+        fd_t1, fd_t2, matched_game_id = match_kalshi_to_fanduel_game(t1_name, t2_name, fd_games, kalshi_date_str=today_str)
         if not fd_t1 or not matched_game_id or matched_game_id not in fd_spreads:
             continue
 
