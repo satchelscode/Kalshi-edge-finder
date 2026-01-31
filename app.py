@@ -127,7 +127,7 @@ BTTS_SPORTS = {
 
 # Auto-trade configuration
 AUTO_TRADE_ENABLED = True
-MAX_POSITIONS = 20
+MAX_POSITIONS = 40
 TARGET_PROFIT = 1.00  # Target $1 profit per trade
 
 # Track which edges we've already notified about
@@ -908,6 +908,18 @@ class KalshiAPI:
         except Exception as e:
             print(f"   Kalshi {series_ticker} error: {e}")
             return all_markets
+
+    def get_market(self, ticker: str) -> Optional[Dict]:
+        """Get details for a single market by ticker."""
+        try:
+            response = self.session.get(f"{self.BASE_URL}/markets/{ticker}", timeout=10)
+            if response.status_code == 429:
+                time.sleep(2.0)
+                response = self.session.get(f"{self.BASE_URL}/markets/{ticker}", timeout=10)
+            response.raise_for_status()
+            return response.json().get('market', response.json())
+        except Exception as e:
+            return None
 
     def get_orderbook(self, ticker: str) -> Optional[Dict]:
         try:
@@ -1920,6 +1932,93 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
         return f"<h1 style='color:red'>Error</h1><pre>{e}</pre>", 500
 
 
+def _describe_position(market_info: Optional[Dict], ticker: str, side: str) -> Tuple[str, str, str]:
+    """Build human-readable bet description from market info and side.
+    Returns (bet_description, market_type_tag, subtitle)."""
+    if not market_info:
+        return f"{side} · {ticker}", '', ''
+
+    title = market_info.get('title', '') or ''
+    subtitle = market_info.get('subtitle', '') or ''
+    event_ticker = market_info.get('event_ticker', '') or ''
+    series_ticker = (market_info.get('series_ticker', '') or ticker).upper()
+
+    # Determine market type from series ticker
+    if 'SPREAD' in series_ticker:
+        mtype = 'Spread'
+    elif 'TOTAL' in series_ticker:
+        mtype = 'Total'
+    elif 'BTTS' in series_ticker:
+        mtype = 'BTTS'
+    elif 'GAME' in series_ticker or 'BGAME' in series_ticker:
+        mtype = 'Moneyline'
+    else:
+        mtype = 'Prop' if ':' in title else 'Market'
+
+    # For moneyline: title is usually the team name like "Toledo Rockets"
+    # YES on Toledo = Toledo ML. NO on Toledo = opponent ML.
+    if side == 'NO' and mtype == 'Moneyline':
+        # Try to get the opponent from the event (ticker has both team abbrevs)
+        # e.g., KXNCAAMBGAME-26JAN31BALLTOL-TOL -> the other team is BALL
+        parts = ticker.split('-')
+        if len(parts) >= 3:
+            team_abbrev = parts[-1]
+            game_part = parts[1] if len(parts) >= 2 else ''
+            # Remove date prefix from game_part to get team codes
+            date_match = re.match(r'\d{2}[A-Z]{3}\d{2}', game_part)
+            if date_match:
+                teams_str = game_part[len(date_match.group(0)):]
+                # teams_str is like "BALLTOL" and team_abbrev is "TOL"
+                opp_abbrev = teams_str.replace(team_abbrev, '', 1).strip()
+                if opp_abbrev:
+                    # Look up full name from any team map
+                    opp_name = None
+                    for sports_map in [MONEYLINE_SPORTS, SPREAD_SPORTS]:
+                        for _, v in sports_map.items():
+                            tmap = v[2] if len(v) > 2 else {}
+                            if opp_abbrev in tmap:
+                                opp_name = tmap[opp_abbrev]
+                                break
+                        if opp_name:
+                            break
+                    desc = f"{opp_name or opp_abbrev} ML"
+                    return desc, mtype, subtitle or title
+        desc = f"NOT {title}" if title else f"NO · {ticker}"
+        return desc, mtype, subtitle
+
+    elif side == 'YES' and mtype == 'Moneyline':
+        return f"{title} ML" if title else f"YES · {ticker}", mtype, subtitle
+
+    elif mtype == 'Spread':
+        if side == 'YES':
+            return f"{title}" if title else f"YES · {ticker}", mtype, subtitle
+        else:
+            return f"NOT {title}" if title else f"NO · {ticker}", mtype, subtitle
+
+    elif mtype == 'Total':
+        # title might be like "Over 231.5" or subtitle has the line
+        if side == 'YES':
+            return f"Over {subtitle or title}", mtype, ''
+        else:
+            return f"Under {subtitle or title}", mtype, ''
+
+    elif mtype == 'BTTS':
+        if side == 'YES':
+            return "Both Teams Score", mtype, subtitle or title
+        else:
+            return "Both Teams Don't Score", mtype, subtitle or title
+
+    elif ':' in title:
+        # Player prop like "Stephon Castle: 8+"
+        if side == 'YES':
+            return f"{title}", 'Prop', subtitle
+        else:
+            return f"NOT {title}", 'Prop', subtitle
+
+    # Fallback
+    return f"{side} · {title or ticker}", mtype, subtitle
+
+
 @app.route('/orders')
 def orders_view():
     try:
@@ -1930,8 +2029,15 @@ def orders_view():
 
         # Pull live positions from Kalshi API
         positions = kalshi.get_positions()
-        # Filter to only positions with actual holdings
         active_positions = [p for p in positions if p.get('position', 0) != 0]
+
+        # Fetch market details for each position (for human-readable names)
+        market_cache = {}
+        for pos in active_positions:
+            ticker = pos.get('ticker', '')
+            if ticker and ticker not in market_cache:
+                market_cache[ticker] = kalshi.get_market(ticker)
+                time.sleep(0.2)
 
         html = f"""<!DOCTYPE html>
 <html><head>
@@ -1946,11 +2052,15 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
 .balance {{ text-align: center; padding: 15px; background: #0f3460; border-radius: 8px; margin-bottom: 20px; }}
 .balance span {{ margin: 0 20px; }}
 .order {{ background: #16213e; padding: 15px; margin: 10px 0; border-radius: 10px; border-left: 4px solid #3498db; }}
-.order-team {{ font-weight: bold; color: #ff6b6b; font-size: 1.1em; margin-bottom: 8px; }}
+.bet-name {{ font-weight: bold; color: #00ff88; font-size: 1.2em; margin-bottom: 4px; }}
+.bet-sub {{ font-size: 0.85em; color: #888; margin-bottom: 8px; }}
+.badge {{ display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 0.7em; font-weight: bold; color: white; margin-left: 6px; vertical-align: middle; }}
 .row {{ display: flex; justify-content: space-between; margin: 4px 0; padding: 4px 0; border-bottom: 1px solid #2a2a3e; }}
 .label {{ color: #aaa; }} .value {{ font-weight: 600; }}
 .pos {{ color: #00ff88; }} .neg {{ color: #e74c3c; }}
 .no-orders {{ text-align: center; padding: 50px 20px; color: #888; }}
+.summary {{ text-align: center; padding: 15px; background: #0f3460; border-radius: 8px; margin-top: 15px; }}
+.summary span {{ margin: 0 20px; }}
 </style></head><body><div class="container">
 <h1>Kalshi Orders</h1>
 <div class="nav"><a href="/debug">Edge Scanner</a> | <a href="/orders">Orders</a></div>
@@ -1961,56 +2071,57 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
 <span>Auto-trade: <strong style="color:{'#00ff88' if AUTO_TRADE_ENABLED else '#e74c3c'}">{'ON' if AUTO_TRADE_ENABLED else 'OFF'}</strong></span>
 </div>"""
 
+        type_colors = {
+            'Moneyline': '#e74c3c', 'Spread': '#3498db', 'Total': '#e67e22',
+            'Prop': '#9b59b6', 'BTTS': '#2ecc71', 'Market': '#95a5a6',
+        }
+
         if active_positions:
             total_cost = 0
-            total_value = 0
             total_pnl = 0
             for pos in active_positions:
                 ticker = pos.get('ticker', '?')
-                position = pos.get('position', 0)  # positive = YES, negative = NO
+                position = pos.get('position', 0)
                 side = 'YES' if position > 0 else 'NO'
                 contracts = abs(position)
-                avg_price_cents = pos.get('market_exposure', 0)  # total cost in cents
-                market_price = pos.get('market_exposure', 0)
-                resting_orders_count = pos.get('resting_orders_count', 0)
+                market_exposure = pos.get('market_exposure', 0)
 
-                # Calculate costs from the position data
-                total_cost_cents = pos.get('total_traded', 0)
-                realized_pnl = pos.get('realized_pnl', 0) / 100 if 'realized_pnl' in pos else 0
-
-                # Estimate per-contract avg price
                 if contracts > 0:
-                    avg_price = abs(market_price) / contracts / 100 if market_price else 0
+                    avg_price = abs(market_exposure) / contracts / 100 if market_exposure else 0
                 else:
                     avg_price = 0
 
-                cost_dollars = abs(market_price) / 100 if market_price else 0
-                payout = contracts  # $1 per contract if right
+                cost_dollars = abs(market_exposure) / 100 if market_exposure else 0
+                payout = contracts
                 potential_profit = payout - cost_dollars
-
-                # American odds from avg price
                 american = prob_to_american(avg_price) if 0 < avg_price < 1 else 'N/A'
-
                 pnl_class = 'pos' if potential_profit >= 0 else 'neg'
 
                 total_cost += cost_dollars
                 total_pnl += potential_profit
 
-                html += f"""<div class="order">
-<div class="order-team">{side} · {ticker}</div>
-<div class="row"><span class="label">Side:</span><span class="value">{side}</span></div>
-<div class="row"><span class="label">Contracts:</span><span class="value">{contracts}</span></div>
-<div class="row"><span class="label">Avg price:</span><span class="value">{avg_price*100:.1f}¢ ({american})</span></div>
-<div class="row"><span class="label">Cost:</span><span class="value">${cost_dollars:.2f}</span></div>
-<div class="row"><span class="label">Payout if right:</span><span class="value">${payout:.2f}</span></div>
-<div class="row"><span class="label">Potential profit:</span><span class="{pnl_class}">${potential_profit:.2f}</span></div>
-</div>"""
+                # Get human-readable description
+                market_info = market_cache.get(ticker)
+                bet_desc, mtype, bet_sub = _describe_position(market_info, ticker, side)
+                mtype_color = type_colors.get(mtype, '#95a5a6')
+                sub_line = (bet_sub + ' · ') if bet_sub else ''
 
-            html += f"""<div style="text-align:center;padding:15px;background:#0f3460;border-radius:8px;margin-top:15px;">
-<span style="margin:0 20px;">Total cost: <strong>${total_cost:.2f}</strong></span>
-<span style="margin:0 20px;">Total payout: <strong>${total_cost + total_pnl:.2f}</strong></span>
-<span style="margin:0 20px;">Potential P&L: <strong class="{'pos' if total_pnl >= 0 else 'neg'}">${total_pnl:.2f}</strong></span>
-</div>"""
+                html += f'<div class="order">'
+                html += f'<div class="bet-name">{bet_desc}<span class="badge" style="background:{mtype_color}">{mtype}</span></div>'
+                html += f'<div class="bet-sub">{sub_line}{ticker}</div>'
+                html += f'<div class="row"><span class="label">Contracts:</span><span class="value">{contracts}</span></div>'
+                html += f'<div class="row"><span class="label">Avg price:</span><span class="value">{avg_price*100:.1f}¢ ({american})</span></div>'
+                html += f'<div class="row"><span class="label">Cost:</span><span class="value">${cost_dollars:.2f}</span></div>'
+                html += f'<div class="row"><span class="label">Payout if right:</span><span class="value">${payout:.2f}</span></div>'
+                html += f'<div class="row"><span class="label">Potential profit:</span><span class="{pnl_class}">${potential_profit:.2f}</span></div>'
+                html += '</div>'
+
+            pnl_cls = 'pos' if total_pnl >= 0 else 'neg'
+            html += f'<div class="summary">'
+            html += f'<span>Total cost: <strong>${total_cost:.2f}</strong></span>'
+            html += f'<span>Total payout: <strong>${total_cost + total_pnl:.2f}</strong></span>'
+            html += f'<span>Potential P&L: <strong class="{pnl_cls}">${total_pnl:.2f}</strong></span>'
+            html += '</div>'
         else:
             html += '<div class="no-orders"><p>No open positions</p><p style="color:#666;font-size:0.9em">Positions from your Kalshi portfolio will appear here</p></div>'
 
