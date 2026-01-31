@@ -320,31 +320,83 @@ class FanDuelAPI:
         print(f"   FanDuel {sport_key} totals: {len(totals)} games")
         return {'totals': totals, 'games': games_dict}
 
+    def get_events(self, sport_key: str) -> list:
+        """Get today's event IDs for a sport (used for per-event prop fetching)."""
+        try:
+            now_utc = datetime.now(timezone.utc)
+            start_of_today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_of_today = start_of_today + timedelta(days=1)
+
+            url = f"{self.base_url}/sports/{sport_key}/events/"
+            params = {
+                'apiKey': self.api_key,
+                'commenceTimeFrom': start_of_today.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'commenceTimeTo': end_of_today.strftime('%Y-%m-%dT%H:%M:%SZ')
+            }
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"   FanDuel {sport_key} events error: {e}")
+            return []
+
     def get_player_props(self, sport_key: str, market_key: str) -> Dict:
-        """Get player prop lines. Returns {game_id: [{name, point, odds, description}]}."""
-        data = self._fetch(sport_key, market_key)
+        """Get player prop lines using per-event endpoint (required by The Odds API).
+        Returns {game_id: [{player, point, over_odds}]} and games dict."""
         props = {}
         games_dict = {}
-        for game in data:
-            game_id = game.get('id', '')
-            home = game.get('home_team', '')
-            away = game.get('away_team', '')
+
+        # Step 1: Get today's events for this sport
+        events = self.get_events(sport_key)
+        if not events:
+            print(f"   FanDuel {sport_key} {market_key}: no events today")
+            return {'props': props, 'games': games_dict}
+
+        print(f"   FanDuel {sport_key}: {len(events)} events today, fetching {market_key} props...")
+
+        # Step 2: Fetch props for each event individually
+        for event in events:
+            event_id = event.get('id', '')
+            home = event.get('home_team', '')
+            away = event.get('away_team', '')
             if home and away:
-                games_dict[game_id] = {'home': home, 'away': away}
-            for bm in game.get('bookmakers', []):
-                if bm['key'] == 'fanduel':
-                    for mkt in bm.get('markets', []):
-                        if mkt['key'] == market_key:
-                            game_props = []
-                            for o in mkt.get('outcomes', []):
-                                if o.get('name') == 'Over':
-                                    game_props.append({
-                                        'player': o.get('description', ''),
-                                        'point': o.get('point', 0),
-                                        'over_odds': o['price'],
-                                    })
-                            if game_props:
-                                props[game_id] = game_props
+                games_dict[event_id] = {'home': home, 'away': away}
+
+            try:
+                url = f"{self.base_url}/sports/{sport_key}/events/{event_id}/odds"
+                params = {
+                    'apiKey': self.api_key,
+                    'regions': 'us',
+                    'markets': market_key,
+                    'bookmakers': 'fanduel',
+                    'oddsFormat': 'decimal',
+                }
+                response = requests.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+
+                for bm in data.get('bookmakers', []):
+                    if bm['key'] == 'fanduel':
+                        for mkt in bm.get('markets', []):
+                            if mkt['key'] == market_key:
+                                game_props = []
+                                for o in mkt.get('outcomes', []):
+                                    if o.get('name') == 'Over':
+                                        game_props.append({
+                                            'player': o.get('description', ''),
+                                            'point': o.get('point', 0),
+                                            'over_odds': o['price'],
+                                        })
+                                if game_props:
+                                    props[event_id] = game_props
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else 'unknown'
+                print(f"   FanDuel {sport_key} event {event_id} {market_key}: HTTP {status}")
+            except Exception as e:
+                print(f"   FanDuel {sport_key} event {event_id} {market_key}: {e}")
+
+            time.sleep(0.5)  # Rate limit between per-event requests
+
         total_props = sum(len(v) for v in props.values())
         print(f"   FanDuel {sport_key} {market_key}: {total_props} props in {len(props)} games")
         return {'props': props, 'games': games_dict}
@@ -369,6 +421,10 @@ class KalshiAPI:
                 if cursor:
                     params['cursor'] = cursor
                 response = self.session.get(f"{self.BASE_URL}/markets", params=params, timeout=10)
+                if response.status_code == 429:
+                    print(f"   Kalshi 429 on {series_ticker} markets, backing off 5s...")
+                    time.sleep(5.0)
+                    response = self.session.get(f"{self.BASE_URL}/markets", params=params, timeout=10)
                 response.raise_for_status()
                 data = response.json()
                 markets = data.get('markets', [])
@@ -386,6 +442,10 @@ class KalshiAPI:
     def get_orderbook(self, ticker: str) -> Optional[Dict]:
         try:
             response = self.session.get(f"{self.BASE_URL}/markets/{ticker}/orderbook", timeout=10)
+            if response.status_code == 429:
+                print(f"   Kalshi 429 on {ticker}, backing off 5s...")
+                time.sleep(5.0)
+                response = self.session.get(f"{self.BASE_URL}/markets/{ticker}/orderbook", timeout=10)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -451,9 +511,9 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
             continue
 
         ob1 = kalshi_api.get_orderbook(team_markets[abbrevs[0]]['ticker'])
-        time.sleep(0.15)
+        time.sleep(0.3)
         ob2 = kalshi_api.get_orderbook(team_markets[abbrevs[1]]['ticker'])
-        time.sleep(0.15)
+        time.sleep(0.3)
         if not ob1 or not ob2:
             continue
 
@@ -597,18 +657,25 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                 continue
 
             fd_spread = fd_game_spreads[fd_team_name]
-            fd_point = abs(fd_spread['point'])
+            fd_point = fd_spread['point']  # SIGNED: negative = favorite, positive = underdog
             fd_odds = fd_spread['odds']
 
-            # Only compare EXACT matching spread lines (within 0.5 points)
-            if abs(floor_strike - fd_point) > 0.5:
+            # Kalshi spread markets are "Team wins by X+" which means the team is FAVORED.
+            # FanDuel returns negative points for favorites (e.g., -1.5) and positive for underdogs (+1.5).
+            # Only match if FanDuel spread is negative (team is favorite), matching Kalshi's "wins by X+".
+            if fd_point >= 0:
+                # FanDuel says this team is underdog (getting points), skip - not comparable to Kalshi "wins by X+"
+                continue
+
+            # Compare absolute values: Kalshi floor_strike (always positive) vs FanDuel |spread|
+            if abs(floor_strike - abs(fd_point)) > 0.5:
                 continue
 
             # Get Kalshi orderbook
             ob = kalshi_api.get_orderbook(ticker)
             if not ob:
                 continue
-            time.sleep(0.15)
+            time.sleep(0.3)
 
             yes_price = get_best_yes_price(ob)
             if yes_price is None:
@@ -737,7 +804,7 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
             ob = kalshi_api.get_orderbook(ticker)
             if not ob:
                 continue
-            time.sleep(0.15)
+            time.sleep(0.3)
 
             yes_price = get_best_yes_price(ob)  # YES = Over
             no_price = get_best_no_price(ob)    # NO = Under
@@ -873,7 +940,7 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
         ob = kalshi_api.get_orderbook(ticker)
         if not ob:
             continue
-        time.sleep(0.15)
+        time.sleep(0.3)
 
         yes_price = get_best_yes_price(ob)
         if yes_price is None:
@@ -935,7 +1002,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         edges = find_moneyline_edges(kalshi_api, fd, kalshi_series, name, team_map)
         all_edges.extend(edges)
         print(f"   {name} moneyline: {len(edges)} edges")
-        time.sleep(1.0)
+        time.sleep(2.0)
 
     # 2. Spread markets
     for kalshi_series, (odds_key, name, team_map) in SPREAD_SPORTS.items():
@@ -948,7 +1015,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         edges = find_spread_edges(kalshi_api, fd, kalshi_series, name, team_map)
         all_edges.extend(edges)
         print(f"   {name}: {len(edges)} edges")
-        time.sleep(1.0)
+        time.sleep(2.0)
 
     # 3. Total markets
     for kalshi_series, (odds_key, name) in TOTAL_SPORTS.items():
@@ -967,7 +1034,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         edges = find_total_edges(kalshi_api, fd, kalshi_series, name, team_map)
         all_edges.extend(edges)
         print(f"   {name}: {len(edges)} edges")
-        time.sleep(1.0)
+        time.sleep(2.0)
 
     # 4. Player props
     for kalshi_series, (odds_key, fd_market, name) in PLAYER_PROP_SPORTS.items():
@@ -980,7 +1047,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         edges = find_player_prop_edges(kalshi_api, fd, kalshi_series, name, fd_market)
         all_edges.extend(edges)
         print(f"   {name}: {len(edges)} edges")
-        time.sleep(1.0)
+        time.sleep(2.0)
 
     print(f"\n{'='*60}")
     print(f"SCAN COMPLETE")
