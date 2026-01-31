@@ -125,6 +125,15 @@ BTTS_SPORTS = {
     'KXUCLBTTS': ('soccer_uefa_champs_league', 'UCL BTTS'),
 }
 
+# Golf outright (winner) markets: kalshi_series -> (odds_api_sport_key, display_name)
+# The Odds API only has keys for the 4 major championships
+GOLF_SPORTS = {
+    'KXGOLFPGAWINNER': ('golf_pga_championship_winner', 'PGA Championship Winner'),
+    'KXGOLFMASTERSWINNER': ('golf_masters_tournament_winner', 'Masters Winner'),
+    'KXGOLFUSWINNER': ('golf_us_open_winner', 'US Open Winner'),
+    'KXGOLFOPENWINNER': ('golf_the_open_championship_winner', 'The Open Winner'),
+}
+
 # Auto-trade configuration
 AUTO_TRADE_ENABLED = True
 MAX_POSITIONS = 20
@@ -482,6 +491,13 @@ class OddsConverter:
     def decimal_to_implied_prob(odds: float) -> float:
         return 1 / odds
 
+    @staticmethod
+    def decimal_to_american(odds: float) -> str:
+        if odds >= 2.0:
+            return f"+{int(round((odds - 1) * 100))}"
+        else:
+            return f"-{int(round(100 / (odds - 1)))}"
+
 
 class FanDuelAPI:
     def __init__(self, api_key: str):
@@ -725,6 +741,45 @@ class FanDuelAPI:
         total_props = sum(len(v) for v in props.values())
         print(f"   FanDuel {sport_key} {market_key}: {total_props} props in {len(props)} games")
         return {'props': props, 'games': games_dict}
+
+    def get_golf_outrights(self, sport_key: str) -> Dict:
+        """Get golf outright (winner) odds. No time filter — tournaments span days.
+        Returns {player_name: decimal_odds}."""
+        try:
+            url = f"{self.base_url}/sports/{sport_key}/odds/"
+            params = {
+                'apiKey': self.api_key,
+                'regions': 'us',
+                'markets': 'outrights',
+                'bookmakers': 'fanduel',
+                'oddsFormat': 'decimal',
+            }
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            outrights = {}
+            event_name = ''
+            for event in data:
+                event_name = event.get('sport_title', '') or event.get('home_team', '') or sport_key
+                for bm in event.get('bookmakers', []):
+                    if bm['key'] == 'fanduel':
+                        for mkt in bm.get('markets', []):
+                            if mkt['key'] == 'outrights':
+                                for o in mkt.get('outcomes', []):
+                                    name = o.get('name', '')
+                                    odds = o.get('price', 0)
+                                    if name and odds:
+                                        outrights[name] = odds
+            print(f"   FanDuel {sport_key} outrights: {len(outrights)} players ({event_name})")
+            return {'outrights': outrights, 'event_name': event_name}
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 'unknown'
+            print(f"   FanDuel {sport_key} outrights: HTTP {status}")
+            return {'outrights': {}, 'event_name': ''}
+        except Exception as e:
+            print(f"   FanDuel {sport_key} outrights error: {e}")
+            return {'outrights': {}, 'event_name': ''}
 
 
 class KalshiAPI:
@@ -1637,6 +1692,114 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
 
 
 # ============================================================
+# GOLF OUTRIGHT EDGE FINDER
+# ============================================================
+
+def find_golf_edges(kalshi_api, fd_outrights, kalshi_series, sport_name):
+    """
+    Compare Kalshi golf outright markets against FanDuel outright odds.
+
+    Strategy: Buy NO on Kalshi when FD YES implies the player is overpriced.
+    total_implied = kalshi_no_eff + fd_yes_prob
+    If < 1.0, there's an edge on the NO side.
+
+    This is conservative: FD vig inflates YES probabilities, making it harder
+    to trigger false edges on the NO side.
+    """
+    converter = OddsConverter()
+    fd_players = fd_outrights.get('outrights', {})
+    event_name = fd_outrights.get('event_name', sport_name)
+    edges = []
+
+    if not fd_players:
+        return edges
+
+    kalshi_markets = kalshi_api.get_markets(kalshi_series)
+    if not kalshi_markets:
+        return edges
+
+    # Build FD lookup: {player_name_lower: decimal_odds}
+    fd_lookup = {name.lower().strip(): odds for name, odds in fd_players.items()}
+
+    for m in kalshi_markets:
+        ticker = m.get('ticker', '')
+        title = m.get('title', '')
+        subtitle = m.get('subtitle', '')
+
+        # Extract player name from title like "Justin Rose to win" or "Justin Rose: Winner"
+        # or just the player name itself
+        player_name = (title or subtitle or '').strip()
+        # Strip common suffixes
+        for suffix in [' to win', ' to Win', ': Winner', ': Yes', ' - Winner', ' - Yes']:
+            if player_name.endswith(suffix):
+                player_name = player_name[:-len(suffix)].strip()
+                break
+
+        if not player_name:
+            continue
+
+        # Match to FanDuel player
+        matched_fd_name = None
+        matched_fd_odds = None
+        for fd_name, fd_odds in fd_lookup.items():
+            if _match_player_name(player_name, fd_name):
+                matched_fd_name = fd_name
+                matched_fd_odds = fd_odds
+                break
+
+        if not matched_fd_odds:
+            continue
+
+        # Get Kalshi NO ask price (we're buying NO = player doesn't win)
+        ob = kalshi_api.get_orderbook(ticker)
+        if not ob:
+            continue
+        time.sleep(0.3)
+
+        no_price = get_best_no_price(ob)
+        if no_price is None:
+            continue
+
+        fee = kalshi_fee(no_price)
+        no_eff = no_price + fee
+
+        # FD YES implied probability (player wins)
+        fd_yes_prob = converter.decimal_to_implied_prob(matched_fd_odds)
+
+        # Opposite-side check: Kalshi NO + FD YES < 1.0 means edge
+        total_implied = no_eff + fd_yes_prob
+        if total_implied < 1.0:
+            profit = (1.0 / total_implied - 1) * 100
+            fd_american = converter.decimal_to_american(matched_fd_odds)
+
+            edge = {
+                'market_type': 'Golf Outright',
+                'sport': sport_name,
+                'game': event_name,
+                'team': f"{player_name} NO (doesn't win)",
+                'opposite_team': f"{player_name} YES (wins)",
+                'kalshi_price': no_price,
+                'kalshi_price_after_fees': no_eff,
+                'kalshi_prob_after_fees': no_eff * 100,
+                'kalshi_method': f"NO {player_name}",
+                'kalshi_ticker': ticker,
+                'kalshi_side': 'no',
+                'fanduel_opposite_team': f"{matched_fd_name.title()} to Win",
+                'fanduel_opposite_odds': matched_fd_odds,
+                'fanduel_opposite_prob': fd_yes_prob * 100,
+                'total_implied_prob': total_implied * 100,
+                'arbitrage_profit': profit,
+                'is_live': False,
+                'recommendation': f"Buy NO {player_name} on Kalshi at ${no_price:.2f} (FD YES at {fd_american})",
+            }
+            edges.append(edge)
+            send_telegram_notification(edge)
+            auto_trade_edge(edge, kalshi_api)
+
+    return edges
+
+
+# ============================================================
 # MAIN SCANNER
 # ============================================================
 
@@ -1712,6 +1875,19 @@ def scan_all_sports(kalshi_api, fanduel_api):
             continue
         sports_with_games.append(name)
         edges = find_btts_edges(kalshi_api, fd, kalshi_series, name)
+        all_edges.extend(edges)
+        print(f"   {name}: {len(edges)} edges")
+        time.sleep(1.0)
+
+    # 6. Golf outright markets
+    for kalshi_series, (odds_key, name) in GOLF_SPORTS.items():
+        print(f"\n--- {name} ({kalshi_series}) ---")
+        fd = fanduel_api.get_golf_outrights(odds_key)
+        sports_scanned.append(name)
+        if not fd['outrights']:
+            continue
+        sports_with_games.append(name)
+        edges = find_golf_edges(kalshi_api, fd, kalshi_series, name)
         all_edges.extend(edges)
         print(f"   {name}: {len(edges)} edges")
         time.sleep(1.0)
@@ -1794,6 +1970,7 @@ def status():
         'total_sports': list(TOTAL_SPORTS.keys()),
         'player_prop_sports': list(PLAYER_PROP_SPORTS.keys()),
         'btts_sports': list(BTTS_SPORTS.keys()),
+        'golf_sports': list(GOLF_SPORTS.keys()),
     })
 
 
@@ -1826,7 +2003,7 @@ def debug_view():
         type_colors = {
             'Moneyline': '#e74c3c', 'Spread': '#3498db',
             'Total': '#e67e22', 'Player Prop': '#9b59b6',
-            'BTTS': '#2ecc71',
+            'BTTS': '#2ecc71', 'Golf Outright': '#f1c40f',
         }
 
         html = f"""<!DOCTYPE html>
