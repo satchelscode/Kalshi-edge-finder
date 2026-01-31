@@ -1932,14 +1932,37 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
         return f"<h1 style='color:red'>Error</h1><pre>{e}</pre>", 500
 
 
-def _lookup_team_name(abbrev: str) -> Optional[str]:
-    """Look up full team name from abbreviation across all sport configs."""
+def _lookup_team_name(abbrev: str, series_prefix: str = '') -> Optional[str]:
+    """Look up full team name from abbreviation.
+    Uses series_prefix (e.g. 'KXNHL', 'KXNBA') to search ONLY the correct sport's map,
+    avoiding cross-sport collisions like PHI (76ers vs Flyers) or VAN (Canucks vs Vanderbilt).
+    Only falls back to all maps if no series_prefix is provided."""
+    if series_prefix:
+        # ONLY search the matching sport's team map — do NOT fall back
+        for sports_map in [MONEYLINE_SPORTS, SPREAD_SPORTS]:
+            for series_key, v in sports_map.items():
+                if series_key.startswith(series_prefix):
+                    tmap = v[2] if len(v) > 2 else {}
+                    if abbrev in tmap:
+                        return tmap[abbrev]
+        return None
+    # No prefix: search all maps (used when sport is unknown)
     for sports_map in [MONEYLINE_SPORTS, SPREAD_SPORTS]:
         for _, v in sports_map.items():
             tmap = v[2] if len(v) > 2 else {}
             if abbrev in tmap:
                 return tmap[abbrev]
     return None
+
+
+def _get_sport_prefix(ticker: str) -> str:
+    """Extract sport prefix from ticker for sport-aware team lookup.
+    e.g. KXNHLGAME-... -> 'KXNHL', KXNCAAMBGAME-... -> 'KXNCAAMB'"""
+    series_part = ticker.split('-')[0] if '-' in ticker else ticker
+    for suffix in ['GAME', 'BGAME', 'SPREAD', 'TOTAL', 'BTTS', 'PTS', 'REB', 'AST', '3PT', 'SAVES']:
+        if series_part.endswith(suffix):
+            return series_part[:-len(suffix)]
+    return series_part
 
 
 def _parse_ticker_teams(ticker: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -1950,6 +1973,7 @@ def _parse_ticker_teams(ticker: str) -> Tuple[Optional[str], Optional[str], Opti
     if len(parts) < 3:
         return None, None, None
 
+    sport_prefix = _get_sport_prefix(ticker)
     team_abbrev = parts[-1]
     game_part = parts[1]
 
@@ -1962,8 +1986,8 @@ def _parse_ticker_teams(ticker: str) -> Tuple[Optional[str], Optional[str], Opti
     if not opp_abbrev:
         return team_abbrev, None, None
 
-    team_name = _lookup_team_name(team_abbrev) or team_abbrev
-    opp_name = _lookup_team_name(opp_abbrev) or opp_abbrev
+    team_name = _lookup_team_name(team_abbrev, sport_prefix) or team_abbrev
+    opp_name = _lookup_team_name(opp_abbrev, sport_prefix) or opp_abbrev
 
     return team_abbrev, opp_abbrev, f"{opp_name} at {team_name}"
 
@@ -1991,20 +2015,38 @@ def _describe_position(market_info: Optional[Dict], ticker: str, side: str) -> T
         mtype = 'Prop' if ':' in title else 'Market'
 
     # Parse teams from ticker for moneyline/total/spread
+    sport_prefix = _get_sport_prefix(ticker)
     team_abbrev, opp_abbrev, game_display = _parse_ticker_teams(ticker)
 
     if mtype == 'Moneyline':
-        if side == 'NO' and opp_abbrev:
-            # NO on TOL = betting on BALL (opponent wins)
-            opp_name = _lookup_team_name(opp_abbrev) or opp_abbrev
-            return f"{opp_name} ML", mtype, game_display or subtitle
-        elif side == 'YES' and team_abbrev:
-            team_name = _lookup_team_name(team_abbrev) or team_abbrev
-            return f"{team_name} ML", mtype, game_display or subtitle
-        # Fallback: use title
-        if side == 'NO':
-            return f"NOT {title}", mtype, subtitle
-        return f"{title} ML", mtype, subtitle
+        # title from Kalshi API for a contract is the team name (e.g. "Vanderbilt Commodores")
+        # subtitle is usually the event name (e.g. "Ole Miss at Vanderbilt Winner?")
+        # Clean event name: strip " Winner?" suffix for game display
+        event_name = subtitle.replace(' Winner?', '').replace(' winner?', '') if subtitle else ''
+        game_line = event_name or game_display
+
+        if side == 'YES':
+            # YES on this contract = betting this team wins
+            team_name = _lookup_team_name(team_abbrev, sport_prefix) if team_abbrev else None
+            bet_name = team_name or title or team_abbrev or ticker
+            return f"{bet_name} ML", mtype, game_line
+        elif side == 'NO':
+            # NO on this contract = opponent wins. Try to resolve opponent name.
+            opp_name = _lookup_team_name(opp_abbrev, sport_prefix) if opp_abbrev else None
+            if opp_name:
+                return f"{opp_name} ML", mtype, game_line
+            # No team map for this sport — use event name to figure out opponent
+            # title = this contract's team. Event has "TeamA at TeamB".
+            # The opponent is whichever team in the event ISN'T the title.
+            if title and event_name:
+                # Try to remove the title team from event to find opponent
+                for sep in [' at ', ' vs ', ' vs. ']:
+                    if sep in event_name:
+                        teams = event_name.split(sep)
+                        if len(teams) == 2:
+                            opp = teams[1].strip() if title.lower() in teams[0].lower() else teams[0].strip()
+                            return f"{opp} ML", mtype, game_line
+            return f"NOT {title} ML" if title else f"NO · {ticker}", mtype, game_line
 
     elif mtype == 'Spread':
         # title from Kalshi is usually like "Team wins by X+"
@@ -2035,8 +2077,8 @@ def _describe_position(market_info: Optional[Dict], ticker: str, side: str) -> T
                 for length in range(2, len(teams_str) - 1):
                     t1 = teams_str[:length]
                     t2 = teams_str[length:]
-                    n1 = _lookup_team_name(t1)
-                    n2 = _lookup_team_name(t2)
+                    n1 = _lookup_team_name(t1, sport_prefix)
+                    n2 = _lookup_team_name(t2, sport_prefix)
                     if n1 and n2:
                         game_name = f"{n1} at {n2}"
                         break
