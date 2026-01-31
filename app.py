@@ -125,6 +125,30 @@ BTTS_SPORTS = {
     'KXUCLBTTS': ('soccer_uefa_champs_league', 'UCL BTTS'),
 }
 
+# Tennis match-winner markets: kalshi_series -> ([odds_api_sport_keys], display_name)
+# The Odds API uses tournament-specific keys; we try all and use whichever has data
+ATP_TOURNAMENT_KEYS = [
+    'tennis_atp_aus_open_singles', 'tennis_atp_french_open', 'tennis_atp_wimbledon',
+    'tennis_atp_us_open', 'tennis_atp_indian_wells', 'tennis_atp_miami_open',
+    'tennis_atp_madrid_open', 'tennis_atp_italian_open', 'tennis_atp_canadian_open',
+    'tennis_atp_cincinnati_open', 'tennis_atp_shanghai_masters', 'tennis_atp_paris_masters',
+    'tennis_atp_monte_carlo_masters', 'tennis_atp_dubai', 'tennis_atp_qatar_open',
+    'tennis_atp_china_open',
+]
+WTA_TOURNAMENT_KEYS = [
+    'tennis_wta_aus_open_singles', 'tennis_wta_french_open', 'tennis_wta_wimbledon',
+    'tennis_wta_us_open', 'tennis_wta_indian_wells', 'tennis_wta_miami_open',
+    'tennis_wta_madrid_open', 'tennis_wta_italian_open', 'tennis_wta_canadian_open',
+    'tennis_wta_cincinnati_open', 'tennis_wta_dubai', 'tennis_wta_qatar_open',
+    'tennis_wta_china_open', 'tennis_wta_wuhan_open',
+]
+TENNIS_SPORTS = {
+    'KXATPMATCH': (ATP_TOURNAMENT_KEYS, 'ATP Tennis'),
+    'KXWTAMATCH': (WTA_TOURNAMENT_KEYS, 'WTA Tennis'),
+    'KXATPCHALLENGERMATCH': (ATP_TOURNAMENT_KEYS, 'ATP Challenger'),
+    'KXWTACHALLENGERMATCH': (WTA_TOURNAMENT_KEYS, 'WTA Challenger'),
+}
+
 # Auto-trade configuration
 AUTO_TRADE_ENABLED = True
 MAX_POSITIONS = 40
@@ -513,6 +537,25 @@ class FanDuelAPI:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://api.the-odds-api.com/v4"
+        self._active_sports_cache = None
+        self._active_sports_ts = None
+
+    def get_active_sports(self) -> set:
+        """Get currently active sport keys from The Odds API. Cached for 30 min."""
+        now = time.time()
+        if self._active_sports_cache and self._active_sports_ts and (now - self._active_sports_ts) < 1800:
+            return self._active_sports_cache
+        try:
+            resp = requests.get(f"{self.base_url}/sports",
+                               params={'apiKey': self.api_key}, timeout=10)
+            resp.raise_for_status()
+            active = {s['key'] for s in resp.json() if s.get('active')}
+            self._active_sports_cache = active
+            self._active_sports_ts = now
+            return active
+        except Exception as e:
+            print(f"   Error fetching active sports: {e}")
+            return self._active_sports_cache or set()
 
     def _fetch(self, sport_key: str, markets: str = 'h2h') -> list:
         """Fetch odds for today and tomorrow (covers US evening + next day games)."""
@@ -1741,6 +1784,209 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
 
 
 # ============================================================
+# TENNIS EDGE FINDER
+# ============================================================
+
+def _extract_player_from_title(title: str) -> Optional[str]:
+    """Extract player name from Kalshi tennis title.
+    e.g. 'Will Matteo Martineau win the Martineau vs Damm Jr : Qualification Round 1 match?'
+    -> 'Matteo Martineau'"""
+    m = re.match(r'Will (.+?) win the ', title, re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
+
+def _tennis_name_matches(kalshi_name: str, fd_name: str) -> bool:
+    """Check if a Kalshi player name matches a FanDuel player name.
+    Handles variations: last name match, partial match, etc."""
+    k = kalshi_name.lower().strip()
+    f = fd_name.lower().strip()
+    if k == f:
+        return True
+    # Last name match (last word)
+    k_parts = k.split()
+    f_parts = f.split()
+    if k_parts and f_parts and k_parts[-1] == f_parts[-1]:
+        # Last names match — check first name initial or full match
+        if len(k_parts) == 1 or len(f_parts) == 1:
+            return True  # Only last name available
+        if k_parts[0] == f_parts[0]:
+            return True  # First + last match
+        if k_parts[0][0] == f_parts[0][0]:
+            return True  # Initial + last match
+        # Multi-word last names: check last 2 words
+        if len(k_parts) >= 2 and len(f_parts) >= 2:
+            if k_parts[-2] == f_parts[-2]:
+                return True
+    # Check if one contains the other (handles middle names, suffixes)
+    if k in f or f in k:
+        return True
+    return False
+
+
+def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys: list, sport_name: str):
+    """Find edges on tennis match-winner markets."""
+    converter = OddsConverter()
+    edges = []
+    today_str = datetime.utcnow().strftime('%y%b%d').upper()
+
+    # Step 1: Fetch Kalshi markets
+    kalshi_markets = kalshi_api.get_markets(series_ticker)
+    today_markets = [m for m in kalshi_markets if today_str in m.get('ticker', '')]
+    if not today_markets:
+        return edges
+
+    # Step 2: Fetch FanDuel odds from active tournament keys only
+    active_sports = fanduel_api.get_active_sports()
+    active_keys = [k for k in odds_api_keys if k in active_sports]
+    if not active_keys:
+        print(f"   No active tennis tournaments on The Odds API for {sport_name}")
+        return edges
+    print(f"   Active tournament keys: {', '.join(active_keys)}")
+
+    all_fd_odds = {}  # player_name -> {odds, game_id, last_update}
+    all_fd_games = {}  # game_id -> {home, away, commence_time}
+    for odds_key in active_keys:
+        try:
+            fd = fanduel_api.get_moneyline(odds_key)
+            if fd['odds']:
+                for name, data in fd['odds'].items():
+                    all_fd_odds[name] = data
+                all_fd_games.update(fd['games'])
+                print(f"   FanDuel {odds_key}: {len(fd['odds'])} outcomes")
+            time.sleep(0.3)
+        except Exception as e:
+            continue
+
+    if not all_fd_odds:
+        print(f"   No FanDuel tennis odds found for {sport_name}")
+        return edges
+
+    print(f"   Total FD tennis odds: {len(all_fd_odds)} players across {len(all_fd_games)} matches")
+
+    # Step 3: Group Kalshi markets by match (event_ticker)
+    matches = {}
+    for m in today_markets:
+        event = m.get('event_ticker', '')
+        if not event:
+            continue
+        if event not in matches:
+            matches[event] = []
+        matches[event].append(m)
+
+    # Step 4: For each match, find FD odds and check for edges
+    for event_ticker, match_markets in matches.items():
+        if len(match_markets) != 2:
+            continue
+
+        # Extract player names from Kalshi titles
+        players = []
+        for m in match_markets:
+            title = m.get('title', '')
+            player = _extract_player_from_title(title)
+            if player:
+                players.append({'name': player, 'market': m})
+
+        if len(players) != 2:
+            continue
+
+        p1, p2 = players[0], players[1]
+
+        # Match to FanDuel odds
+        fd_p1_name, fd_p2_name = None, None
+        fd_p1_odds, fd_p2_odds = None, None
+        for fd_name, fd_data in all_fd_odds.items():
+            if _tennis_name_matches(p1['name'], fd_name):
+                fd_p1_name = fd_name
+                fd_p1_odds = fd_data
+            elif _tennis_name_matches(p2['name'], fd_name):
+                fd_p2_name = fd_name
+                fd_p2_odds = fd_data
+
+        if not fd_p1_odds or not fd_p2_odds:
+            continue
+
+        # Staleness check
+        game_id = fd_p1_odds.get('game_id', '')
+        commence_str = all_fd_games.get(game_id, {}).get('commence_time', '')
+        game_live = is_game_live(commence_str)
+        fd_last_update = fd_p1_odds.get('last_update', '') or fd_p2_odds.get('last_update', '')
+        if are_odds_stale(commence_str, fd_last_update):
+            print(f"   Skipping {p1['name']} vs {p2['name']}: FD odds stale")
+            continue
+
+        game_name = f"{p1['name']} vs {p2['name']}"
+
+        # Get orderbooks
+        ob1 = kalshi_api.get_orderbook(p1['market']['ticker'])
+        time.sleep(0.3)
+        ob2 = kalshi_api.get_orderbook(p2['market']['ticker'])
+        time.sleep(0.3)
+        if not ob1 or not ob2:
+            continue
+
+        p1_yes = get_best_yes_price(ob1)
+        p1_no = get_best_no_price(ob1)
+        p2_yes = get_best_yes_price(ob2)
+        p2_no = get_best_no_price(ob2)
+        if None in [p1_yes, p1_no, p2_yes, p2_no]:
+            continue
+
+        # Build entries: for each player, find cheapest way to bet on them
+        # and compare to FD opposite side
+        entries = []
+        # Bet on player 1: YES on p1 or NO on p2 (whichever is cheaper)
+        if p1_yes <= p2_no:
+            entries.append((p1['name'], p1_yes, f"YES on {p1['name']}", fd_p2_name,
+                           p1['market']['ticker'], 'yes'))
+        else:
+            entries.append((p1['name'], p2_no, f"NO on {p2['name']}", fd_p2_name,
+                           p2['market']['ticker'], 'no'))
+        # Bet on player 2: YES on p2 or NO on p1
+        if p2_yes <= p1_no:
+            entries.append((p2['name'], p2_yes, f"YES on {p2['name']}", fd_p1_name,
+                           p2['market']['ticker'], 'yes'))
+        else:
+            entries.append((p2['name'], p1_no, f"NO on {p1['name']}", fd_p1_name,
+                           p1['market']['ticker'], 'no'))
+
+        for name, best_p, method, fd_opp_name, trade_ticker, trade_side in entries:
+            fee = kalshi_fee(best_p)
+            eff = best_p + fee
+            fd_opp_data = all_fd_odds.get(fd_opp_name, {})
+            if not fd_opp_data.get('odds'):
+                continue
+            fd_prob = converter.decimal_to_implied_prob(fd_opp_data['odds'])
+            total = eff + fd_prob
+            if total < 1.0:
+                profit = (1.0 / total - 1) * 100
+                edge = {
+                    'market_type': 'Tennis ML',
+                    'sport': sport_name,
+                    'game': game_name,
+                    'team': name,
+                    'opposite_team': fd_opp_name,
+                    'kalshi_price': best_p,
+                    'kalshi_price_after_fees': eff,
+                    'kalshi_prob_after_fees': eff * 100,
+                    'kalshi_method': method,
+                    'kalshi_ticker': trade_ticker,
+                    'kalshi_side': trade_side,
+                    'fanduel_opposite_team': fd_opp_name,
+                    'fanduel_opposite_odds': fd_opp_data['odds'],
+                    'fanduel_opposite_prob': fd_prob * 100,
+                    'total_implied_prob': total * 100,
+                    'arbitrage_profit': profit,
+                    'is_live': game_live,
+                    'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (FanDuel: {fd_opp_name} at {fd_opp_data['odds']:.2f})",
+                }
+                edges.append(edge)
+                send_telegram_notification(edge)
+                auto_trade_edge(edge, kalshi_api)
+
+    return edges
+
+
+# ============================================================
 # MAIN SCANNER
 # ============================================================
 
@@ -1823,6 +2069,17 @@ def scan_all_sports(kalshi_api, fanduel_api):
         print(f"   {name}: {len(edges)} edges")
         time.sleep(1.0)
 
+    # 6. Tennis match-winner markets
+    for kalshi_series, (odds_keys, name) in TENNIS_SPORTS.items():
+        print(f"\n--- {name} ({kalshi_series}) ---")
+        sports_scanned.append(name)
+        edges = find_tennis_edges(kalshi_api, fanduel_api, kalshi_series, odds_keys, name)
+        if edges:
+            sports_with_games.append(name)
+        all_edges.extend(edges)
+        print(f"   {name}: {len(edges)} edges")
+        time.sleep(1.0)
+
     print(f"\n{'='*60}")
     print(f"SCAN COMPLETE")
     print(f"Markets checked: {', '.join(sports_scanned)}")
@@ -1901,6 +2158,7 @@ def status():
         'total_sports': list(TOTAL_SPORTS.keys()),
         'player_prop_sports': list(PLAYER_PROP_SPORTS.keys()),
         'btts_sports': list(BTTS_SPORTS.keys()),
+        'tennis_sports': list(TENNIS_SPORTS.keys()),
     })
 
 
@@ -2018,7 +2276,7 @@ def _get_sport_prefix(ticker: str) -> str:
     """Extract sport prefix from ticker for sport-aware team lookup.
     e.g. KXNHLGAME-... -> 'KXNHL', KXNCAAMBGAME-... -> 'KXNCAAMB'"""
     series_part = ticker.split('-')[0] if '-' in ticker else ticker
-    for suffix in ['GAME', 'BGAME', 'SPREAD', 'TOTAL', 'BTTS', 'PTS', 'REB', 'AST', '3PT', 'SAVES']:
+    for suffix in ['CHALLENGERMATCH', 'MATCH', 'BGAME', 'GAME', 'SPREAD', 'TOTALSETS', 'TOTAL', 'BTTS', 'PTS', 'REB', 'AST', '3PT', 'SAVES', 'SETWINNER', 'ANYSET']:
         if series_part.endswith(suffix):
             return series_part[:-len(suffix)]
     return series_part
@@ -2062,7 +2320,9 @@ def _describe_position(market_info: Optional[Dict], ticker: str, side: str) -> T
     series_ticker = (market_info.get('series_ticker', '') or ticker).upper()
 
     # Determine market type from series ticker
-    if 'SPREAD' in series_ticker:
+    if 'MATCH' in series_ticker or 'CHALLENGERMATCH' in series_ticker:
+        mtype = 'Tennis ML'
+    elif 'SPREAD' in series_ticker:
         mtype = 'Spread'
     elif 'TOTAL' in series_ticker:
         mtype = 'Total'
@@ -2077,7 +2337,30 @@ def _describe_position(market_info: Optional[Dict], ticker: str, side: str) -> T
     sport_prefix = _get_sport_prefix(ticker)
     team_abbrev, opp_abbrev, game_display = _parse_ticker_teams(ticker)
 
-    if mtype == 'Moneyline':
+    if mtype == 'Tennis ML':
+        # Tennis title: "Will Matteo Martineau win the Martineau vs Damm Jr : Qualification Round 1 match?"
+        player = _extract_player_from_title(title)
+        # Extract match name from title: "Martineau vs Damm Jr : Qualification Round 1"
+        match_info = ''
+        m = re.search(r'win the (.+?)(?:\s+match)?\?', title, re.IGNORECASE)
+        if m:
+            match_info = m.group(1).strip()
+        if side == 'YES':
+            return f"{player or title} ML", mtype, match_info
+        else:
+            # NO = opponent wins. Try to extract opponent from match info
+            if match_info and ' vs ' in match_info:
+                parts = match_info.split(' vs ')
+                p1_last = parts[0].strip().split(':')[0].strip()
+                p2_last = parts[1].strip().split(':')[0].strip()
+                # Figure out which is ours
+                if player and p1_last.lower() in player.lower():
+                    return f"{p2_last} ML", mtype, match_info
+                else:
+                    return f"{p1_last} ML", mtype, match_info
+            return f"NOT {player or title} ML", mtype, match_info
+
+    elif mtype == 'Moneyline':
         # Kalshi API structure varies by sport:
         # - NBA/NHL: title = team name (e.g. "Boston Celtics"), subtitle = event (e.g. "Boston at Miami Winner?")
         # - NCAAMB/soccer: title = event question (e.g. "Marquette at Seton Hall Winner?"), subtitle = empty
@@ -2296,7 +2579,7 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
 
         type_colors = {
             'Moneyline': '#e74c3c', 'Spread': '#3498db', 'Total': '#e67e22',
-            'Prop': '#9b59b6', 'BTTS': '#2ecc71', 'Market': '#95a5a6',
+            'Prop': '#9b59b6', 'BTTS': '#2ecc71', 'Tennis ML': '#1abc9c', 'Market': '#95a5a6',
         }
 
         if active_positions:
