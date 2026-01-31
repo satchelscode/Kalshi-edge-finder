@@ -579,21 +579,25 @@ class KalshiAPI:
 
 
 def get_best_yes_price(ob: Dict) -> Optional[float]:
-    """Get best YES price from orderbook (what you'd pay to buy YES)."""
-    data = ob.get('orderbook', {})
-    yes_bids = data.get('yes', [])
-    if not yes_bids:
-        return None
-    return max(yes_bids, key=lambda x: x[0])[0] / 100
-
-
-def get_best_no_price(ob: Dict) -> Optional[float]:
-    """Get best NO price from orderbook."""
+    """Get best YES ask price (what you'd pay to buy YES instantly).
+    In Kalshi's binary market: YES ask = 100 - best NO bid."""
     data = ob.get('orderbook', {})
     no_bids = data.get('no', [])
     if not no_bids:
         return None
-    return max(no_bids, key=lambda x: x[0])[0] / 100
+    best_no_bid = max(no_bids, key=lambda x: x[0])[0]
+    return (100 - best_no_bid) / 100
+
+
+def get_best_no_price(ob: Dict) -> Optional[float]:
+    """Get best NO ask price (what you'd pay to buy NO instantly).
+    In Kalshi's binary market: NO ask = 100 - best YES bid."""
+    data = ob.get('orderbook', {})
+    yes_bids = data.get('yes', [])
+    if not yes_bids:
+        return None
+    best_yes_bid = max(yes_bids, key=lambda x: x[0])[0]
+    return (100 - best_yes_bid) / 100
 
 
 # ============================================================
