@@ -668,7 +668,7 @@ class FanDuelAPI:
 
     def get_player_props(self, sport_key: str, market_key: str) -> Dict:
         """Get player prop lines using per-event endpoint (required by The Odds API).
-        Returns {game_id: [{player, point, over_odds}]} and games dict."""
+        Returns {game_id: [{player, point, over_odds, under_odds}]} and games dict."""
         props = {}
         games_dict = {}
 
@@ -705,14 +705,19 @@ class FanDuelAPI:
                     if bm['key'] == 'fanduel':
                         for mkt in bm.get('markets', []):
                             if mkt['key'] == market_key:
-                                game_props = []
+                                # Group by player+point to pair Over/Under
+                                paired = {}  # (player, point) -> {over_odds, under_odds}
                                 for o in mkt.get('outcomes', []):
+                                    player = o.get('description', '')
+                                    point = o.get('point', 0)
+                                    key = (player, point)
+                                    if key not in paired:
+                                        paired[key] = {'player': player, 'point': point}
                                     if o.get('name') == 'Over':
-                                        game_props.append({
-                                            'player': o.get('description', ''),
-                                            'point': o.get('point', 0),
-                                            'over_odds': o['price'],
-                                        })
+                                        paired[key]['over_odds'] = o['price']
+                                    elif o.get('name') == 'Under':
+                                        paired[key]['under_odds'] = o['price']
+                                game_props = [v for v in paired.values() if 'over_odds' in v and 'under_odds' in v]
                                 if game_props:
                                     props[event_id] = game_props
             except requests.exceptions.HTTPError as e:
@@ -1386,7 +1391,7 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
     if not today_markets:
         return edges
 
-    # Build FanDuel lookup: {player_name_lower: [{point, over_odds, game_id}]}
+    # Build FanDuel lookup: {player_name_lower: [{point, over_odds, under_odds, game_id}]}
     fd_lookup = {}
     for game_id, props in fd_props.items():
         for prop in props:
@@ -1396,6 +1401,7 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
             fd_lookup[player].append({
                 'point': prop['point'],
                 'over_odds': prop['over_odds'],
+                'under_odds': prop['under_odds'],
                 'game_id': game_id,
             })
 
@@ -1444,12 +1450,14 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
         fee = kalshi_fee(yes_price)
         eff = yes_price + fee
 
-        fd_over_prob = converter.decimal_to_implied_prob(best_fd_match['over_odds'])
+        # Opposite-side method (same as spreads/totals/moneyline):
+        # Kalshi YES = player hits Over. FD Under = opposite side.
+        # total_implied = kalshi_yes_eff + fd_under_prob. Edge if < 1.0
+        fd_under_prob = converter.decimal_to_implied_prob(best_fd_match['under_odds'])
+        total_implied = eff + fd_under_prob
 
-        # Kalshi YES = player hits prop. FanDuel Over = same thing.
-        # If Kalshi is cheaper than FanDuel implies -> +EV
-        if eff < fd_over_prob:
-            edge_pct = ((fd_over_prob / eff) - 1) * 100
+        if total_implied < 1.0:
+            profit = (1.0 / total_implied - 1) * 100
             game_id = best_fd_match['game_id']
             game_info = fd_games.get(game_id, {})
             game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
@@ -1467,13 +1475,13 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
                 'kalshi_method': f"YES {player_name} {kalshi_line}+",
                 'kalshi_ticker': ticker,
                 'kalshi_side': 'yes',
-                'fanduel_opposite_team': f"{player_name} Over {best_fd_match['point']}",
-                'fanduel_opposite_odds': best_fd_match['over_odds'],
-                'fanduel_opposite_prob': fd_over_prob * 100,
-                'total_implied_prob': (eff + (1 - fd_over_prob)) * 100,
-                'arbitrage_profit': edge_pct,
+                'fanduel_opposite_team': f"{player_name} Under {best_fd_match['point']}",
+                'fanduel_opposite_odds': best_fd_match['under_odds'],
+                'fanduel_opposite_prob': fd_under_prob * 100,
+                'total_implied_prob': total_implied * 100,
+                'arbitrage_profit': profit,
                 'is_live': game_live,
-                'recommendation': f"Buy YES {player_name} {kalshi_line}+ on Kalshi at ${yes_price:.2f} (FanDuel Over {best_fd_match['point']} at {best_fd_match['over_odds']:.2f})",
+                'recommendation': f"Buy YES {player_name} {kalshi_line}+ on Kalshi at ${yes_price:.2f} (FanDuel Under {best_fd_match['point']} at {best_fd_match['under_odds']:.2f})",
             }
             edges.append(edge)
             send_telegram_notification(edge)
