@@ -99,7 +99,7 @@ SPORTS_CONFIG = {
     'KXSERIEAGAME': ('soccer_italy_serie_a', 'Serie A', {}, False),
     'KXLIGUE1GAME': ('soccer_france_ligue_one', 'Ligue 1', {}, False),
     'KXMLSGAME': ('soccer_usa_mls', 'MLS', {}, False),
-    'KXUCLGAME': ('soccer_uefa_champions_league', 'Champions League', {}, False),
+    'KXUCLGAME': ('soccer_uefa_champs_league', 'Champions League', {}, False),
 }
 
 # Track which edges we've already notified about (prevent duplicate alerts)
@@ -264,7 +264,14 @@ class FanDuelAPI:
         self.base_url = "https://api.the-odds-api.com/v4"
 
     def get_odds(self, sport_key: str) -> Dict:
-        """Fetch odds for any sport from FanDuel via The Odds API, filtered to today only"""
+        """
+        Fetch odds for any sport from FanDuel via The Odds API, filtered to today only.
+
+        Returns TWO dicts:
+        - odds_dict: team_name -> {odds, team, game_id}
+        - games_dict: game_id -> {home, away} (teams paired by game)
+        Wrapped in a single dict: {'odds': odds_dict, 'games': games_dict}
+        """
         try:
             now_utc = datetime.now(timezone.utc)
             start_of_today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -285,10 +292,17 @@ class FanDuelAPI:
             response.raise_for_status()
             data = response.json()
 
-            # For soccer (3-way), group odds by game so we can access draw odds too
             odds_dict = {}
+            games_dict = {}
+
             for game in data:
-                game_teams = []
+                game_id = game.get('id', '')
+                home_team = game.get('home_team', '')
+                away_team = game.get('away_team', '')
+
+                if home_team and away_team:
+                    games_dict[game_id] = {'home': home_team, 'away': away_team}
+
                 for bookmaker in game.get('bookmakers', []):
                     if bookmaker['key'] == 'fanduel':
                         for market in bookmaker.get('markets', []):
@@ -298,21 +312,22 @@ class FanDuelAPI:
                                     odds = outcome['price']
                                     odds_dict[team_name] = {
                                         'odds': odds,
-                                        'team': team_name
+                                        'team': team_name,
+                                        'game_id': game_id
                                     }
 
-            print(f"   Fetched {len(odds_dict)} FanDuel {sport_key} odds (today: {start_of_today.strftime('%Y-%m-%d')})")
-            return odds_dict
+            print(f"   Fetched {len(odds_dict)} FanDuel {sport_key} odds in {len(games_dict)} games (today: {start_of_today.strftime('%Y-%m-%d')})")
+            return {'odds': odds_dict, 'games': games_dict}
 
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 422:
                 print(f"   Sport {sport_key} not available on The Odds API right now (422)")
             else:
                 print(f"   Error fetching FanDuel {sport_key} odds: {e}")
-            return {}
+            return {'odds': {}, 'games': {}}
         except Exception as e:
             print(f"   Error fetching FanDuel {sport_key} odds: {e}")
-            return {}
+            return {'odds': {}, 'games': {}}
 
 
 class KalshiAPI:
@@ -383,7 +398,69 @@ class KalshiAPI:
             return None
 
 
-def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAME',
+def match_kalshi_to_fanduel_game(team1_name, team2_name, fd_odds, fd_games):
+    """
+    Find a FanDuel game where BOTH Kalshi teams match.
+    Returns (fd_team1_name, fd_team2_name) or (None, None) if no valid match.
+
+    This prevents matching Kalshi abbreviations to random unrelated FanDuel teams.
+    """
+    # For each FanDuel game, try to match both Kalshi teams
+    for game_id, game_info in fd_games.items():
+        fd_home = game_info['home']
+        fd_away = game_info['away']
+
+        # Try matching team1 to home/away and team2 to the other
+        t1_matches_home = _name_matches(team1_name, fd_home)
+        t1_matches_away = _name_matches(team1_name, fd_away)
+        t2_matches_home = _name_matches(team2_name, fd_home)
+        t2_matches_away = _name_matches(team2_name, fd_away)
+
+        if t1_matches_home and t2_matches_away:
+            return fd_home, fd_away
+        if t1_matches_away and t2_matches_home:
+            return fd_away, fd_home
+
+    return None, None
+
+
+def _name_matches(kalshi_name: str, fd_name: str, threshold: float = 0.55) -> bool:
+    """Check if a Kalshi team name matches a FanDuel team name."""
+    k = kalshi_name.lower().strip()
+    f = fd_name.lower().strip()
+
+    # Exact match
+    if k == f:
+        return True
+
+    # Kalshi name is contained in FanDuel name (e.g., "SYR" in "Syracuse Orange")
+    if k in f:
+        return True
+
+    # Check if any Kalshi word is a significant part of the FanDuel name
+    k_words = k.split()
+    f_words = f.split()
+
+    # Any full word match (e.g., "Syracuse" matches "Syracuse Orange")
+    for kw in k_words:
+        if len(kw) >= 3:  # Skip very short words
+            for fw in f_words:
+                if kw == fw or (len(kw) >= 4 and kw in fw):
+                    return True
+
+    # SequenceMatcher for full string similarity
+    score = SequenceMatcher(None, k, f).ratio()
+    if score >= threshold:
+        return True
+
+    # Check cache
+    if kalshi_name in TEAM_NAME_CACHE and TEAM_NAME_CACHE[kalshi_name] == fd_name:
+        return True
+
+    return False
+
+
+def find_edges(kalshi_api, fd_data, min_edge=0.005, series_ticker='KXNBAGAME',
                sport_name='NBA', team_map=None):
     """
     Find +EV opportunities by checking BOTH ways to bet on each outcome.
@@ -393,17 +470,22 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
     2. Buy NO on their opponent
 
     We pick the CHEAPER option and compare against FanDuel fair value.
+
+    CRITICAL: Both Kalshi teams must match to the SAME FanDuel game to prevent
+    false matches (e.g., Kalshi "VAN vs MISS" matching to random FanDuel teams).
     """
     if team_map is None:
         team_map = {}
 
+    fanduel_odds = fd_data['odds']
+    fanduel_games = fd_data['games']
     converter = OddsConverter()
     edges = []
 
     print(f"\n{'='*60}")
     print(f"FINDING EDGES: {sport_name} ({series_ticker})")
     print(f"{'='*60}")
-    print(f"   FanDuel has {len(fanduel_odds)} outcomes - only checking matching Kalshi markets")
+    print(f"   FanDuel has {len(fanduel_odds)} outcomes in {len(fanduel_games)} games")
 
     # Get all markets for the specified series
     kalshi_markets = kalshi_api.get_markets(series_ticker=series_ticker, limit=200)
@@ -413,7 +495,7 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
         return edges
 
     # Filter for TODAY only
-    today_str = datetime.utcnow().strftime('%y%b%d').upper()  # e.g., "26JAN30"
+    today_str = datetime.utcnow().strftime('%y%b%d').upper()
     today_markets = [m for m in kalshi_markets if today_str in m.get('ticker', '')]
     print(f"   TODAY's markets ({today_str}): {len(today_markets)}")
 
@@ -422,8 +504,6 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
         return edges
 
     # Group markets by game
-    # Ticker format: KXNBAGAME-26JAN30NOPVSMEM-NOP
-    # We group by everything before the last dash (the team code)
     games = {}
     for market in today_markets:
         ticker = market.get('ticker', '')
@@ -431,16 +511,14 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
         if len(parts) < 3:
             continue
 
-        # Game identifier is the middle part (date + matchup code)
-        # Team abbrev is the last part
-        game_code = '-'.join(parts[:-1])  # Everything except last part
+        game_code = '-'.join(parts[:-1])
         team_abbrev = parts[-1]
 
         if game_code not in games:
             games[game_code] = {}
         games[game_code][team_abbrev] = market
 
-    print(f"   Found {len(games)} unique games\n")
+    print(f"   Found {len(games)} unique Kalshi games\n")
 
     for game_code, team_markets in games.items():
         if len(team_markets) != 2:
@@ -451,17 +529,31 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
         team1_name = team_map.get(team1_abbrev, team1_abbrev)
         team2_name = team_map.get(team2_abbrev, team2_abbrev)
 
-        # Check if either team matches FanDuel
-        fd_keys = list(fanduel_odds.keys())
-        team1_on_fd = team1_name in fanduel_odds or fuzzy_match_team(team1_name, fd_keys, threshold=0.6)
-        team2_on_fd = team2_name in fanduel_odds or fuzzy_match_team(team2_name, fd_keys, threshold=0.6)
+        # CRITICAL: Match BOTH teams to the SAME FanDuel game
+        fd_team1, fd_team2 = match_kalshi_to_fanduel_game(
+            team1_name, team2_name, fanduel_odds, fanduel_games
+        )
 
-        if not team1_on_fd and not team2_on_fd:
-            print(f"   Skipping {team1_name} vs {team2_name} - not on FanDuel")
+        if not fd_team1 or not fd_team2:
+            print(f"   Skipping {team1_name} vs {team2_name} - no matching FanDuel game")
             continue
+
+        # Verify both teams have odds
+        if fd_team1 not in fanduel_odds or fd_team2 not in fanduel_odds:
+            print(f"   Skipping {team1_name} vs {team2_name} - FanDuel odds incomplete")
+            continue
+
+        # Cache the successful mappings
+        if team1_name != fd_team1:
+            TEAM_NAME_CACHE[team1_name] = fd_team1
+        if team2_name != fd_team2:
+            TEAM_NAME_CACHE[team2_name] = fd_team2
+        save_team_name_cache(TEAM_NAME_CACHE)
 
         print(f"{'='*60}")
         print(f"   {sport_name}: {team1_name} vs {team2_name}")
+        if team1_name != fd_team1:
+            print(f"   Matched: {team1_name} -> {fd_team1}, {team2_name} -> {fd_team2}")
 
         # Get orderbooks
         ob1 = kalshi_api.get_orderbook(team_markets[team1_abbrev]['ticker'])
@@ -471,7 +563,6 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
             print(f"   Missing orderbook\n")
             continue
 
-        # Extract prices
         def get_prices(ob):
             data = ob.get('orderbook', {})
             yes_bids = data.get('yes', [])
@@ -504,30 +595,12 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
         print(f"   {team2_name} wins: ${team2_best_price:.2f} ({team2_method})")
 
         # Check each outcome against FanDuel
-        for team_name, best_price, method in [
-            (team1_name, team1_best_price, team1_method),
-            (team2_name, team2_best_price, team2_method)
+        for team_name, best_price, method, fd_name, fd_opp_name in [
+            (team1_name, team1_best_price, team1_method, fd_team1, fd_team2),
+            (team2_name, team2_best_price, team2_method, fd_team2, fd_team1)
         ]:
-            opposite_team = team2_name if team_name == team1_name else team1_name
-
-            # Resolve FanDuel names
-            fd_team_name = team_name
-            fd_opposite_name = opposite_team
-
-            if team_name not in fanduel_odds:
-                matched = fuzzy_match_team(team_name, fd_keys)
-                if not matched:
-                    continue
-                fd_team_name = matched
-
-            if opposite_team not in fanduel_odds:
-                matched = fuzzy_match_team(opposite_team, fd_keys)
-                if not matched:
-                    continue
-                fd_opposite_name = matched
-
             # FanDuel odds for the OPPOSITE outcome
-            fd_opposite_odds = fanduel_odds[fd_opposite_name]['odds']
+            fd_opposite_odds = fanduel_odds[fd_opp_name]['odds']
             fd_opposite_prob = converter.decimal_to_implied_prob(fd_opposite_odds)
 
             # Kalshi fee: round_up(0.07 * C * P * (1-P))
@@ -543,39 +616,39 @@ def find_edges(kalshi_api, fanduel_odds, min_edge=0.005, series_ticker='KXNBAGAM
             if total_prob < 1.0:
                 arbitrage_profit = (1.0 / total_prob) - 1
 
-                print(f"\n   {team_name}:")
+                print(f"\n   {team_name} ({fd_name}):")
                 print(f"      Kalshi: ${P:.2f} ({P*100:.1f}%) - {method}")
                 print(f"      Kalshi fee: ${fee_per_contract:.4f}/contract")
                 print(f"      Kalshi after fees: ${effective_cost:.4f} ({kalshi_prob_after_fees*100:.2f}%)")
-                print(f"      FanDuel {fd_opposite_name}: {fd_opposite_odds:.2f} ({fd_opposite_prob*100:.2f}%)")
+                print(f"      FanDuel {fd_opp_name}: {fd_opposite_odds:.2f} ({fd_opposite_prob*100:.2f}%)")
                 print(f"      Total implied prob: {total_prob*100:.2f}%")
                 print(f"      +EV: {arbitrage_profit*100:.2f}%")
 
                 edge_data = {
                     'sport': sport_name,
-                    'game': f"{team1_name} vs {team2_name}",
-                    'team': team_name,
-                    'opposite_team': fd_opposite_name,
+                    'game': f"{fd_name} vs {fd_opp_name}",
+                    'team': fd_name,
+                    'opposite_team': fd_opp_name,
                     'kalshi_price': best_price,
                     'kalshi_fee_per_contract': fee_per_contract,
                     'kalshi_price_after_fees': effective_cost,
                     'kalshi_prob_after_fees': kalshi_prob_after_fees * 100,
                     'kalshi_method': method,
-                    'fanduel_opposite_team': fd_opposite_name,
+                    'fanduel_opposite_team': fd_opp_name,
                     'fanduel_opposite_odds': fd_opposite_odds,
                     'fanduel_opposite_prob': fd_opposite_prob * 100,
                     'total_implied_prob': total_prob * 100,
                     'arbitrage_profit': arbitrage_profit * 100,
-                    'recommendation': f"Buy {method} on Kalshi at ${best_price:.2f} (FanDuel fair value: {fd_opposite_name} at {fd_opposite_odds:.2f})",
-                    'strategy': f"1. Buy {method} on Kalshi\n2. FanDuel benchmark: {fd_opposite_name} at {fd_opposite_odds:.2f}"
+                    'recommendation': f"Buy {method} on Kalshi at ${best_price:.2f} (FanDuel fair value: {fd_opp_name} at {fd_opposite_odds:.2f})",
+                    'strategy': f"1. Buy {method} on Kalshi\n2. FanDuel benchmark: {fd_opp_name} at {fd_opposite_odds:.2f}"
                 }
 
                 edges.append(edge_data)
                 send_telegram_notification(edge_data)
             else:
-                print(f"\n   {team_name}:")
+                print(f"\n   {team_name} ({fd_name}):")
                 print(f"      Kalshi after fees: ${effective_cost:.4f} ({kalshi_prob_after_fees*100:.2f}%)")
-                print(f"      FanDuel {opposite_team}: {fd_opposite_odds:.2f} ({fd_opposite_prob*100:.2f}%)")
+                print(f"      FanDuel {fd_opp_name}: {fd_opposite_odds:.2f} ({fd_opposite_prob*100:.2f}%)")
                 print(f"      Total implied prob: {total_prob*100:.2f}%")
                 print(f"      No edge (total > 100%)")
 
@@ -595,9 +668,9 @@ def scan_all_sports(kalshi_api, fanduel_api, min_edge=0.005):
     for kalshi_series, (odds_api_key, display_name, team_map, is_two_way) in SPORTS_CONFIG.items():
         print(f"\n--- Fetching FanDuel odds for {display_name} ({odds_api_key}) ---")
 
-        fd_odds = fanduel_api.get_odds(odds_api_key)
+        fd_data = fanduel_api.get_odds(odds_api_key)
 
-        if not fd_odds:
+        if not fd_data['odds']:
             print(f"   No FanDuel odds for {display_name} today - skipping")
             sports_scanned.append(display_name)
             continue
@@ -606,7 +679,7 @@ def scan_all_sports(kalshi_api, fanduel_api, min_edge=0.005):
         sports_with_games.append(display_name)
 
         sport_edges = find_edges(
-            kalshi_api, fd_odds, min_edge,
+            kalshi_api, fd_data, min_edge,
             series_ticker=kalshi_series,
             sport_name=display_name,
             team_map=team_map
