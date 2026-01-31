@@ -2025,27 +2025,44 @@ def _describe_position(market_info: Optional[Dict], ticker: str, side: str) -> T
         event_name = subtitle.replace(' Winner?', '').replace(' winner?', '') if subtitle else ''
         game_line = event_name or game_display
 
+        # Parse event name into two teams for name resolution
+        event_teams = []
+        for sep in [' at ', ' vs ', ' vs. ']:
+            if sep in event_name:
+                event_teams = [t.strip() for t in event_name.split(sep)]
+                break
+
         if side == 'YES':
             # YES on this contract = betting this team wins
             team_name = _lookup_team_name(team_abbrev, sport_prefix) if team_abbrev else None
+            if not team_name and event_teams and team_abbrev:
+                # No team map — figure out which event team matches this contract's abbrev
+                # The ticker ends with the team abbrev. Match by checking if abbrev appears
+                # in the event team name or title
+                tl = (title or '').lower()
+                for et in event_teams:
+                    if et.lower() in tl or tl in et.lower() or (tl.split()[0] == et.lower().split()[0] if tl and et else False):
+                        team_name = et
+                        break
             bet_name = team_name or title or team_abbrev or ticker
+            # Clean up "Winner?" from bet name if present
+            bet_name = bet_name.replace(' Winner?', '').replace(' winner?', '')
             return f"{bet_name} ML", mtype, game_line
+
         elif side == 'NO':
             # NO on this contract = opponent wins. Try to resolve opponent name.
             opp_name = _lookup_team_name(opp_abbrev, sport_prefix) if opp_abbrev else None
             if opp_name:
                 return f"{opp_name} ML", mtype, game_line
-            # No team map for this sport — use event name to figure out opponent
-            # title = this contract's team. Event has "TeamA at TeamB".
-            # The opponent is whichever team in the event ISN'T the title.
-            if title and event_name:
-                # Try to remove the title team from event to find opponent
-                for sep in [' at ', ' vs ', ' vs. ']:
-                    if sep in event_name:
-                        teams = event_name.split(sep)
-                        if len(teams) == 2:
-                            opp = teams[1].strip() if title.lower() in teams[0].lower() else teams[0].strip()
-                            return f"{opp} ML", mtype, game_line
+            # No team map — use event name to figure out opponent
+            if event_teams and len(event_teams) == 2:
+                tl = (title or '').lower()
+                t0 = event_teams[0].lower()
+                t1 = event_teams[1].lower()
+                # Check if title matches team 0
+                t0_match = (tl in t0) or (t0 in tl) or (t0.split()[0] == tl.split()[0] if tl and t0 else False)
+                opp = event_teams[1] if t0_match else event_teams[0]
+                return f"{opp} ML", mtype, game_line
             return f"NOT {title} ML" if title else f"NO · {ticker}", mtype, game_line
 
     elif mtype == 'Spread':
