@@ -176,13 +176,12 @@ class OrderTracker:
             self._api_tickers = set()
             for pos in positions:
                 ticker = pos.get('ticker', '')
-                # Only count positions where we actually hold contracts
-                yes_count = pos.get('position', 0)
-                no_count = pos.get('total_traded', 0)
-                if ticker and (yes_count != 0 or no_count != 0):
+                # position > 0 = YES held, position < 0 = NO held, 0 = settled/closed
+                position = pos.get('position', 0)
+                if ticker and position != 0:
                     self._api_tickers.add(ticker)
             self._position_count = len(self._api_tickers)
-            print(f"   OrderTracker synced: {self._position_count} positions from Kalshi API")
+            print(f"   OrderTracker synced: {self._position_count} active positions from Kalshi API")
         except Exception as e:
             print(f"   OrderTracker sync error: {e}")
 
@@ -906,6 +905,28 @@ class KalshiAPI:
         if result:
             return result.get('orders', [])
         return []
+
+    def get_settlements(self, limit: int = 200) -> List[Dict]:
+        """Get settlement history from Kalshi."""
+        all_settlements = []
+        cursor = None
+        try:
+            while True:
+                params = {'limit': limit}
+                if cursor:
+                    params['cursor'] = cursor
+                result = self._auth_get('/trade-api/v2/portfolio/settlements', params=params)
+                if not result:
+                    break
+                settlements = result.get('settlements', [])
+                all_settlements.extend(settlements)
+                cursor = result.get('cursor')
+                if not cursor:
+                    break
+            return all_settlements
+        except Exception as e:
+            print(f"   Kalshi get_settlements error: {e}")
+            return all_settlements
 
     def get_positions(self, limit: int = 200) -> List[Dict]:
         """Get current portfolio positions from Kalshi."""
@@ -1987,6 +2008,300 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
 
 
 # ============================================================
+# LIVE STAT ARBITRAGE — Buy completed props during live games
+# ============================================================
+
+# ESPN stat array indices: ["MIN","PTS","FG","3PT","FT","REB","AST","TO","STL","BLK","OREB","DREB","PF","+/-"]
+PROP_STAT_MAP = {
+    'KXNBAPTS': {'stat_index': 1, 'stat_name': 'points', 'parse': 'int'},    # PTS
+    'KXNBAREB': {'stat_index': 5, 'stat_name': 'rebounds', 'parse': 'int'},   # REB
+    'KXNBAAST': {'stat_index': 6, 'stat_name': 'assists', 'parse': 'int'},    # AST
+    'KXNBA3PT': {'stat_index': 3, 'stat_name': 'threes', 'parse': 'made'},    # 3PT (format "2-6", take made)
+}
+
+# Max price to pay for a completed prop (99 cents = $0.01 profit per contract minimum)
+COMPLETED_PROP_MAX_PRICE = 0.99
+
+
+def _parse_espn_stat(stat_str: str, parse_type: str) -> int:
+    """Parse ESPN stat string to integer value."""
+    try:
+        if parse_type == 'made':
+            # Format: "2-6" (made-attempted), extract made count
+            return int(stat_str.split('-')[0])
+        else:
+            return int(stat_str)
+    except (ValueError, IndexError):
+        return 0
+
+
+def _get_live_nba_games() -> List[Dict]:
+    """Get currently live NBA games from ESPN scoreboard."""
+    try:
+        resp = requests.get(
+            'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard',
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        live_games = []
+        for event in data.get('events', []):
+            status = event.get('status', {}).get('type', {}).get('name', '')
+            # STATUS_IN_PROGRESS = live, STATUS_FINAL = just finished (props may still be open)
+            if status in ('STATUS_IN_PROGRESS', 'STATUS_FINAL', 'STATUS_END_PERIOD', 'STATUS_HALFTIME'):
+                game_id = event.get('id', '')
+                competitors = event.get('competitions', [{}])[0].get('competitors', [])
+                teams = {}
+                for c in competitors:
+                    abbrev = c.get('team', {}).get('abbreviation', '')
+                    teams[c.get('homeAway', '')] = abbrev
+                live_games.append({
+                    'game_id': game_id,
+                    'home': teams.get('home', ''),
+                    'away': teams.get('away', ''),
+                    'status': status,
+                })
+        return live_games
+    except Exception as e:
+        print(f"   ESPN scoreboard error: {e}")
+        return []
+
+
+def _get_box_score(game_id: str) -> Dict[str, Dict[str, int]]:
+    """Fetch box score for a game. Returns {player_name: {points, rebounds, assists, threes}}."""
+    try:
+        resp = requests.get(
+            f'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={game_id}',
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        player_stats = {}
+        for team_data in data.get('boxscore', {}).get('players', []):
+            for stat_group in team_data.get('statistics', []):
+                # stat_group['labels'] = ["MIN","PTS","FG","3PT","FT","REB","AST",...]
+                for athlete in stat_group.get('athletes', []):
+                    name = athlete.get('athlete', {}).get('displayName', '')
+                    stats = athlete.get('stats', [])
+                    if name and len(stats) >= 11:
+                        player_stats[name] = {
+                            'points': _parse_espn_stat(stats[1], 'int'),
+                            'rebounds': _parse_espn_stat(stats[5], 'int'),
+                            'assists': _parse_espn_stat(stats[6], 'int'),
+                            'threes': _parse_espn_stat(stats[3], 'made'),
+                        }
+        return player_stats
+    except Exception as e:
+        print(f"   ESPN box score error for game {game_id}: {e}")
+        return {}
+
+
+def _match_prop_player(kalshi_player: str, box_score: Dict[str, Dict]) -> Optional[str]:
+    """Match a Kalshi player name to an ESPN box score name."""
+    kp = kalshi_player.lower().strip()
+    for espn_name in box_score:
+        en = espn_name.lower()
+        if kp == en:
+            return espn_name
+        # Last name match
+        kp_parts = kp.split()
+        en_parts = en.split()
+        if kp_parts and en_parts and kp_parts[-1] == en_parts[-1]:
+            if len(kp_parts) == 1 or len(en_parts) == 1:
+                return espn_name
+            if kp_parts[0] == en_parts[0] or kp_parts[0][0] == en_parts[0][0]:
+                return espn_name
+        # Substring
+        if kp in en or en in kp:
+            return espn_name
+    return None
+
+
+def find_completed_props(kalshi_api) -> List[Dict]:
+    """Find player prop markets where the target has already been met during live games.
+    These are essentially guaranteed wins — buy YES at any price below $1."""
+    edges = []
+
+    # Step 1: Get live NBA games
+    live_games = _get_live_nba_games()
+    if not live_games:
+        return edges
+
+    live_game_ids = {g['game_id'] for g in live_games}
+    live_game_abbrevs = set()
+    for g in live_games:
+        live_game_abbrevs.add(g['home'])
+        live_game_abbrevs.add(g['away'])
+    print(f"   Live NBA games: {len(live_games)} ({', '.join(g['away']+'@'+g['home'] for g in live_games)})")
+
+    # Step 2: Fetch box scores for all live games
+    all_player_stats = {}  # player_name -> {points, rebounds, assists, threes}
+    for game in live_games:
+        box = _get_box_score(game['game_id'])
+        all_player_stats.update(box)
+        time.sleep(0.3)
+
+    if not all_player_stats:
+        return edges
+
+    print(f"   Box scores loaded: {len(all_player_stats)} players")
+
+    # Step 3: For each prop type, find Kalshi markets where target is already met
+    today_str = datetime.utcnow().strftime('%y%b%d').upper()
+
+    for series_ticker, stat_info in PROP_STAT_MAP.items():
+        stat_name = stat_info['stat_name']
+        kalshi_markets = kalshi_api.get_markets(series_ticker)
+        today_markets = [m for m in kalshi_markets if today_str in m.get('ticker', '')]
+
+        for m in today_markets:
+            ticker = m.get('ticker', '')
+            title = m.get('title', '')
+
+            # Parse player name and target from title: "LaMelo Ball: 8+ assists"
+            prop_match = re.match(r'^(.+?):\s*(\d+)\+', title)
+            if not prop_match:
+                continue
+
+            player_name = prop_match.group(1).strip()
+            target = int(prop_match.group(2))
+
+            # Match to box score
+            espn_name = _match_prop_player(player_name, all_player_stats)
+            if not espn_name:
+                continue
+
+            current_stat = all_player_stats[espn_name].get(stat_name, 0)
+
+            # Check if target is already met
+            if current_stat < target:
+                continue
+
+            # Target met! Check the orderbook for asks below $0.99
+            ob = kalshi_api.get_orderbook(ticker)
+            if not ob:
+                continue
+            time.sleep(0.2)
+
+            yes_price = get_best_yes_price(ob)
+            if yes_price is None or yes_price >= COMPLETED_PROP_MAX_PRICE:
+                continue
+
+            # Calculate profit
+            fee = kalshi_fee(yes_price)
+            profit_per = 1.0 - yes_price - fee
+            if profit_per <= 0:
+                continue
+
+            edge = {
+                'market_type': 'Completed Prop',
+                'sport': 'NBA',
+                'game': f"{player_name} - {stat_name}",
+                'team': player_name,
+                'opposite_team': '',
+                'kalshi_price': yes_price,
+                'kalshi_price_after_fees': yes_price + fee,
+                'kalshi_prob_after_fees': (yes_price + fee) * 100,
+                'kalshi_method': f"YES on {player_name} {target}+ {stat_name}",
+                'kalshi_ticker': ticker,
+                'kalshi_side': 'yes',
+                'fanduel_opposite_team': f"Already at {current_stat} {stat_name} (target: {target}+)",
+                'fanduel_opposite_odds': 0,
+                'fanduel_opposite_prob': 0,
+                'total_implied_prob': (yes_price + fee) * 100,
+                'arbitrage_profit': profit_per / (yes_price + fee) * 100,
+                'is_live': True,
+                'is_completed_prop': True,
+                'recommendation': f"BUY {player_name} {target}+ {stat_name} at ${yes_price:.2f} — ALREADY AT {current_stat} (guaranteed)",
+            }
+            edges.append(edge)
+            print(f"   COMPLETED PROP: {player_name} has {current_stat} {stat_name} (target {target}+) — ask ${yes_price:.2f}")
+            send_telegram_notification(edge)
+            auto_trade_completed_prop(edge, kalshi_api)
+
+    return edges
+
+
+def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
+    """Auto-trade a completed prop. Buy as many contracts as possible since it's guaranteed money."""
+    global _order_tracker
+
+    if not AUTO_TRADE_ENABLED:
+        return None
+
+    ticker = edge.get('kalshi_ticker')
+    if not ticker:
+        return None
+
+    if _order_tracker.has_position(ticker):
+        return None
+
+    if not _order_tracker.can_trade():
+        return None
+
+    price = edge['kalshi_price']
+    fee = kalshi_fee(price)
+    profit_per = 1.0 - price - fee
+
+    if profit_per <= 0:
+        return None
+
+    # For completed props, buy more contracts since it's guaranteed
+    # Target $5 profit instead of $1 since there's no risk
+    target_profit = 5.00
+    contracts = min(math.ceil(target_profit / profit_per), 100)
+
+    # Recalculate exact fee for this contract count
+    fee_total = math.ceil(0.07 * contracts * price * (1 - price) * 100) / 100
+    total_cost = (price * contracts) + fee_total
+    total_profit = (1.0 * contracts) - total_cost
+
+    # Check we can afford it
+    balance = kalshi_api.get_balance()
+    if balance:
+        avail = balance.get('balance', 0) / 100
+        if total_cost > avail:
+            contracts = max(1, int(avail / (price + fee)))
+            fee_total = math.ceil(0.07 * contracts * price * (1 - price) * 100) / 100
+            total_cost = (price * contracts) + fee_total
+            total_profit = (1.0 * contracts) - total_cost
+
+    if contracts <= 0 or total_profit <= 0:
+        return None
+
+    price_cents = int(round(price * 100))
+
+    print(f"   >>> COMPLETED PROP TRADE: {ticker} YES {contracts}x @ ${price:.2f} = ${total_cost:.2f} (guaranteed profit ${total_profit:.2f})")
+
+    order = kalshi_api.place_order(ticker, 'yes', price_cents, contracts)
+    if order:
+        order_info = {
+            'ticker': ticker,
+            'side': 'yes',
+            'price': price,
+            'fee': fee_total,
+            'contracts': contracts,
+            'cost': total_cost,
+            'potential_profit': total_profit,
+            'edge_pct': edge['arbitrage_profit'],
+            'sport': 'NBA',
+            'market_type': 'Completed Prop',
+            'game': edge.get('game', ''),
+            'team': edge.get('team', ''),
+            'recommendation': edge.get('recommendation', ''),
+            'timestamp': datetime.utcnow().isoformat(),
+            'order_id': order.get('order_id', ''),
+            'status': order.get('status', 'unknown'),
+        }
+        _order_tracker.add_order(ticker, order_info)
+        send_order_telegram(order_info, 'COMPLETED PROP')
+        return order_info
+
+    return None
+
+
+# ============================================================
 # MAIN SCANNER
 # ============================================================
 
@@ -2079,6 +2394,15 @@ def scan_all_sports(kalshi_api, fanduel_api):
         all_edges.extend(edges)
         print(f"   {name}: {len(edges)} edges")
         time.sleep(1.0)
+
+    # 7. Live stat arbitrage — buy completed NBA props
+    print(f"\n--- Completed Props (Live Stat Arb) ---")
+    sports_scanned.append('Live Props')
+    completed = find_completed_props(kalshi_api)
+    if completed:
+        sports_with_games.append('Live Props')
+    all_edges.extend(completed)
+    print(f"   Completed props: {len(completed)} opportunities")
 
     print(f"\n{'='*60}")
     print(f"SCAN COMPLETE")
@@ -2217,7 +2541,7 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
 .no-edge {{ text-align: center; padding: 50px 20px; color: #888; }}
 </style></head><body><div class="container">
 <h1>Kalshi Edge Finder</h1>
-<div class="sub">Background Scanner: Scan #{scan_count} {'🔄 SCANNING...' if is_scanning else '✓ idle'} | Last: {scan_ts[:19] if scan_ts else 'waiting...'} | <a href="/orders" style="color:#3498db">Orders ({_order_tracker.get_open_count()})</a></div>
+<div class="sub">Background Scanner: Scan #{scan_count} {'🔄 SCANNING...' if is_scanning else '✓ idle'} | Last: {scan_ts[:19] if scan_ts else 'waiting...'} | <a href="/orders" style="color:#3498db">Orders ({_order_tracker.get_open_count()})</a> | <a href="/history" style="color:#e67e22">History</a></div>
 <div class="info">Scanning: {', '.join(scanned)} | Active: {', '.join(active) if active else 'None'}</div>
 <div class="count">"""
 
@@ -2569,7 +2893,7 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
 .summary span {{ margin: 0 20px; }}
 </style></head><body><div class="container">
 <h1>Kalshi Orders</h1>
-<div class="nav"><a href="/debug">Edge Scanner</a> | <a href="/orders">Orders</a></div>
+<div class="nav"><a href="/debug">Edge Scanner</a> | <a href="/orders">Orders</a> | <a href="/history">History</a></div>
 <div class="balance">
 <span>Balance: <strong style="color:#00ff88">${balance_dollars:.2f}</strong></span>
 <span>Portfolio: <strong style="color:#3498db">${portfolio_value:.2f}</strong></span>
@@ -2579,7 +2903,7 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
 
         type_colors = {
             'Moneyline': '#e74c3c', 'Spread': '#3498db', 'Total': '#e67e22',
-            'Prop': '#9b59b6', 'BTTS': '#2ecc71', 'Tennis ML': '#1abc9c', 'Market': '#95a5a6',
+            'Prop': '#9b59b6', 'BTTS': '#2ecc71', 'Tennis ML': '#1abc9c', 'Completed Prop': '#f39c12', 'Market': '#95a5a6',
         }
 
         if active_positions:
@@ -2630,6 +2954,171 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
             html += '</div>'
         else:
             html += '<div class="no-orders"><p>No open positions</p><p style="color:#666;font-size:0.9em">Positions from your Kalshi portfolio will appear here</p></div>'
+
+        html += "</div></body></html>"
+        return html
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"<h1 style='color:red'>Error</h1><pre>{e}</pre>", 500
+
+
+@app.route('/history')
+def history_page():
+    """Show settled bets history with P&L and ROI."""
+    try:
+        kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+        balance_data = kalshi.get_balance()
+        balance_dollars = balance_data.get('balance', 0) / 100 if balance_data else 0
+
+        settlements = kalshi.get_settlements()
+
+        # Fetch market details for readable names (batch, with caching)
+        market_cache = {}
+        for s in settlements[:100]:  # Limit API calls
+            ticker = s.get('ticker', '')
+            if ticker and ticker not in market_cache:
+                market_cache[ticker] = kalshi.get_market(ticker)
+                time.sleep(0.15)
+
+        type_colors = {
+            'Moneyline': '#e74c3c', 'Spread': '#3498db', 'Total': '#e67e22',
+            'Prop': '#9b59b6', 'BTTS': '#2ecc71', 'Tennis ML': '#1abc9c', 'Completed Prop': '#f39c12', 'Market': '#95a5a6',
+        }
+
+        # Process settlements
+        rows = []
+        total_cost = 0
+        total_revenue = 0
+        total_fees = 0
+        wins = 0
+        losses = 0
+
+        for s in settlements:
+            ticker = s.get('ticker', '')
+            result = s.get('market_result', '')
+            yes_count = s.get('yes_count', 0)
+            no_count = s.get('no_count', 0)
+            yes_cost = s.get('yes_total_cost', 0) / 100  # cents -> dollars
+            no_cost = s.get('no_total_cost', 0) / 100
+            revenue = s.get('revenue', 0) / 100
+            fee = float(s.get('fee_cost', '0') or '0')
+            settled_time = s.get('settled_time', '')
+
+            cost = yes_cost + no_cost
+            profit = revenue - cost
+            total_cost += cost
+            total_revenue += revenue
+            total_fees += fee
+
+            if profit > 0:
+                wins += 1
+            elif profit < 0:
+                losses += 1
+
+            # Determine which side we held
+            if yes_count > 0 and no_count == 0:
+                side = 'YES'
+                contracts = yes_count
+            elif no_count > 0 and yes_count == 0:
+                side = 'NO'
+                contracts = no_count
+            else:
+                side = 'YES' if yes_cost >= no_cost else 'NO'
+                contracts = max(yes_count, no_count)
+
+            # Did we win?
+            won = (side == 'YES' and result == 'yes') or (side == 'NO' and result == 'no')
+
+            # Human-readable name
+            market_info = market_cache.get(ticker)
+            bet_desc, mtype, bet_sub = _describe_position(market_info, ticker, side)
+            mtype_color = type_colors.get(mtype, '#95a5a6')
+
+            # Parse settled time
+            try:
+                st = datetime.fromisoformat(settled_time.replace('Z', '+00:00'))
+                time_display = st.strftime('%b %d %I:%M %p')
+            except Exception:
+                time_display = settled_time[:16] if settled_time else '?'
+
+            rows.append({
+                'bet_desc': bet_desc, 'mtype': mtype, 'mtype_color': mtype_color,
+                'bet_sub': bet_sub, 'ticker': ticker, 'contracts': contracts,
+                'cost': cost, 'revenue': revenue, 'profit': profit, 'fee': fee,
+                'won': won, 'result': result, 'time_display': time_display,
+            })
+
+        total_profit = total_revenue - total_cost
+        roi = (total_profit / total_cost * 100) if total_cost > 0 else 0
+        total_bets = wins + losses
+
+        html = f"""<!DOCTYPE html>
+<html><head>
+<title>Kalshi History</title>
+<meta http-equiv="refresh" content="60">
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #1a1a2e, #16213e); color: #eee; min-height: 100vh; }}
+.container {{ max-width: 1200px; margin: 0 auto; }}
+h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
+.nav {{ text-align: center; margin-bottom: 15px; }}
+.nav a {{ color: #00ff88; text-decoration: none; margin: 0 15px; }}
+.stats {{ display: flex; justify-content: center; gap: 15px; flex-wrap: wrap; padding: 15px; background: #0f3460; border-radius: 8px; margin-bottom: 20px; }}
+.stat {{ text-align: center; padding: 0 15px; }}
+.stat-val {{ font-size: 1.4em; font-weight: bold; }}
+.stat-label {{ font-size: 0.75em; color: #888; margin-top: 2px; }}
+.row {{ background: #16213e; padding: 12px 15px; margin: 6px 0; border-radius: 8px; display: flex; align-items: center; gap: 15px; }}
+.row-win {{ border-left: 4px solid #00ff88; }}
+.row-loss {{ border-left: 4px solid #e74c3c; }}
+.row-void {{ border-left: 4px solid #666; }}
+.bet-info {{ flex: 1; min-width: 0; }}
+.bet-name {{ font-weight: bold; font-size: 1.05em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+.bet-sub {{ font-size: 0.8em; color: #888; margin-top: 2px; }}
+.badge {{ display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 0.65em; font-weight: bold; color: white; margin-left: 6px; vertical-align: middle; }}
+.nums {{ text-align: right; white-space: nowrap; }}
+.profit {{ font-weight: bold; font-size: 1.1em; }}
+.pos {{ color: #00ff88; }} .neg {{ color: #e74c3c; }}
+.detail {{ font-size: 0.8em; color: #888; }}
+.time {{ font-size: 0.75em; color: #666; min-width: 100px; text-align: right; }}
+.empty {{ text-align: center; padding: 50px 20px; color: #888; }}
+</style></head><body><div class="container">
+<h1>Bet History</h1>
+<div class="nav"><a href="/debug">Edge Scanner</a> | <a href="/orders">Orders</a> | <a href="/history">History</a></div>
+
+<div class="stats">
+<div class="stat"><div class="stat-val {'pos' if total_profit >= 0 else 'neg'}">${total_profit:+.2f}</div><div class="stat-label">Total P&L</div></div>
+<div class="stat"><div class="stat-val {'pos' if roi >= 0 else 'neg'}">{roi:+.1f}%</div><div class="stat-label">ROI</div></div>
+<div class="stat"><div class="stat-val">{total_bets}</div><div class="stat-label">Settled Bets</div></div>
+<div class="stat"><div class="stat-val pos">{wins}</div><div class="stat-label">Wins</div></div>
+<div class="stat"><div class="stat-val neg">{losses}</div><div class="stat-label">Losses</div></div>
+<div class="stat"><div class="stat-val">{wins}/{total_bets if total_bets else 1}</div><div class="stat-label">Win Rate</div></div>
+<div class="stat"><div class="stat-val">${total_cost:.2f}</div><div class="stat-label">Total Wagered</div></div>
+<div class="stat"><div class="stat-val">${total_fees:.2f}</div><div class="stat-label">Total Fees</div></div>
+<div class="stat"><div class="stat-val">${balance_dollars:.2f}</div><div class="stat-label">Balance</div></div>
+</div>
+"""
+
+        if rows:
+            for r in rows:
+                result_class = 'row-win' if r['won'] else ('row-void' if r['result'] == 'void' else 'row-loss')
+                result_icon = '+' if r['won'] else ('-' if r['result'] != 'void' else '~')
+                pnl_class = 'pos' if r['profit'] >= 0 else 'neg'
+                sub_line = (r['bet_sub'] + ' &middot; ') if r['bet_sub'] else ''
+
+                html += f"""<div class="row {result_class}">
+<div class="bet-info">
+<div class="bet-name">{r['bet_desc']}<span class="badge" style="background:{r['mtype_color']}">{r['mtype']}</span></div>
+<div class="bet-sub">{sub_line}{r['ticker']}</div>
+</div>
+<div class="nums">
+<div class="profit {pnl_class}">{result_icon}${abs(r['profit']):.2f}</div>
+<div class="detail">{r['contracts']}x &middot; cost ${r['cost']:.2f} &middot; paid ${r['revenue']:.2f}</div>
+</div>
+<div class="time">{r['time_display']}</div>
+</div>"""
+        else:
+            html += '<div class="empty"><p>No settled bets yet</p><p style="color:#666;font-size:0.9em">Settled positions will appear here</p></div>'
 
         html += "</div></body></html>"
         return html
