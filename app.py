@@ -406,17 +406,20 @@ def auto_trade_edge(edge: Dict, kalshi_api) -> Optional[Dict]:
         return None
 
     price = edge['kalshi_price']
-    fee = kalshi_fee(price)
-    profit_per_contract = 1.0 - price - fee
-
-    if profit_per_contract <= 0:
-        print(f"   >>> No profit possible on {ticker} at ${price:.2f} + ${fee:.4f} fee")
-        return None
 
     # Calculate contracts to win ~$1 profit
-    contracts = math.ceil(TARGET_PROFIT / profit_per_contract)
-    total_cost = (price + fee) * contracts
-    total_profit = profit_per_contract * contracts
+    # First estimate with approximate per-contract fee, then recalculate with exact fee
+    approx_fee = kalshi_fee(price)
+    approx_profit_per = 1.0 - price - approx_fee
+    if approx_profit_per <= 0:
+        print(f"   >>> No profit possible on {ticker} at ${price:.2f}")
+        return None
+    contracts = math.ceil(TARGET_PROFIT / approx_profit_per)
+
+    # Recalculate with exact fee for this contract count
+    fee_total = math.ceil(0.07 * contracts * price * (1 - price) * 100) / 100
+    total_cost = (price * contracts) + fee_total
+    total_profit = (1.0 * contracts) - total_cost  # win $1/contract minus cost
 
     price_cents = int(round(price * 100))
 
@@ -456,7 +459,7 @@ def auto_trade_edge(edge: Dict, kalshi_api) -> Optional[Dict]:
     else:
         # Send failure notification
         fail_info = {
-            'ticker': ticker, 'side': side, 'price': price,
+            'ticker': ticker, 'side': side, 'price': price, 'fee': fee_total,
             'contracts': contracts, 'cost': total_cost,
             'potential_profit': total_profit, 'edge_pct': edge['arbitrage_profit'],
             'sport': edge.get('sport', ''), 'market_type': edge.get('market_type', ''),
