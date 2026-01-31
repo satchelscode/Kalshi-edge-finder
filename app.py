@@ -3,11 +3,15 @@ import requests
 import math
 import time
 import re
+import uuid
+import base64
 from flask import Flask, render_template, jsonify, request, redirect
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 import json
 from difflib import SequenceMatcher
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 
 app = Flask(__name__)
 
@@ -17,6 +21,20 @@ KALSHI_API_KEY_ID = os.environ.get('KALSHI_API_KEY_ID')
 KALSHI_PRIVATE_KEY = os.environ.get('KALSHI_PRIVATE_KEY')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+
+# ============================================================
+# AUTO-TRADE CONFIGURATION
+# ============================================================
+AUTO_TRADE_ENABLED = os.environ.get('AUTO_TRADE_ENABLED', 'false').lower() == 'true'
+TARGET_PROFIT = float(os.environ.get('TARGET_PROFIT', '1.00'))  # Target profit per trade in dollars
+MIN_EDGE_PCT = float(os.environ.get('MIN_EDGE_PCT', '5.0'))     # Minimum edge % to auto-trade
+MAX_CONTRACTS_PER_ORDER = int(os.environ.get('MAX_CONTRACTS_PER_ORDER', '10'))  # Safety cap
+MAX_DAILY_TRADES = int(os.environ.get('MAX_DAILY_TRADES', '20'))  # Max trades per day
+MAX_DAILY_SPEND = float(os.environ.get('MAX_DAILY_SPEND', '20.00'))  # Max total spend per day
+
+# Track auto-trade state
+_trades_today = []  # List of {ticker, side, count, price, cost, time}
+_traded_markets = set()  # Tickers we've already traded (no double-trading)
 
 # ============================================================
 # SPORTS CONFIGURATION
@@ -208,6 +226,153 @@ https://kalshi-edge-finder.onrender.com"""
         print(f"   Telegram failed: {e}")
 
 
+def calculate_contracts(price: float, target_profit: float = 1.0) -> int:
+    """
+    Calculate number of contracts to target a specific profit.
+
+    On Kalshi, each contract pays $1 if it resolves in your favor.
+    Profit per contract = $1.00 - price - fee_per_contract
+    Contracts needed = ceil(target_profit / profit_per_contract)
+    """
+    fee = kalshi_fee(price)
+    profit_per_contract = 1.0 - price - fee
+    if profit_per_contract <= 0:
+        return 0
+    contracts = math.ceil(target_profit / profit_per_contract)
+    return max(1, contracts)
+
+
+def _reset_daily_trades_if_needed():
+    """Reset trade tracking at the start of each new day."""
+    global _trades_today
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    if _trades_today and _trades_today[0].get('date') != today:
+        _trades_today = []
+        _traded_markets.clear()
+
+
+def _daily_spend() -> float:
+    """Total dollars spent on trades today."""
+    return sum(t.get('cost', 0) for t in _trades_today)
+
+
+def auto_trade_edge(kalshi_api, edge: Dict) -> Optional[Dict]:
+    """
+    Automatically place a trade on Kalshi for a detected edge.
+
+    Safety checks:
+    - AUTO_TRADE_ENABLED must be true
+    - Edge must exceed MIN_EDGE_PCT
+    - Must not have already traded this market
+    - Must not exceed daily trade count or spend limits
+    - Private key must be loaded
+
+    Returns order result or None.
+    """
+    if not AUTO_TRADE_ENABLED:
+        return None
+
+    if not kalshi_api.private_key:
+        return None
+
+    _reset_daily_trades_if_needed()
+
+    # Check edge threshold
+    edge_pct = edge.get('arbitrage_profit', 0)
+    if edge_pct < MIN_EDGE_PCT:
+        print(f"   Auto-trade skip: edge {edge_pct:.1f}% < min {MIN_EDGE_PCT}%")
+        return None
+
+    # Check daily limits
+    if len(_trades_today) >= MAX_DAILY_TRADES:
+        print(f"   Auto-trade skip: daily trade limit reached ({MAX_DAILY_TRADES})")
+        return None
+    if _daily_spend() >= MAX_DAILY_SPEND:
+        print(f"   Auto-trade skip: daily spend limit reached (${MAX_DAILY_SPEND:.2f})")
+        return None
+
+    # Determine what to trade from the edge info
+    ticker = edge.get('ticker')
+    side = edge.get('trade_side')
+    price = edge.get('kalshi_price')
+    if not ticker or not side or price is None:
+        print(f"   Auto-trade skip: missing trade info (ticker={ticker}, side={side})")
+        return None
+
+    # Don't double-trade the same market
+    trade_key = f"{ticker}_{side}"
+    if trade_key in _traded_markets:
+        print(f"   Auto-trade skip: already traded {trade_key}")
+        return None
+
+    # Calculate order size
+    contracts = calculate_contracts(price, TARGET_PROFIT)
+    contracts = min(contracts, MAX_CONTRACTS_PER_ORDER)
+    if contracts <= 0:
+        return None
+
+    price_cents = int(round(price * 100))
+    total_cost = price * contracts
+
+    # Final spend check
+    if _daily_spend() + total_cost > MAX_DAILY_SPEND:
+        # Reduce contracts to stay within budget
+        remaining_budget = MAX_DAILY_SPEND - _daily_spend()
+        contracts = int(remaining_budget / price)
+        if contracts <= 0:
+            print(f"   Auto-trade skip: would exceed daily spend limit")
+            return None
+
+    print(f"\n   AUTO-TRADE: {contracts}x {side} {ticker} @ ${price:.2f} "
+          f"(edge: {edge_pct:.1f}%, target profit: ${TARGET_PROFIT:.2f})")
+
+    # Place the order
+    order = kalshi_api.place_order(ticker, side, contracts, price_cents, action='buy')
+
+    if order:
+        trade_record = {
+            'date': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+            'time': datetime.now(timezone.utc).strftime('%H:%M:%S'),
+            'ticker': ticker,
+            'side': side,
+            'count': contracts,
+            'price': price,
+            'cost': price * contracts,
+            'edge_pct': edge_pct,
+            'order_id': order.get('order_id', 'unknown'),
+            'sport': edge.get('sport', ''),
+            'game': edge.get('game', ''),
+            'market_type': edge.get('market_type', ''),
+        }
+        _trades_today.append(trade_record)
+        _traded_markets.add(trade_key)
+
+        # Send Telegram notification about the trade
+        _send_trade_notification(trade_record)
+
+    return order
+
+
+def _send_trade_notification(trade: Dict):
+    """Send Telegram alert when a trade is placed."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        message = f"""AUTO-TRADE PLACED
+
+{trade['game']} ({trade['sport']} - {trade['market_type']})
+{trade['count']}x {trade['side'].upper()} {trade['ticker']} @ ${trade['price']:.2f}
+
+Cost: ${trade['cost']:.2f}
+Edge: {trade['edge_pct']:.1f}%
+Order ID: {trade['order_id']}
+Trades today: {len(_trades_today)} | Spent: ${_daily_spend():.2f}/${MAX_DAILY_SPEND:.2f}"""
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, json={'chat_id': TELEGRAM_CHAT_ID, 'text': message}, timeout=10)
+    except Exception as e:
+        print(f"   Trade notification failed: {e}")
+
+
 class OddsConverter:
     @staticmethod
     def decimal_to_implied_prob(odds: float) -> float:
@@ -354,11 +519,43 @@ class KalshiAPI:
     def __init__(self, api_key_id: str = None, private_key: str = None):
         self.BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
         self.api_key_id = api_key_id
+        self.private_key = None
         self.session = requests.Session()
-        headers = {'Accept': 'application/json'}
+        headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
         if api_key_id:
             headers['KALSHI-ACCESS-KEY'] = api_key_id
         self.session.headers.update(headers)
+
+        # Load RSA private key for authenticated (trading) requests
+        if private_key:
+            try:
+                # Handle newlines encoded as literal \n in env vars
+                key_str = private_key.replace('\\n', '\n')
+                self.private_key = serialization.load_pem_private_key(
+                    key_str.encode('utf-8'), password=None
+                )
+                print("   Kalshi RSA private key loaded successfully")
+            except Exception as e:
+                print(f"   Warning: Could not load Kalshi private key: {e}")
+                self.private_key = None
+
+    def _sign_request(self, method: str, path: str) -> Dict[str, str]:
+        """Generate RSA-PSS signed headers for authenticated Kalshi endpoints."""
+        timestamp = str(int(datetime.now(timezone.utc).timestamp() * 1000))
+        msg = f"{timestamp}{method}{path}"
+        signature = self.private_key.sign(
+            msg.encode('utf-8'),
+            asym_padding.PSS(
+                mgf=asym_padding.MGF1(hashes.SHA256()),
+                salt_length=asym_padding.PSS.DIGEST_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        return {
+            'KALSHI-ACCESS-KEY': self.api_key_id,
+            'KALSHI-ACCESS-SIGNATURE': base64.b64encode(signature).decode('utf-8'),
+            'KALSHI-ACCESS-TIMESTAMP': timestamp,
+        }
 
     def get_markets(self, series_ticker: str, limit: int = 200, status: str = 'open') -> List[Dict]:
         all_markets = []
@@ -389,6 +586,75 @@ class KalshiAPI:
             response.raise_for_status()
             return response.json()
         except Exception as e:
+            return None
+
+    def get_balance(self) -> Optional[float]:
+        """Get account balance in dollars. Requires RSA auth."""
+        if not self.private_key:
+            return None
+        try:
+            path = "/trade-api/v2/portfolio/balance"
+            headers = self._sign_request("GET", path)
+            response = self.session.get(f"{self.BASE_URL}/portfolio/balance",
+                                        headers=headers, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            return data.get('balance', 0) / 100  # cents to dollars
+        except Exception as e:
+            print(f"   Balance check error: {e}")
+            return None
+
+    def place_order(self, ticker: str, side: str, count: int, price_cents: int,
+                    action: str = 'buy') -> Optional[Dict]:
+        """
+        Place an order on Kalshi.
+
+        Args:
+            ticker: Market ticker (e.g., KXNBAGAME-26JAN31MIA-MIA)
+            side: 'yes' or 'no'
+            count: Number of contracts
+            price_cents: Price in cents (1-99)
+            action: 'buy' or 'sell'
+
+        Returns:
+            Order response dict or None on failure
+        """
+        if not self.private_key:
+            print("   Cannot place order: no private key loaded")
+            return None
+
+        path = "/trade-api/v2/portfolio/orders"
+        headers = self._sign_request("POST", path)
+
+        body = {
+            'ticker': ticker,
+            'side': side,
+            'action': action,
+            'type': 'limit',
+            'count': count,
+            'client_order_id': str(uuid.uuid4()),
+        }
+        if side == 'yes':
+            body['yes_price'] = price_cents
+        else:
+            body['no_price'] = price_cents
+
+        try:
+            response = self.session.post(f"{self.BASE_URL}/portfolio/orders",
+                                         headers=headers, json=body, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            order = result.get('order', result)
+            print(f"   ORDER PLACED: {action} {count}x {side} {ticker} @ {price_cents}c "
+                  f"(order_id: {order.get('order_id', 'unknown')})")
+            return order
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response else 'unknown'
+            body_text = e.response.text if e.response else ''
+            print(f"   ORDER FAILED ({status}): {action} {count}x {side} {ticker} @ {price_cents}c - {body_text}")
+            return None
+        except Exception as e:
+            print(f"   ORDER ERROR: {e}")
             return None
 
 
@@ -464,11 +730,18 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         if None in [t1_yes, t1_no, t2_yes, t2_no]:
             continue
 
-        for name, best_p, method, fd_opp in [
+        t1_ticker = team_markets[abbrevs[0]]['ticker']
+        t2_ticker = team_markets[abbrevs[1]]['ticker']
+
+        for name, best_p, method, fd_opp, trade_ticker, trade_side in [
             (t1_name, min(t1_yes, t2_no),
-             f"YES on {t1_name}" if t1_yes <= t2_no else f"NO on {t2_name}", fd_t2),
+             f"YES on {t1_name}" if t1_yes <= t2_no else f"NO on {t2_name}", fd_t2,
+             t1_ticker if t1_yes <= t2_no else t2_ticker,
+             'yes' if t1_yes <= t2_no else 'no'),
             (t2_name, min(t2_yes, t1_no),
-             f"YES on {t2_name}" if t2_yes <= t1_no else f"NO on {t1_name}", fd_t1),
+             f"YES on {t2_name}" if t2_yes <= t1_no else f"NO on {t1_name}", fd_t1,
+             t2_ticker if t2_yes <= t1_no else t1_ticker,
+             'yes' if t2_yes <= t1_no else 'no'),
         ]:
             fee = kalshi_fee(best_p)
             eff = best_p + fee
@@ -492,9 +765,12 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                     'total_implied_prob': total * 100,
                     'arbitrage_profit': profit,
                     'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (FanDuel: {fd_opp} at {fanduel_odds[fd_opp]['odds']:.2f})",
+                    'ticker': trade_ticker,
+                    'trade_side': trade_side,
                 }
                 edges.append(edge)
                 send_telegram_notification(edge)
+                auto_trade_edge(kalshi_api, edge)
     return edges
 
 
@@ -638,9 +914,12 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                     'total_implied_prob': (eff + (1 - fd_prob)) * 100,
                     'arbitrage_profit': edge_pct,
                     'recommendation': f"Buy YES {team_name} -{floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel: {fd_team_name} {fd_spread['point']} at {fd_odds:.2f})",
+                    'ticker': ticker,
+                    'trade_side': 'yes',
                 }
                 edges.append(edge)
                 send_telegram_notification(edge)
+                auto_trade_edge(kalshi_api, edge)
 
     return edges
 
@@ -765,9 +1044,12 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                         'total_implied_prob': (eff + (1 - fd_over_prob)) * 100,
                         'arbitrage_profit': edge_pct,
                         'recommendation': f"Buy YES Over {floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel Over {fd_line} at {fd_total['over_odds']:.2f})",
+                        'ticker': ticker,
+                        'trade_side': 'yes',
                     }
                     edges.append(edge)
                     send_telegram_notification(edge)
+                    auto_trade_edge(kalshi_api, edge)
 
             # Check Under: Kalshi NO (= Under) vs FanDuel Under
             if no_price is not None:
@@ -793,9 +1075,12 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                         'total_implied_prob': (eff + (1 - fd_under_prob)) * 100,
                         'arbitrage_profit': edge_pct,
                         'recommendation': f"Buy NO (Under {floor_strike}) on Kalshi at ${under_cost:.2f} (FanDuel Under {fd_line} at {fd_total['under_odds']:.2f})",
+                        'ticker': ticker,
+                        'trade_side': 'no',
                     }
                     edges.append(edge)
                     send_telegram_notification(edge)
+                    auto_trade_edge(kalshi_api, edge)
 
     return edges
 
@@ -908,9 +1193,12 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
                 'total_implied_prob': (eff + (1 - fd_over_prob)) * 100,
                 'arbitrage_profit': edge_pct,
                 'recommendation': f"Buy YES {player_name} {kalshi_line}+ on Kalshi at ${yes_price:.2f} (FanDuel Over {best_fd_match['point']} at {best_fd_match['over_odds']:.2f})",
+                'ticker': ticker,
+                'trade_side': 'yes',
             }
             edges.append(edge)
             send_telegram_notification(edge)
+            auto_trade_edge(kalshi_api, edge)
 
     return edges
 
@@ -1007,10 +1295,33 @@ def status():
         'status': 'ok',
         'odds_api_configured': bool(ODDS_API_KEY),
         'kalshi_authenticated': bool(KALSHI_API_KEY_ID),
+        'auto_trade_enabled': AUTO_TRADE_ENABLED,
+        'auto_trade_config': {
+            'target_profit': TARGET_PROFIT,
+            'min_edge_pct': MIN_EDGE_PCT,
+            'max_contracts': MAX_CONTRACTS_PER_ORDER,
+            'max_daily_trades': MAX_DAILY_TRADES,
+            'max_daily_spend': MAX_DAILY_SPEND,
+        },
+        'trades_today': len(_trades_today),
+        'daily_spend': _daily_spend(),
         'moneyline_sports': list(MONEYLINE_SPORTS.keys()),
         'spread_sports': list(SPREAD_SPORTS.keys()),
         'total_sports': list(TOTAL_SPORTS.keys()),
         'player_prop_sports': list(PLAYER_PROP_SPORTS.keys()),
+    })
+
+
+@app.route('/api/trades')
+def get_trades():
+    _reset_daily_trades_if_needed()
+    return jsonify({
+        'trades': _trades_today,
+        'count': len(_trades_today),
+        'daily_spend': _daily_spend(),
+        'max_daily_spend': MAX_DAILY_SPEND,
+        'max_daily_trades': MAX_DAILY_TRADES,
+        'auto_trade_enabled': AUTO_TRADE_ENABLED,
     })
 
 
@@ -1070,6 +1381,10 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
 <h1>Kalshi Edge Finder</h1>
 <div class="sub">Moneylines + Spreads + Totals + Player Props | Auto-refresh 5min</div>
 <div class="info">Scanning: {', '.join(scanned)} | Active: {', '.join(active) if active else 'None'}</div>
+<div class="count" style="background:{'#1a4d2e' if AUTO_TRADE_ENABLED else '#0f3460'}">
+<strong>Auto-Trade: {'ON' if AUTO_TRADE_ENABLED else 'OFF'}</strong>
+{f' | Target: ${TARGET_PROFIT:.2f}/trade | Min edge: {MIN_EDGE_PCT}% | Trades today: {len(_trades_today)}/{MAX_DAILY_TRADES} | Spent: ${_daily_spend():.2f}/${MAX_DAILY_SPEND:.2f}' if AUTO_TRADE_ENABLED else ' | Set AUTO_TRADE_ENABLED=true to enable'}
+</div>
 <div class="count">"""
 
         if all_edges:
