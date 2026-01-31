@@ -134,47 +134,46 @@ TARGET_PROFIT = 1.00  # Target $1 profit per trade
 _notified_edges = set()
 
 # ============================================================
-# ORDER TRACKER (persists to file to survive restarts)
+# ORDER TRACKER (uses Kalshi API for positions, in-memory for session)
 # ============================================================
-
-ORDERS_FILE = '/tmp/kalshi_orders.json'
-
 
 class OrderTracker:
     def __init__(self):
-        self.orders = self._load()
+        # In-memory set of tickers we've traded THIS session (fast lookup)
+        self._session_tickers = set()
+        # Cached positions from Kalshi API (refreshed each scan)
+        self._api_tickers = set()
+        self._position_count = 0
 
-    def _load(self) -> Dict:
+    def refresh_from_api(self, kalshi_api):
+        """Pull current positions from Kalshi API to sync state."""
         try:
-            if os.path.exists(ORDERS_FILE):
-                with open(ORDERS_FILE, 'r') as f:
-                    return json.load(f)
+            positions = kalshi_api.get_positions()
+            self._api_tickers = set()
+            for pos in positions:
+                ticker = pos.get('ticker', '')
+                # Only count positions where we actually hold contracts
+                yes_count = pos.get('position', 0)
+                no_count = pos.get('total_traded', 0)
+                if ticker and (yes_count != 0 or no_count != 0):
+                    self._api_tickers.add(ticker)
+            self._position_count = len(self._api_tickers)
+            print(f"   OrderTracker synced: {self._position_count} positions from Kalshi API")
         except Exception as e:
-            print(f"Error loading orders: {e}")
-        return {}
-
-    def _save(self):
-        try:
-            with open(ORDERS_FILE, 'w') as f:
-                json.dump(self.orders, f, indent=2)
-        except Exception as e:
-            print(f"Error saving orders: {e}")
+            print(f"   OrderTracker sync error: {e}")
 
     def has_position(self, ticker: str) -> bool:
-        return ticker in self.orders
+        return ticker in self._session_tickers or ticker in self._api_tickers
 
     def can_trade(self) -> bool:
-        return len(self.orders) < MAX_POSITIONS
+        total = len(self._session_tickers | self._api_tickers)
+        return total < MAX_POSITIONS
 
     def add_order(self, ticker: str, order_info: Dict):
-        self.orders[ticker] = order_info
-        self._save()
-
-    def get_all_orders(self) -> Dict:
-        return self.orders
+        self._session_tickers.add(ticker)
 
     def get_open_count(self) -> int:
-        return len(self.orders)
+        return len(self._session_tickers | self._api_tickers)
 
 
 # Global order tracker instance
@@ -828,6 +827,28 @@ class KalshiAPI:
         if result:
             return result.get('orders', [])
         return []
+
+    def get_positions(self, limit: int = 200) -> List[Dict]:
+        """Get current portfolio positions from Kalshi."""
+        all_positions = []
+        cursor = None
+        try:
+            while True:
+                params = {'limit': limit}
+                if cursor:
+                    params['cursor'] = cursor
+                result = self._auth_get('/trade-api/v2/portfolio/positions', params=params)
+                if not result:
+                    break
+                settlements = result.get('market_positions', [])
+                all_positions.extend(settlements)
+                cursor = result.get('cursor')
+                if not cursor:
+                    break
+            return all_positions
+        except Exception as e:
+            print(f"   Kalshi get_positions error: {e}")
+            return all_positions
 
     def place_order(self, ticker: str, side: str, price_cents: int, count: int,
                     client_order_id: str = None) -> Optional[Dict]:
@@ -1657,6 +1678,9 @@ def scan_all_sports(kalshi_api, fanduel_api):
     sports_scanned = []
     sports_with_games = []
 
+    # Sync positions from Kalshi API at start of each scan
+    _order_tracker.refresh_from_api(kalshi_api)
+
     # 1. Moneyline markets
     for kalshi_series, (odds_key, name, team_map) in MONEYLINE_SPORTS.items():
         print(f"\n--- {name} Moneyline ({kalshi_series}) ---")
@@ -1904,29 +1928,28 @@ def orders_view():
         balance_dollars = balance_data.get('balance', 0) / 100 if balance_data else 0
         portfolio_value = balance_data.get('portfolio_value', 0) / 100 if balance_data else 0
 
-        orders = _order_tracker.get_all_orders()
+        # Pull live positions from Kalshi API
+        positions = kalshi.get_positions()
+        # Filter to only positions with actual holdings
+        active_positions = [p for p in positions if p.get('position', 0) != 0]
 
         html = f"""<!DOCTYPE html>
 <html><head>
 <title>Kalshi Orders</title>
-<meta http-equiv="refresh" content="60">
+<meta http-equiv="refresh" content="30">
 <style>
 body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #1a1a2e, #16213e); color: #eee; min-height: 100vh; }}
 .container {{ max-width: 1200px; margin: 0 auto; }}
 h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
-.sub {{ text-align: center; color: #aaa; margin-bottom: 20px; }}
-.balance {{ text-align: center; padding: 15px; background: #0f3460; border-radius: 8px; margin-bottom: 20px; }}
-.balance span {{ margin: 0 20px; }}
 .nav {{ text-align: center; margin-bottom: 15px; }}
 .nav a {{ color: #00ff88; text-decoration: none; margin: 0 15px; }}
+.balance {{ text-align: center; padding: 15px; background: #0f3460; border-radius: 8px; margin-bottom: 20px; }}
+.balance span {{ margin: 0 20px; }}
 .order {{ background: #16213e; padding: 15px; margin: 10px 0; border-radius: 10px; border-left: 4px solid #3498db; }}
-.order-header {{ display: flex; justify-content: space-between; margin-bottom: 8px; }}
-.order-game {{ font-size: 0.85em; color: #888; }}
-.order-team {{ font-weight: bold; color: #ff6b6b; font-size: 1.1em; }}
+.order-team {{ font-weight: bold; color: #ff6b6b; font-size: 1.1em; margin-bottom: 8px; }}
 .row {{ display: flex; justify-content: space-between; margin: 4px 0; padding: 4px 0; border-bottom: 1px solid #2a2a3e; }}
 .label {{ color: #aaa; }} .value {{ font-weight: 600; }}
 .pos {{ color: #00ff88; }} .neg {{ color: #e74c3c; }}
-.badge {{ display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 0.7em; font-weight: bold; margin-left: 8px; color: white; }}
 .no-orders {{ text-align: center; padding: 50px 20px; color: #888; }}
 </style></head><body><div class="container">
 <h1>Kalshi Orders</h1>
@@ -1934,50 +1957,62 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
 <div class="balance">
 <span>Balance: <strong style="color:#00ff88">${balance_dollars:.2f}</strong></span>
 <span>Portfolio: <strong style="color:#3498db">${portfolio_value:.2f}</strong></span>
-<span>Open positions: <strong>{len(orders)}</strong> / {MAX_POSITIONS}</span>
+<span>Positions: <strong>{len(active_positions)}</strong> / {MAX_POSITIONS}</span>
 <span>Auto-trade: <strong style="color:{'#00ff88' if AUTO_TRADE_ENABLED else '#e74c3c'}">{'ON' if AUTO_TRADE_ENABLED else 'OFF'}</strong></span>
 </div>"""
 
-        if orders:
-            # Sort by timestamp descending (newest first)
-            sorted_orders = sorted(orders.items(), key=lambda x: x[1].get('timestamp', ''), reverse=True)
-            for ticker, o in sorted_orders:
-                price = o.get('price', 0)
-                american = prob_to_american(price)
-                side = o.get('side', '?').upper()
-                contracts = o.get('contracts', 0)
-                cost = o.get('cost', 0)
-                potential = o.get('potential_profit', 0)
-                edge_pct = o.get('edge_pct', 0)
-                status = o.get('status', 'unknown')
-                mtype = o.get('market_type', '?')
-                sport = o.get('sport', '?')
-                game = o.get('game', '?')
-                team = o.get('team', '?')
-                ts = o.get('timestamp', '?')
+        if active_positions:
+            total_cost = 0
+            total_value = 0
+            total_pnl = 0
+            for pos in active_positions:
+                ticker = pos.get('ticker', '?')
+                position = pos.get('position', 0)  # positive = YES, negative = NO
+                side = 'YES' if position > 0 else 'NO'
+                contracts = abs(position)
+                avg_price_cents = pos.get('market_exposure', 0)  # total cost in cents
+                market_price = pos.get('market_exposure', 0)
+                resting_orders_count = pos.get('resting_orders_count', 0)
 
-                status_color = '#00ff88' if status == 'executed' else '#e67e22' if status == 'resting' else '#e74c3c'
+                # Calculate costs from the position data
+                total_cost_cents = pos.get('total_traded', 0)
+                realized_pnl = pos.get('realized_pnl', 0) / 100 if 'realized_pnl' in pos else 0
+
+                # Estimate per-contract avg price
+                if contracts > 0:
+                    avg_price = abs(market_price) / contracts / 100 if market_price else 0
+                else:
+                    avg_price = 0
+
+                cost_dollars = abs(market_price) / 100 if market_price else 0
+                payout = contracts  # $1 per contract if right
+                potential_profit = payout - cost_dollars
+
+                # American odds from avg price
+                american = prob_to_american(avg_price) if 0 < avg_price < 1 else 'N/A'
+
+                pnl_class = 'pos' if potential_profit >= 0 else 'neg'
+
+                total_cost += cost_dollars
+                total_pnl += potential_profit
 
                 html += f"""<div class="order">
-<div class="order-header">
-<div>
-<span class="order-game">{game}</span>
-<span class="badge" style="background:#3498db">{mtype}</span>
-<span class="badge" style="background:#444">{sport}</span>
-<span class="badge" style="background:{status_color}">{status.upper()}</span>
-</div>
-<div style="color:#666;font-size:0.8em">{ts[:19]}</div>
-</div>
-<div class="order-team">{side} {team}</div>
-<div class="row"><span class="label">Ticker:</span><span class="value" style="font-size:0.85em">{ticker}</span></div>
-<div class="row"><span class="label">Price:</span><span class="value">${price:.2f} ({american})</span></div>
+<div class="order-team">{side} · {ticker}</div>
+<div class="row"><span class="label">Side:</span><span class="value">{side}</span></div>
 <div class="row"><span class="label">Contracts:</span><span class="value">{contracts}</span></div>
-<div class="row"><span class="label">Cost:</span><span class="value">${cost:.2f}</span></div>
-<div class="row"><span class="label">Potential profit:</span><span class="pos">${potential:.2f}</span></div>
-<div class="row"><span class="label">Edge when placed:</span><span class="pos">{edge_pct:.2f}%</span></div>
+<div class="row"><span class="label">Avg price:</span><span class="value">{avg_price*100:.1f}¢ ({american})</span></div>
+<div class="row"><span class="label">Cost:</span><span class="value">${cost_dollars:.2f}</span></div>
+<div class="row"><span class="label">Payout if right:</span><span class="value">${payout:.2f}</span></div>
+<div class="row"><span class="label">Potential profit:</span><span class="{pnl_class}">${potential_profit:.2f}</span></div>
+</div>"""
+
+            html += f"""<div style="text-align:center;padding:15px;background:#0f3460;border-radius:8px;margin-top:15px;">
+<span style="margin:0 20px;">Total cost: <strong>${total_cost:.2f}</strong></span>
+<span style="margin:0 20px;">Total payout: <strong>${total_cost + total_pnl:.2f}</strong></span>
+<span style="margin:0 20px;">Potential P&L: <strong class="{'pos' if total_pnl >= 0 else 'neg'}">${total_pnl:.2f}</strong></span>
 </div>"""
         else:
-            html += '<div class="no-orders"><p>No orders placed yet</p><p style="color:#666;font-size:0.9em">Orders will appear here when the scanner finds +EV edges and auto-trades</p></div>'
+            html += '<div class="no-orders"><p>No open positions</p><p style="color:#666;font-size:0.9em">Positions from your Kalshi portfolio will appear here</p></div>'
 
         html += "</div></body></html>"
         return html
