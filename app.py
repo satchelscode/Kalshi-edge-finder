@@ -1311,7 +1311,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         edges = find_moneyline_edges(kalshi_api, fd, kalshi_series, name, team_map)
         all_edges.extend(edges)
         print(f"   {name} moneyline: {len(edges)} edges")
-        time.sleep(2.0)
+        time.sleep(1.0)
 
     # 2. Spread markets
     for kalshi_series, (odds_key, name, team_map) in SPREAD_SPORTS.items():
@@ -1324,7 +1324,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         edges = find_spread_edges(kalshi_api, fd, kalshi_series, name, team_map)
         all_edges.extend(edges)
         print(f"   {name}: {len(edges)} edges")
-        time.sleep(2.0)
+        time.sleep(1.0)
 
     # 3. Total markets
     for kalshi_series, (odds_key, name) in TOTAL_SPORTS.items():
@@ -1343,7 +1343,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         edges = find_total_edges(kalshi_api, fd, kalshi_series, name, team_map)
         all_edges.extend(edges)
         print(f"   {name}: {len(edges)} edges")
-        time.sleep(2.0)
+        time.sleep(1.0)
 
     # 4. Player props
     for kalshi_series, (odds_key, fd_market, name) in PLAYER_PROP_SPORTS.items():
@@ -1356,7 +1356,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         edges = find_player_prop_edges(kalshi_api, fd, kalshi_series, name, fd_market)
         all_edges.extend(edges)
         print(f"   {name}: {len(edges)} edges")
-        time.sleep(2.0)
+        time.sleep(1.0)
 
     # 5. BTTS markets
     for kalshi_series, (odds_key, name) in BTTS_SPORTS.items():
@@ -1369,7 +1369,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         edges = find_btts_edges(kalshi_api, fd, kalshi_series, name)
         all_edges.extend(edges)
         print(f"   {name}: {len(edges)} edges")
-        time.sleep(2.0)
+        time.sleep(1.0)
 
     print(f"\n{'='*60}")
     print(f"SCAN COMPLETE")
