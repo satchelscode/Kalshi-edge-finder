@@ -153,6 +153,7 @@ TENNIS_SPORTS = {
 AUTO_TRADE_ENABLED = True
 MAX_POSITIONS = 999  # No practical limit
 TARGET_PROFIT = 1.00  # Target $1 profit per trade
+MIN_EDGE_PERCENT = 1.5  # Skip edges below this % (fees/slippage eat small edges)
 
 # Track which edges we've already notified about
 _notified_edges = set()
@@ -388,6 +389,9 @@ def are_odds_stale(commence_time_str: str, last_update_str: str) -> bool:
 def send_telegram_notification(edge: Dict):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+    # Don't notify for edges below the minimum threshold
+    if edge.get('arbitrage_profit', 0) < MIN_EDGE_PERCENT:
+        return
     edge_key = f"{edge.get('market_type','')}{edge['game']}_{edge['team']}_{edge['arbitrage_profit']:.1f}"
     if edge_key in _notified_edges:
         return
@@ -465,6 +469,12 @@ def auto_trade_edge(edge: Dict, kalshi_api) -> Optional[Dict]:
     # Skip if we already have a position on this ticker or same game
     # (prevents betting both sides of the same game)
     if _order_tracker.has_game_position(ticker):
+        return None
+
+    # Skip edges below minimum threshold
+    edge_pct = edge.get('arbitrage_profit', 0)
+    if edge_pct < MIN_EDGE_PERCENT:
+        print(f"   >>> Edge {edge_pct:.2f}% below minimum {MIN_EDGE_PERCENT}%, skipping {ticker}")
         return None
 
     # Check position limit
