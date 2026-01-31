@@ -151,7 +151,7 @@ TENNIS_SPORTS = {
 
 # Auto-trade configuration
 AUTO_TRADE_ENABLED = True
-MAX_POSITIONS = 40
+MAX_POSITIONS = 999  # No practical limit
 TARGET_PROFIT = 1.00  # Target $1 profit per trade
 
 # Track which edges we've already notified about
@@ -317,11 +317,16 @@ def _match_player_name(kalshi_name: str, fd_name: str) -> bool:
     f_parts = f.split()
     if k_parts and f_parts:
         if k_parts[-1] == f_parts[-1]:  # Same last name
-            # Also check first initial or first name
-            if k_parts[0][0] == f_parts[0][0]:
+            # Require first name to match (not just initial) to avoid
+            # false matches like Amen Thompson vs Ausar Thompson
+            if k_parts[0] == f_parts[0]:
                 return True
+            # Allow match if first 3+ chars match (handles nicknames)
+            if len(k_parts[0]) >= 3 and len(f_parts[0]) >= 3 and k_parts[0][:3] == f_parts[0][:3]:
+                return True
+    # Strict fuzzy match as last resort
     score = SequenceMatcher(None, k, f).ratio()
-    return score >= 0.75
+    return score >= 0.85
 
 
 def kalshi_fee(price: float, contracts: int = 100) -> float:
