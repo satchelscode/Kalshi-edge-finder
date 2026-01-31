@@ -376,7 +376,7 @@ class KalshiAPI:
                 cursor = data.get('cursor')
                 if not cursor:
                     break
-                time.sleep(0.5)
+                time.sleep(1.0)  # Respect Kalshi rate limits between paginated requests
             print(f"   Kalshi {series_ticker}: {len(all_markets)} markets")
             return all_markets
         except Exception as e:
@@ -451,7 +451,9 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
             continue
 
         ob1 = kalshi_api.get_orderbook(team_markets[abbrevs[0]]['ticker'])
+        time.sleep(0.15)
         ob2 = kalshi_api.get_orderbook(team_markets[abbrevs[1]]['ticker'])
+        time.sleep(0.15)
         if not ob1 or not ob2:
             continue
 
@@ -520,111 +522,125 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
     if not today_markets:
         return edges
 
-    # Group by game, then by team+spread
+    # Step 1: Group Kalshi markets by game code (both teams together)
+    # Ticker format: KXNBASPREAD-26JAN30DETGSW-GSW4
+    game_groups = {}  # game_code -> [{ticker, team_abbrev, floor_strike, market}]
     for m in today_markets:
         ticker = m.get('ticker', '')
-        title = m.get('title', '')
-        subtitle = m.get('subtitle', '')
-
-        # Extract spread value from ticker: e.g., KXNBASPREAD-26JAN30DETGSW-GSW4
-        # The last part after the last dash contains team+spread number
         parts = ticker.split('-')
         if len(parts) < 3:
             continue
 
         game_part = parts[1]  # e.g., 26JAN30DETGSW
-        team_spread_part = parts[-1]  # e.g., GSW4 or DET2
+        game_code = f"{parts[0]}-{game_part}"
+        team_spread_part = parts[-1]  # e.g., GSW4
 
-        # Extract team abbrev and spread index from last part
         match = re.match(r'^([A-Z]+?)(\d+)$', team_spread_part)
         if not match:
             continue
         team_abbrev = match.group(1)
-        team_name = team_map.get(team_abbrev, team_abbrev)
 
-        # Get the floor_strike from market data (this is the actual spread value)
         floor_strike = m.get('floor_strike')
         if floor_strike is None:
-            # Try to parse from subtitle: "wins by over 4.5 Points"
-            spread_match = re.search(r'(\d+\.?\d*)', subtitle or title or '')
+            subtitle = m.get('subtitle', '') or m.get('title', '') or ''
+            spread_match = re.search(r'(\d+\.?\d*)', subtitle)
             if spread_match:
                 floor_strike = float(spread_match.group(1))
             else:
                 continue
-
         floor_strike = float(floor_strike)
 
-        # Extract both team abbreviations from the game part
-        # e.g., 26JAN30DETGSW -> need to figure out the two teams
-        # Find matching FanDuel game
-        # First try to identify opponent from game_part
-        game_code = f"{parts[0]}-{game_part}"
+        if game_code not in game_groups:
+            game_groups[game_code] = []
+        game_groups[game_code].append({
+            'ticker': ticker,
+            'team_abbrev': team_abbrev,
+            'team_name': team_map.get(team_abbrev, team_abbrev),
+            'floor_strike': floor_strike,
+            'market': m,
+        })
 
-        # Match to FanDuel game
-        matched_game_id = None
-        fd_team_name = None
-        for gid, ginfo in fd_games.items():
-            if _name_matches(team_name, ginfo['home']) or _name_matches(team_name, ginfo['away']):
-                matched_game_id = gid
-                if _name_matches(team_name, ginfo['home']):
-                    fd_team_name = ginfo['home']
-                else:
-                    fd_team_name = ginfo['away']
-                break
+    # Step 2: For each game group, find the two team abbreviations and match BOTH to same FD game
+    for game_code, markets in game_groups.items():
+        # Get unique team abbrevs in this game
+        team_abbrevs = list(set(mk['team_abbrev'] for mk in markets))
+        if len(team_abbrevs) < 2:
+            continue
 
-        if not matched_game_id or matched_game_id not in fd_spreads:
+        t1_name = team_map.get(team_abbrevs[0], team_abbrevs[0])
+        t2_name = team_map.get(team_abbrevs[1], team_abbrevs[1])
+
+        # Require BOTH teams match the SAME FanDuel game
+        fd_t1, fd_t2, matched_game_id = match_kalshi_to_fanduel_game(t1_name, t2_name, fd_games)
+        if not fd_t1 or not matched_game_id or matched_game_id not in fd_spreads:
             continue
 
         fd_game_spreads = fd_spreads[matched_game_id]
-        if fd_team_name not in fd_game_spreads:
-            continue
+        print(f"   Spread match: {t1_name} vs {t2_name} -> {fd_t1} vs {fd_t2}")
 
-        fd_spread = fd_game_spreads[fd_team_name]
-        fd_point = abs(fd_spread['point'])
-        fd_odds = fd_spread['odds']
+        # Step 3: For each market in this game, compare to FanDuel spread
+        for mk in markets:
+            team_name = mk['team_name']
+            floor_strike = mk['floor_strike']
+            ticker = mk['ticker']
 
-        # Only compare if spread values are close (within 2 points)
-        if abs(floor_strike - fd_point) > 2.0:
-            continue
+            # Find which FD team this Kalshi team corresponds to
+            fd_team_name = None
+            if _name_matches(team_name, fd_t1):
+                fd_team_name = fd_t1
+            elif _name_matches(team_name, fd_t2):
+                fd_team_name = fd_t2
+            else:
+                continue
 
-        # Get Kalshi orderbook
-        ob = kalshi_api.get_orderbook(ticker)
-        if not ob:
-            continue
-        yes_price = get_best_yes_price(ob)
-        if yes_price is None:
-            continue
+            if fd_team_name not in fd_game_spreads:
+                continue
 
-        fee = kalshi_fee(yes_price)
-        eff = yes_price + fee
+            fd_spread = fd_game_spreads[fd_team_name]
+            fd_point = abs(fd_spread['point'])
+            fd_odds = fd_spread['odds']
 
-        # FanDuel implied prob for this spread
-        fd_prob = converter.decimal_to_implied_prob(fd_odds)
+            # Only compare EXACT matching spread lines (within 0.5 points)
+            if abs(floor_strike - fd_point) > 0.5:
+                continue
 
-        # Kalshi YES = team covers spread. Compare Kalshi price vs FanDuel prob.
-        # If Kalshi price (after fees) < FanDuel implied prob -> +EV to buy YES on Kalshi
-        if eff < fd_prob:
-            edge_pct = ((fd_prob / eff) - 1) * 100
-            game_name = f"{fd_games[matched_game_id]['away']} at {fd_games[matched_game_id]['home']}"
-            edge = {
-                'market_type': 'Spread',
-                'sport': sport_name,
-                'game': game_name,
-                'team': f"{team_name} -{floor_strike}",
-                'opposite_team': fd_team_name,
-                'kalshi_price': yes_price,
-                'kalshi_price_after_fees': eff,
-                'kalshi_prob_after_fees': eff * 100,
-                'kalshi_method': f"YES on {team_name} -{floor_strike}",
-                'fanduel_opposite_team': f"{fd_team_name} {fd_spread['point']}",
-                'fanduel_opposite_odds': fd_odds,
-                'fanduel_opposite_prob': fd_prob * 100,
-                'total_implied_prob': (eff + (1 - fd_prob)) * 100,
-                'arbitrage_profit': edge_pct,
-                'recommendation': f"Buy YES {team_name} -{floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel: {fd_team_name} {fd_spread['point']} at {fd_odds:.2f})",
-            }
-            edges.append(edge)
-            send_telegram_notification(edge)
+            # Get Kalshi orderbook
+            ob = kalshi_api.get_orderbook(ticker)
+            if not ob:
+                continue
+            time.sleep(0.15)
+
+            yes_price = get_best_yes_price(ob)
+            if yes_price is None:
+                continue
+
+            fee = kalshi_fee(yes_price)
+            eff = yes_price + fee
+
+            fd_prob = converter.decimal_to_implied_prob(fd_odds)
+
+            if eff < fd_prob:
+                edge_pct = ((fd_prob / eff) - 1) * 100
+                game_name = f"{fd_games[matched_game_id]['away']} at {fd_games[matched_game_id]['home']}"
+                edge = {
+                    'market_type': 'Spread',
+                    'sport': sport_name,
+                    'game': game_name,
+                    'team': f"{team_name} -{floor_strike}",
+                    'opposite_team': fd_team_name,
+                    'kalshi_price': yes_price,
+                    'kalshi_price_after_fees': eff,
+                    'kalshi_prob_after_fees': eff * 100,
+                    'kalshi_method': f"YES on {team_name} -{floor_strike}",
+                    'fanduel_opposite_team': f"{fd_team_name} {fd_spread['point']}",
+                    'fanduel_opposite_odds': fd_odds,
+                    'fanduel_opposite_prob': fd_prob * 100,
+                    'total_implied_prob': (eff + (1 - fd_prob)) * 100,
+                    'arbitrage_profit': edge_pct,
+                    'recommendation': f"Buy YES {team_name} -{floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel: {fd_team_name} {fd_spread['point']} at {fd_odds:.2f})",
+                }
+                edges.append(edge)
+                send_telegram_notification(edge)
 
     return edges
 
@@ -640,7 +656,7 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
     Kalshi: "Over 224.5 points" at some YES price
     FanDuel: Over 224.5 at decimal odds
 
-    Match by line value, compare prices.
+    Match by game (both teams) + exact line value, compare prices.
     """
     converter = OddsConverter()
     fd_totals = fd_data['totals']
@@ -653,6 +669,9 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
     if not today_markets:
         return edges
 
+    # Step 1: Group by game code to identify both teams
+    # Ticker format: KXNBATOTAL-26JAN30DETGSW-239
+    game_groups = {}  # game_code -> [market_info]
     for m in today_markets:
         ticker = m.get('ticker', '')
         parts = ticker.split('-')
@@ -660,29 +679,43 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
             continue
 
         game_part = parts[1]
-        line_part = parts[-1]  # e.g., "224" or "239"
+        game_code = f"{parts[0]}-{game_part}"
 
-        # Get line value from market data
         floor_strike = m.get('floor_strike')
         if floor_strike is None:
+            line_part = parts[-1]
             try:
-                floor_strike = float(line_part) + 0.5  # Kalshi uses whole numbers, actual line is +0.5
+                floor_strike = float(line_part) + 0.5
             except ValueError:
                 continue
         floor_strike = float(floor_strike)
 
-        # Find matching FanDuel game by looking at team codes in game_part
+        if game_code not in game_groups:
+            game_groups[game_code] = {'game_part': game_part, 'markets': []}
+        game_groups[game_code]['markets'].append({
+            'ticker': ticker,
+            'floor_strike': floor_strike,
+            'market': m,
+        })
+
+    # Step 2: Match each game group to FanDuel by finding team abbrevs in game_part
+    for game_code, group in game_groups.items():
+        game_part = group['game_part']
+
+        # Find which FanDuel game this matches by checking team abbreviations in game_part
         matched_game_id = None
         for gid, ginfo in fd_games.items():
-            home_abbrevs = [k for k, v in team_map.items() if _name_matches(v, ginfo['home'])]
-            away_abbrevs = [k for k, v in team_map.items() if _name_matches(v, ginfo['away'])]
-            all_abbrevs = home_abbrevs + away_abbrevs
-            # Check if game_part contains these abbreviations
-            for abbr in all_abbrevs:
+            home_found = False
+            away_found = False
+            for abbr, full_name in team_map.items():
                 if abbr in game_part:
-                    matched_game_id = gid
-                    break
-            if matched_game_id:
+                    if _name_matches(full_name, ginfo['home']):
+                        home_found = True
+                    elif _name_matches(full_name, ginfo['away']):
+                        away_found = True
+            # Require BOTH teams found in the game_part
+            if home_found and away_found:
+                matched_game_id = gid
                 break
 
         if not matched_game_id or matched_game_id not in fd_totals:
@@ -690,74 +723,79 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
 
         fd_total = fd_totals[matched_game_id]
         fd_line = fd_total['point']
-
-        # Only compare matching lines (within 1.5 points)
-        if abs(floor_strike - fd_line) > 1.5:
-            continue
-
-        ob = kalshi_api.get_orderbook(ticker)
-        if not ob:
-            continue
-
-        yes_price = get_best_yes_price(ob)  # YES = Over
-        no_price = get_best_no_price(ob)    # NO = Under (effectively buying Under)
-
         game_name = f"{fd_games[matched_game_id]['away']} at {fd_games[matched_game_id]['home']}"
 
-        # Check Over: Kalshi YES vs FanDuel Over
-        if yes_price is not None:
-            fee = kalshi_fee(yes_price)
-            eff = yes_price + fee
-            fd_over_prob = converter.decimal_to_implied_prob(fd_total['over_odds'])
-            if eff < fd_over_prob:
-                edge_pct = ((fd_over_prob / eff) - 1) * 100
-                edge = {
-                    'market_type': 'Total',
-                    'sport': sport_name,
-                    'game': game_name,
-                    'team': f"Over {floor_strike}",
-                    'opposite_team': f"Under {floor_strike}",
-                    'kalshi_price': yes_price,
-                    'kalshi_price_after_fees': eff,
-                    'kalshi_prob_after_fees': eff * 100,
-                    'kalshi_method': f"YES Over {floor_strike}",
-                    'fanduel_opposite_team': f"Over {fd_line}",
-                    'fanduel_opposite_odds': fd_total['over_odds'],
-                    'fanduel_opposite_prob': fd_over_prob * 100,
-                    'total_implied_prob': (eff + (1 - fd_over_prob)) * 100,
-                    'arbitrage_profit': edge_pct,
-                    'recommendation': f"Buy YES Over {floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel Over {fd_line} at {fd_total['over_odds']:.2f})",
-                }
-                edges.append(edge)
-                send_telegram_notification(edge)
+        # Step 3: For each total market in this game, compare to FanDuel
+        for mk in group['markets']:
+            floor_strike = mk['floor_strike']
+            ticker = mk['ticker']
 
-        # Check Under: Kalshi NO (= Under) vs FanDuel Under
-        if no_price is not None:
-            under_cost = no_price  # Buying NO = betting Under
-            fee = kalshi_fee(under_cost)
-            eff = under_cost + fee
-            fd_under_prob = converter.decimal_to_implied_prob(fd_total['under_odds'])
-            if eff < fd_under_prob:
-                edge_pct = ((fd_under_prob / eff) - 1) * 100
-                edge = {
-                    'market_type': 'Total',
-                    'sport': sport_name,
-                    'game': game_name,
-                    'team': f"Under {floor_strike}",
-                    'opposite_team': f"Over {floor_strike}",
-                    'kalshi_price': under_cost,
-                    'kalshi_price_after_fees': eff,
-                    'kalshi_prob_after_fees': eff * 100,
-                    'kalshi_method': f"NO (Under) {floor_strike}",
-                    'fanduel_opposite_team': f"Under {fd_line}",
-                    'fanduel_opposite_odds': fd_total['under_odds'],
-                    'fanduel_opposite_prob': fd_under_prob * 100,
-                    'total_implied_prob': (eff + (1 - fd_under_prob)) * 100,
-                    'arbitrage_profit': edge_pct,
-                    'recommendation': f"Buy NO (Under {floor_strike}) on Kalshi at ${under_cost:.2f} (FanDuel Under {fd_line} at {fd_total['under_odds']:.2f})",
-                }
-                edges.append(edge)
-                send_telegram_notification(edge)
+            # Only compare EXACT matching lines (within 0.5 points)
+            if abs(floor_strike - fd_line) > 0.5:
+                continue
+
+            ob = kalshi_api.get_orderbook(ticker)
+            if not ob:
+                continue
+            time.sleep(0.15)
+
+            yes_price = get_best_yes_price(ob)  # YES = Over
+            no_price = get_best_no_price(ob)    # NO = Under
+
+            # Check Over: Kalshi YES vs FanDuel Over
+            if yes_price is not None:
+                fee = kalshi_fee(yes_price)
+                eff = yes_price + fee
+                fd_over_prob = converter.decimal_to_implied_prob(fd_total['over_odds'])
+                if eff < fd_over_prob:
+                    edge_pct = ((fd_over_prob / eff) - 1) * 100
+                    edge = {
+                        'market_type': 'Total',
+                        'sport': sport_name,
+                        'game': game_name,
+                        'team': f"Over {floor_strike}",
+                        'opposite_team': f"Under {floor_strike}",
+                        'kalshi_price': yes_price,
+                        'kalshi_price_after_fees': eff,
+                        'kalshi_prob_after_fees': eff * 100,
+                        'kalshi_method': f"YES Over {floor_strike}",
+                        'fanduel_opposite_team': f"Over {fd_line}",
+                        'fanduel_opposite_odds': fd_total['over_odds'],
+                        'fanduel_opposite_prob': fd_over_prob * 100,
+                        'total_implied_prob': (eff + (1 - fd_over_prob)) * 100,
+                        'arbitrage_profit': edge_pct,
+                        'recommendation': f"Buy YES Over {floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel Over {fd_line} at {fd_total['over_odds']:.2f})",
+                    }
+                    edges.append(edge)
+                    send_telegram_notification(edge)
+
+            # Check Under: Kalshi NO (= Under) vs FanDuel Under
+            if no_price is not None:
+                under_cost = no_price
+                fee = kalshi_fee(under_cost)
+                eff = under_cost + fee
+                fd_under_prob = converter.decimal_to_implied_prob(fd_total['under_odds'])
+                if eff < fd_under_prob:
+                    edge_pct = ((fd_under_prob / eff) - 1) * 100
+                    edge = {
+                        'market_type': 'Total',
+                        'sport': sport_name,
+                        'game': game_name,
+                        'team': f"Under {floor_strike}",
+                        'opposite_team': f"Over {floor_strike}",
+                        'kalshi_price': under_cost,
+                        'kalshi_price_after_fees': eff,
+                        'kalshi_prob_after_fees': eff * 100,
+                        'kalshi_method': f"NO (Under) {floor_strike}",
+                        'fanduel_opposite_team': f"Under {fd_line}",
+                        'fanduel_opposite_odds': fd_total['under_odds'],
+                        'fanduel_opposite_prob': fd_under_prob * 100,
+                        'total_implied_prob': (eff + (1 - fd_under_prob)) * 100,
+                        'arbitrage_profit': edge_pct,
+                        'recommendation': f"Buy NO (Under {floor_strike}) on Kalshi at ${under_cost:.2f} (FanDuel Under {fd_line} at {fd_total['under_odds']:.2f})",
+                    }
+                    edges.append(edge)
+                    send_telegram_notification(edge)
 
     return edges
 
@@ -835,6 +873,7 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
         ob = kalshi_api.get_orderbook(ticker)
         if not ob:
             continue
+        time.sleep(0.15)
 
         yes_price = get_best_yes_price(ob)
         if yes_price is None:
@@ -896,7 +935,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         edges = find_moneyline_edges(kalshi_api, fd, kalshi_series, name, team_map)
         all_edges.extend(edges)
         print(f"   {name} moneyline: {len(edges)} edges")
-        time.sleep(0.3)
+        time.sleep(1.0)
 
     # 2. Spread markets
     for kalshi_series, (odds_key, name, team_map) in SPREAD_SPORTS.items():
@@ -909,7 +948,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         edges = find_spread_edges(kalshi_api, fd, kalshi_series, name, team_map)
         all_edges.extend(edges)
         print(f"   {name}: {len(edges)} edges")
-        time.sleep(0.3)
+        time.sleep(1.0)
 
     # 3. Total markets
     for kalshi_series, (odds_key, name) in TOTAL_SPORTS.items():
@@ -928,7 +967,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         edges = find_total_edges(kalshi_api, fd, kalshi_series, name, team_map)
         all_edges.extend(edges)
         print(f"   {name}: {len(edges)} edges")
-        time.sleep(0.3)
+        time.sleep(1.0)
 
     # 4. Player props
     for kalshi_series, (odds_key, fd_market, name) in PLAYER_PROP_SPORTS.items():
@@ -941,7 +980,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         edges = find_player_prop_edges(kalshi_api, fd, kalshi_series, name, fd_market)
         all_edges.extend(edges)
         print(f"   {name}: {len(edges)} edges")
-        time.sleep(0.3)
+        time.sleep(1.0)
 
     print(f"\n{'='*60}")
     print(f"SCAN COMPLETE")
