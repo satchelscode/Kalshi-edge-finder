@@ -906,6 +906,28 @@ class KalshiAPI:
             return result.get('orders', [])
         return []
 
+    def get_settlements(self, limit: int = 200) -> List[Dict]:
+        """Get settlement history from Kalshi."""
+        all_settlements = []
+        cursor = None
+        try:
+            while True:
+                params = {'limit': limit}
+                if cursor:
+                    params['cursor'] = cursor
+                result = self._auth_get('/trade-api/v2/portfolio/settlements', params=params)
+                if not result:
+                    break
+                settlements = result.get('settlements', [])
+                all_settlements.extend(settlements)
+                cursor = result.get('cursor')
+                if not cursor:
+                    break
+            return all_settlements
+        except Exception as e:
+            print(f"   Kalshi get_settlements error: {e}")
+            return all_settlements
+
     def get_positions(self, limit: int = 200) -> List[Dict]:
         """Get current portfolio positions from Kalshi."""
         all_positions = []
@@ -2216,7 +2238,7 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
 .no-edge {{ text-align: center; padding: 50px 20px; color: #888; }}
 </style></head><body><div class="container">
 <h1>Kalshi Edge Finder</h1>
-<div class="sub">Background Scanner: Scan #{scan_count} {'🔄 SCANNING...' if is_scanning else '✓ idle'} | Last: {scan_ts[:19] if scan_ts else 'waiting...'} | <a href="/orders" style="color:#3498db">Orders ({_order_tracker.get_open_count()})</a></div>
+<div class="sub">Background Scanner: Scan #{scan_count} {'🔄 SCANNING...' if is_scanning else '✓ idle'} | Last: {scan_ts[:19] if scan_ts else 'waiting...'} | <a href="/orders" style="color:#3498db">Orders ({_order_tracker.get_open_count()})</a> | <a href="/history" style="color:#e67e22">History</a></div>
 <div class="info">Scanning: {', '.join(scanned)} | Active: {', '.join(active) if active else 'None'}</div>
 <div class="count">"""
 
@@ -2568,7 +2590,7 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
 .summary span {{ margin: 0 20px; }}
 </style></head><body><div class="container">
 <h1>Kalshi Orders</h1>
-<div class="nav"><a href="/debug">Edge Scanner</a> | <a href="/orders">Orders</a></div>
+<div class="nav"><a href="/debug">Edge Scanner</a> | <a href="/orders">Orders</a> | <a href="/history">History</a></div>
 <div class="balance">
 <span>Balance: <strong style="color:#00ff88">${balance_dollars:.2f}</strong></span>
 <span>Portfolio: <strong style="color:#3498db">${portfolio_value:.2f}</strong></span>
@@ -2629,6 +2651,171 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
             html += '</div>'
         else:
             html += '<div class="no-orders"><p>No open positions</p><p style="color:#666;font-size:0.9em">Positions from your Kalshi portfolio will appear here</p></div>'
+
+        html += "</div></body></html>"
+        return html
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"<h1 style='color:red'>Error</h1><pre>{e}</pre>", 500
+
+
+@app.route('/history')
+def history_page():
+    """Show settled bets history with P&L and ROI."""
+    try:
+        kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+        balance_data = kalshi.get_balance()
+        balance_dollars = balance_data.get('balance', 0) / 100 if balance_data else 0
+
+        settlements = kalshi.get_settlements()
+
+        # Fetch market details for readable names (batch, with caching)
+        market_cache = {}
+        for s in settlements[:100]:  # Limit API calls
+            ticker = s.get('ticker', '')
+            if ticker and ticker not in market_cache:
+                market_cache[ticker] = kalshi.get_market(ticker)
+                time.sleep(0.15)
+
+        type_colors = {
+            'Moneyline': '#e74c3c', 'Spread': '#3498db', 'Total': '#e67e22',
+            'Prop': '#9b59b6', 'BTTS': '#2ecc71', 'Tennis ML': '#1abc9c', 'Market': '#95a5a6',
+        }
+
+        # Process settlements
+        rows = []
+        total_cost = 0
+        total_revenue = 0
+        total_fees = 0
+        wins = 0
+        losses = 0
+
+        for s in settlements:
+            ticker = s.get('ticker', '')
+            result = s.get('market_result', '')
+            yes_count = s.get('yes_count', 0)
+            no_count = s.get('no_count', 0)
+            yes_cost = s.get('yes_total_cost', 0) / 100  # cents -> dollars
+            no_cost = s.get('no_total_cost', 0) / 100
+            revenue = s.get('revenue', 0) / 100
+            fee = float(s.get('fee_cost', '0') or '0')
+            settled_time = s.get('settled_time', '')
+
+            cost = yes_cost + no_cost
+            profit = revenue - cost
+            total_cost += cost
+            total_revenue += revenue
+            total_fees += fee
+
+            if profit > 0:
+                wins += 1
+            elif profit < 0:
+                losses += 1
+
+            # Determine which side we held
+            if yes_count > 0 and no_count == 0:
+                side = 'YES'
+                contracts = yes_count
+            elif no_count > 0 and yes_count == 0:
+                side = 'NO'
+                contracts = no_count
+            else:
+                side = 'YES' if yes_cost >= no_cost else 'NO'
+                contracts = max(yes_count, no_count)
+
+            # Did we win?
+            won = (side == 'YES' and result == 'yes') or (side == 'NO' and result == 'no')
+
+            # Human-readable name
+            market_info = market_cache.get(ticker)
+            bet_desc, mtype, bet_sub = _describe_position(market_info, ticker, side)
+            mtype_color = type_colors.get(mtype, '#95a5a6')
+
+            # Parse settled time
+            try:
+                st = datetime.fromisoformat(settled_time.replace('Z', '+00:00'))
+                time_display = st.strftime('%b %d %I:%M %p')
+            except Exception:
+                time_display = settled_time[:16] if settled_time else '?'
+
+            rows.append({
+                'bet_desc': bet_desc, 'mtype': mtype, 'mtype_color': mtype_color,
+                'bet_sub': bet_sub, 'ticker': ticker, 'contracts': contracts,
+                'cost': cost, 'revenue': revenue, 'profit': profit, 'fee': fee,
+                'won': won, 'result': result, 'time_display': time_display,
+            })
+
+        total_profit = total_revenue - total_cost
+        roi = (total_profit / total_cost * 100) if total_cost > 0 else 0
+        total_bets = wins + losses
+
+        html = f"""<!DOCTYPE html>
+<html><head>
+<title>Kalshi History</title>
+<meta http-equiv="refresh" content="60">
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #1a1a2e, #16213e); color: #eee; min-height: 100vh; }}
+.container {{ max-width: 1200px; margin: 0 auto; }}
+h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
+.nav {{ text-align: center; margin-bottom: 15px; }}
+.nav a {{ color: #00ff88; text-decoration: none; margin: 0 15px; }}
+.stats {{ display: flex; justify-content: center; gap: 15px; flex-wrap: wrap; padding: 15px; background: #0f3460; border-radius: 8px; margin-bottom: 20px; }}
+.stat {{ text-align: center; padding: 0 15px; }}
+.stat-val {{ font-size: 1.4em; font-weight: bold; }}
+.stat-label {{ font-size: 0.75em; color: #888; margin-top: 2px; }}
+.row {{ background: #16213e; padding: 12px 15px; margin: 6px 0; border-radius: 8px; display: flex; align-items: center; gap: 15px; }}
+.row-win {{ border-left: 4px solid #00ff88; }}
+.row-loss {{ border-left: 4px solid #e74c3c; }}
+.row-void {{ border-left: 4px solid #666; }}
+.bet-info {{ flex: 1; min-width: 0; }}
+.bet-name {{ font-weight: bold; font-size: 1.05em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+.bet-sub {{ font-size: 0.8em; color: #888; margin-top: 2px; }}
+.badge {{ display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 0.65em; font-weight: bold; color: white; margin-left: 6px; vertical-align: middle; }}
+.nums {{ text-align: right; white-space: nowrap; }}
+.profit {{ font-weight: bold; font-size: 1.1em; }}
+.pos {{ color: #00ff88; }} .neg {{ color: #e74c3c; }}
+.detail {{ font-size: 0.8em; color: #888; }}
+.time {{ font-size: 0.75em; color: #666; min-width: 100px; text-align: right; }}
+.empty {{ text-align: center; padding: 50px 20px; color: #888; }}
+</style></head><body><div class="container">
+<h1>Bet History</h1>
+<div class="nav"><a href="/debug">Edge Scanner</a> | <a href="/orders">Orders</a> | <a href="/history">History</a></div>
+
+<div class="stats">
+<div class="stat"><div class="stat-val {'pos' if total_profit >= 0 else 'neg'}">${total_profit:+.2f}</div><div class="stat-label">Total P&L</div></div>
+<div class="stat"><div class="stat-val {'pos' if roi >= 0 else 'neg'}">{roi:+.1f}%</div><div class="stat-label">ROI</div></div>
+<div class="stat"><div class="stat-val">{total_bets}</div><div class="stat-label">Settled Bets</div></div>
+<div class="stat"><div class="stat-val pos">{wins}</div><div class="stat-label">Wins</div></div>
+<div class="stat"><div class="stat-val neg">{losses}</div><div class="stat-label">Losses</div></div>
+<div class="stat"><div class="stat-val">{wins}/{total_bets if total_bets else 1}</div><div class="stat-label">Win Rate</div></div>
+<div class="stat"><div class="stat-val">${total_cost:.2f}</div><div class="stat-label">Total Wagered</div></div>
+<div class="stat"><div class="stat-val">${total_fees:.2f}</div><div class="stat-label">Total Fees</div></div>
+<div class="stat"><div class="stat-val">${balance_dollars:.2f}</div><div class="stat-label">Balance</div></div>
+</div>
+"""
+
+        if rows:
+            for r in rows:
+                result_class = 'row-win' if r['won'] else ('row-void' if r['result'] == 'void' else 'row-loss')
+                result_icon = '+' if r['won'] else ('-' if r['result'] != 'void' else '~')
+                pnl_class = 'pos' if r['profit'] >= 0 else 'neg'
+                sub_line = (r['bet_sub'] + ' &middot; ') if r['bet_sub'] else ''
+
+                html += f"""<div class="row {result_class}">
+<div class="bet-info">
+<div class="bet-name">{r['bet_desc']}<span class="badge" style="background:{r['mtype_color']}">{r['mtype']}</span></div>
+<div class="bet-sub">{sub_line}{r['ticker']}</div>
+</div>
+<div class="nums">
+<div class="profit {pnl_class}">{result_icon}${abs(r['profit']):.2f}</div>
+<div class="detail">{r['contracts']}x &middot; cost ${r['cost']:.2f} &middot; paid ${r['revenue']:.2f}</div>
+</div>
+<div class="time">{r['time_display']}</div>
+</div>"""
+        else:
+            html += '<div class="empty"><p>No settled bets yet</p><p style="color:#666;font-size:0.9em">Settled positions will appear here</p></div>'
 
         html += "</div></body></html>"
         return html
