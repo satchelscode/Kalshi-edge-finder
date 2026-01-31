@@ -176,13 +176,12 @@ class OrderTracker:
             self._api_tickers = set()
             for pos in positions:
                 ticker = pos.get('ticker', '')
-                # Only count positions where we actually hold contracts
-                yes_count = pos.get('position', 0)
-                no_count = pos.get('total_traded', 0)
-                if ticker and (yes_count != 0 or no_count != 0):
+                # position > 0 = YES held, position < 0 = NO held, 0 = settled/closed
+                position = pos.get('position', 0)
+                if ticker and position != 0:
                     self._api_tickers.add(ticker)
             self._position_count = len(self._api_tickers)
-            print(f"   OrderTracker synced: {self._position_count} positions from Kalshi API")
+            print(f"   OrderTracker synced: {self._position_count} active positions from Kalshi API")
         except Exception as e:
             print(f"   OrderTracker sync error: {e}")
 
