@@ -73,6 +73,13 @@ MONEYLINE_SPORTS = {
 SPREAD_SPORTS = {
     'KXNBASPREAD': ('basketball_nba', 'NBA Spread', NBA_TEAMS),
     'KXNHLSPREAD': ('icehockey_nhl', 'NHL Spread', NHL_TEAMS),
+    'KXNCAAMBSPREAD': ('basketball_ncaab', 'NCAAB Spread', {}),
+    'KXEPLSPREAD': ('soccer_epl', 'EPL Spread', {}),
+    'KXLALIGASPREAD': ('soccer_spain_la_liga', 'La Liga Spread', {}),
+    'KXBUNDESLIGASPREAD': ('soccer_germany_bundesliga', 'Bundesliga Spread', {}),
+    'KXSERIEASPREAD': ('soccer_italy_serie_a', 'Serie A Spread', {}),
+    'KXLIGUE1SPREAD': ('soccer_france_ligue_one', 'Ligue 1 Spread', {}),
+    'KXUCLSPREAD': ('soccer_uefa_champs_league', 'UCL Spread', {}),
     # 'KXNFLSPREAD': ('americanfootball_nfl', 'NFL Spread', NFL_TEAMS),
 }
 
@@ -80,15 +87,37 @@ SPREAD_SPORTS = {
 TOTAL_SPORTS = {
     'KXNBATOTAL': ('basketball_nba', 'NBA Total'),
     'KXNHLTOTAL': ('icehockey_nhl', 'NHL Total'),
+    'KXNCAAMBTOTAL': ('basketball_ncaab', 'NCAAB Total'),
+    'KXEPLTOTAL': ('soccer_epl', 'EPL Total'),
+    'KXLALIGATOTAL': ('soccer_spain_la_liga', 'La Liga Total'),
+    'KXBUNDESLIGATOTAL': ('soccer_germany_bundesliga', 'Bundesliga Total'),
+    'KXSERIEATOTAL': ('soccer_italy_serie_a', 'Serie A Total'),
+    'KXLIGUE1TOTAL': ('soccer_france_ligue_one', 'Ligue 1 Total'),
+    'KXUCLTOTAL': ('soccer_uefa_champs_league', 'UCL Total'),
     # 'KXNFLTOTAL': ('americanfootball_nfl', 'NFL Total'),
 }
 
 # Player prop markets: kalshi_series -> (odds_api_sport, odds_api_market, display_name)
 PLAYER_PROP_SPORTS = {
+    # NBA
     'KXNBAPTS': ('basketball_nba', 'player_points', 'NBA Points'),
     'KXNBAREB': ('basketball_nba', 'player_rebounds', 'NBA Rebounds'),
     'KXNBAAST': ('basketball_nba', 'player_assists', 'NBA Assists'),
     'KXNBA3PT': ('basketball_nba', 'player_threes', 'NBA 3-Pointers'),
+    # NHL
+    'KXNHLPTS': ('icehockey_nhl', 'player_points', 'NHL Points'),
+    'KXNHLAST': ('icehockey_nhl', 'player_assists', 'NHL Assists'),
+    'KXNHLSAVES': ('icehockey_nhl', 'player_total_saves', 'NHL Saves'),
+}
+
+# BTTS (Both Teams To Score) markets: kalshi_series -> (odds_api_sport, display_name)
+BTTS_SPORTS = {
+    'KXEPLBTTS': ('soccer_epl', 'EPL BTTS'),
+    'KXLALIGABTTS': ('soccer_spain_la_liga', 'La Liga BTTS'),
+    'KXBUNDESLIGABTTS': ('soccer_germany_bundesliga', 'Bundesliga BTTS'),
+    'KXSERIEABTTS': ('soccer_italy_serie_a', 'Serie A BTTS'),
+    'KXLIGUE1BTTS': ('soccer_france_ligue_one', 'Ligue 1 BTTS'),
+    'KXUCLBTTS': ('soccer_uefa_champs_league', 'UCL BTTS'),
 }
 
 # Track which edges we've already notified about
@@ -141,8 +170,18 @@ def _name_matches(kalshi_name: str, fd_name: str, threshold: float = 0.55) -> bo
     return False
 
 
-def match_kalshi_to_fanduel_game(team1_name, team2_name, fd_games):
-    """Match BOTH Kalshi teams to the SAME FanDuel game."""
+def match_kalshi_to_fanduel_game(team1_name, team2_name, fd_games, kalshi_date_str=None):
+    """Match BOTH Kalshi teams to the SAME FanDuel game.
+    If kalshi_date_str is provided (e.g., '26JAN31'), prefer games on that date."""
+    # Parse Kalshi date if provided, to filter FD games by date
+    kalshi_date = None
+    if kalshi_date_str:
+        try:
+            kalshi_date = datetime.strptime(kalshi_date_str, '%y%b%d').replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+
+    candidates = []
     for game_id, game_info in fd_games.items():
         fd_home = game_info['home']
         fd_away = game_info['away']
@@ -150,11 +189,30 @@ def match_kalshi_to_fanduel_game(team1_name, team2_name, fd_games):
         t1a = _name_matches(team1_name, fd_away)
         t2h = _name_matches(team2_name, fd_home)
         t2a = _name_matches(team2_name, fd_away)
+        matched = None
         if t1h and t2a:
-            return fd_home, fd_away, game_id
-        if t1a and t2h:
-            return fd_away, fd_home, game_id
-    return None, None, None
+            matched = (fd_home, fd_away, game_id)
+        elif t1a and t2h:
+            matched = (fd_away, fd_home, game_id)
+        if matched:
+            # Score by date proximity if we have both dates
+            if kalshi_date and game_info.get('commence_time'):
+                try:
+                    ct = datetime.fromisoformat(game_info['commence_time'].replace('Z', '+00:00'))
+                    # Game should be on the Kalshi date (allow same day or next day early AM)
+                    day_diff = abs((ct.date() - kalshi_date.date()).days)
+                    candidates.append((day_diff, matched))
+                except Exception:
+                    candidates.append((0, matched))
+            else:
+                candidates.append((0, matched))
+
+    if not candidates:
+        return None, None, None
+
+    # Return the closest date match
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
 
 
 def _match_player_name(kalshi_name: str, fd_name: str) -> bool:
@@ -232,11 +290,11 @@ class FanDuelAPI:
         self.base_url = "https://api.the-odds-api.com/v4"
 
     def _fetch(self, sport_key: str, markets: str = 'h2h') -> list:
-        """Base fetch method with today-only filtering."""
+        """Fetch odds for today and tomorrow (covers US evening + next day games)."""
         try:
             now_utc = datetime.now(timezone.utc)
             start_of_today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_of_today = start_of_today + timedelta(days=1)
+            end_of_window = start_of_today + timedelta(days=2)  # Today + tomorrow
 
             url = f"{self.base_url}/sports/{sport_key}/odds/"
             params = {
@@ -246,7 +304,7 @@ class FanDuelAPI:
                 'bookmakers': 'fanduel',
                 'oddsFormat': 'decimal',
                 'commenceTimeFrom': start_of_today.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                'commenceTimeTo': end_of_today.strftime('%Y-%m-%dT%H:%M:%SZ')
+                'commenceTimeTo': end_of_window.strftime('%Y-%m-%dT%H:%M:%SZ')
             }
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
@@ -333,17 +391,17 @@ class FanDuelAPI:
         return {'totals': totals, 'games': games_dict}
 
     def get_events(self, sport_key: str) -> list:
-        """Get today's event IDs for a sport (used for per-event prop fetching)."""
+        """Get event IDs for today and tomorrow (used for per-event prop fetching)."""
         try:
             now_utc = datetime.now(timezone.utc)
             start_of_today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_of_today = start_of_today + timedelta(days=1)
+            end_of_window = start_of_today + timedelta(days=2)
 
             url = f"{self.base_url}/sports/{sport_key}/events/"
             params = {
                 'apiKey': self.api_key,
                 'commenceTimeFrom': start_of_today.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                'commenceTimeTo': end_of_today.strftime('%Y-%m-%dT%H:%M:%SZ')
+                'commenceTimeTo': end_of_window.strftime('%Y-%m-%dT%H:%M:%SZ')
             }
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
@@ -351,6 +409,62 @@ class FanDuelAPI:
         except Exception as e:
             print(f"   FanDuel {sport_key} events error: {e}")
             return []
+
+    def get_btts(self, sport_key: str) -> Dict:
+        """Get BTTS (Both Teams To Score) odds using per-event endpoint.
+        Returns {game_id: {yes_odds, no_odds}} and games dict."""
+        btts = {}
+        games_dict = {}
+
+        events = self.get_events(sport_key)
+        if not events:
+            print(f"   FanDuel {sport_key} btts: no events today")
+            return {'btts': btts, 'games': games_dict}
+
+        print(f"   FanDuel {sport_key}: {len(events)} events, fetching btts...")
+
+        for event in events:
+            event_id = event.get('id', '')
+            home = event.get('home_team', '')
+            away = event.get('away_team', '')
+            if home and away:
+                games_dict[event_id] = {'home': home, 'away': away, 'commence_time': event.get('commence_time', '')}
+
+            try:
+                url = f"{self.base_url}/sports/{sport_key}/events/{event_id}/odds"
+                params = {
+                    'apiKey': self.api_key,
+                    'regions': 'us',
+                    'markets': 'btts',
+                    'bookmakers': 'fanduel',
+                    'oddsFormat': 'decimal',
+                }
+                response = requests.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+
+                for bm in data.get('bookmakers', []):
+                    if bm['key'] == 'fanduel':
+                        for mkt in bm.get('markets', []):
+                            if mkt['key'] == 'btts':
+                                game_btts = {}
+                                for o in mkt.get('outcomes', []):
+                                    if o['name'] == 'Yes':
+                                        game_btts['yes_odds'] = o['price']
+                                    elif o['name'] == 'No':
+                                        game_btts['no_odds'] = o['price']
+                                if 'yes_odds' in game_btts and 'no_odds' in game_btts:
+                                    btts[event_id] = game_btts
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else 'unknown'
+                print(f"   FanDuel {sport_key} event {event_id} btts: HTTP {status}")
+            except Exception as e:
+                print(f"   FanDuel {sport_key} event {event_id} btts: {e}")
+
+            time.sleep(0.5)
+
+        print(f"   FanDuel {sport_key} btts: {len(btts)} games")
+        return {'btts': btts, 'games': games_dict}
 
     def get_player_props(self, sport_key: str, market_key: str) -> Dict:
         """Get player prop lines using per-event endpoint (required by The Odds API).
@@ -518,7 +632,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         t1_name = team_map.get(abbrevs[0], abbrevs[0])
         t2_name = team_map.get(abbrevs[1], abbrevs[1])
 
-        fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games)
+        fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games, kalshi_date_str=today_str)
         if not fd_t1 or fd_t1 not in fanduel_odds or fd_t2 not in fanduel_odds:
             continue
         game_live = is_game_live(fanduel_games.get(matched_gid, {}).get('commence_time', ''))
@@ -645,7 +759,7 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
         t2_name = team_map.get(team_abbrevs[1], team_abbrevs[1])
 
         # Require BOTH teams match the SAME FanDuel game
-        fd_t1, fd_t2, matched_game_id = match_kalshi_to_fanduel_game(t1_name, t2_name, fd_games)
+        fd_t1, fd_t2, matched_game_id = match_kalshi_to_fanduel_game(t1_name, t2_name, fd_games, kalshi_date_str=today_str)
         if not fd_t1 or not matched_game_id or matched_game_id not in fd_spreads:
             continue
 
@@ -1025,6 +1139,155 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
 
 
 # ============================================================
+# BTTS (BOTH TEAMS TO SCORE) EDGE FINDER
+# ============================================================
+
+def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
+    """
+    Compare Kalshi BTTS markets against FanDuel BTTS odds.
+
+    Kalshi: "Both Teams To Score: Yes" at some YES/NO price
+    FanDuel: BTTS Yes/No at decimal odds
+
+    Uses opposite-side probability for fair value (same as spreads/totals).
+    """
+    converter = OddsConverter()
+    fd_btts = fd_data['btts']
+    fd_games = fd_data['games']
+    edges = []
+    today_str = datetime.utcnow().strftime('%y%b%d').upper()
+
+    kalshi_markets = kalshi_api.get_markets(series_ticker)
+    today_markets = [m for m in kalshi_markets if today_str in m.get('ticker', '')]
+    if not today_markets:
+        return edges
+
+    # Group Kalshi BTTS markets by game code
+    # Ticker format expected: KXEPLBTTS-26JAN31LIVARS or similar
+    game_groups = {}
+    for m in today_markets:
+        ticker = m.get('ticker', '')
+        parts = ticker.split('-')
+        if len(parts) < 2:
+            continue
+        game_part = parts[1] if len(parts) >= 2 else ''
+        game_code = f"{parts[0]}-{game_part}"
+
+        if game_code not in game_groups:
+            game_groups[game_code] = []
+        game_groups[game_code].append(m)
+
+    for game_code, markets in game_groups.items():
+        # Try to match this Kalshi game to a FanDuel game
+        # Extract game_part for fuzzy matching
+        parts = game_code.split('-')
+        if len(parts) < 2:
+            continue
+        game_part = parts[1]
+
+        # Try to match by team names in the game_part against FD games
+        matched_game_id = None
+        for gid, ginfo in fd_games.items():
+            home = ginfo['home'].lower()
+            away = ginfo['away'].lower()
+            gp_lower = game_part.lower()
+            # Check if any significant part of team names appears in game_part
+            home_words = [w for w in home.split() if len(w) >= 3]
+            away_words = [w for w in away.split() if len(w) >= 3]
+            home_found = any(w in gp_lower for w in home_words)
+            away_found = any(w in gp_lower for w in away_words)
+            if home_found and away_found:
+                matched_game_id = gid
+                break
+
+        # Fallback: if only one FD game and one Kalshi game, match them
+        if not matched_game_id and len(fd_btts) == 1 and len(game_groups) == 1:
+            matched_game_id = list(fd_btts.keys())[0]
+
+        if not matched_game_id or matched_game_id not in fd_btts:
+            continue
+
+        fd_game_btts = fd_btts[matched_game_id]
+        game_info = fd_games.get(matched_game_id, {})
+        game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
+        game_live = is_game_live(game_info.get('commence_time', ''))
+
+        fd_yes_prob = converter.decimal_to_implied_prob(fd_game_btts['yes_odds'])
+        fd_no_prob = converter.decimal_to_implied_prob(fd_game_btts['no_odds'])
+
+        for m in markets:
+            ticker = m.get('ticker', '')
+            title = (m.get('title', '') or '').lower()
+            subtitle = (m.get('subtitle', '') or '').lower()
+
+            ob = kalshi_api.get_orderbook(ticker)
+            if not ob:
+                continue
+            time.sleep(0.3)
+
+            yes_price = get_best_yes_price(ob)
+            no_price = get_best_no_price(ob)
+
+            # Check YES (BTTS Yes): use opposite side (FD No) for fair value
+            if yes_price is not None:
+                fee = kalshi_fee(yes_price)
+                eff = yes_price + fee
+                total_implied = eff + fd_no_prob
+                if total_implied < 1.0:
+                    profit = (1.0 / total_implied - 1) * 100
+                    edge = {
+                        'market_type': 'BTTS',
+                        'sport': sport_name,
+                        'game': game_name,
+                        'team': 'BTTS Yes',
+                        'opposite_team': 'BTTS No',
+                        'kalshi_price': yes_price,
+                        'kalshi_price_after_fees': eff,
+                        'kalshi_prob_after_fees': eff * 100,
+                        'kalshi_method': 'YES (Both Teams Score)',
+                        'fanduel_opposite_team': 'BTTS No',
+                        'fanduel_opposite_odds': fd_game_btts['no_odds'],
+                        'fanduel_opposite_prob': fd_no_prob * 100,
+                        'total_implied_prob': total_implied * 100,
+                        'arbitrage_profit': profit,
+                        'is_live': game_live,
+                        'recommendation': f"Buy YES BTTS on Kalshi at ${yes_price:.2f} (FanDuel BTTS No at {fd_game_btts['no_odds']:.2f})",
+                    }
+                    edges.append(edge)
+                    send_telegram_notification(edge)
+
+            # Check NO (BTTS No): use opposite side (FD Yes) for fair value
+            if no_price is not None:
+                fee = kalshi_fee(no_price)
+                eff = no_price + fee
+                total_implied = eff + fd_yes_prob
+                if total_implied < 1.0:
+                    profit = (1.0 / total_implied - 1) * 100
+                    edge = {
+                        'market_type': 'BTTS',
+                        'sport': sport_name,
+                        'game': game_name,
+                        'team': 'BTTS No',
+                        'opposite_team': 'BTTS Yes',
+                        'kalshi_price': no_price,
+                        'kalshi_price_after_fees': eff,
+                        'kalshi_prob_after_fees': eff * 100,
+                        'kalshi_method': 'NO (Both Teams Don\'t Score)',
+                        'fanduel_opposite_team': 'BTTS Yes',
+                        'fanduel_opposite_odds': fd_game_btts['yes_odds'],
+                        'fanduel_opposite_prob': fd_yes_prob * 100,
+                        'total_implied_prob': total_implied * 100,
+                        'arbitrage_profit': profit,
+                        'is_live': game_live,
+                        'recommendation': f"Buy NO BTTS on Kalshi at ${no_price:.2f} (FanDuel BTTS Yes at {fd_game_btts['yes_odds']:.2f})",
+                    }
+                    edges.append(edge)
+                    send_telegram_notification(edge)
+
+    return edges
+
+
+# ============================================================
 # MAIN SCANNER
 # ============================================================
 
@@ -1091,6 +1354,19 @@ def scan_all_sports(kalshi_api, fanduel_api):
         print(f"   {name}: {len(edges)} edges")
         time.sleep(2.0)
 
+    # 5. BTTS markets
+    for kalshi_series, (odds_key, name) in BTTS_SPORTS.items():
+        print(f"\n--- {name} ({kalshi_series}) ---")
+        fd = fanduel_api.get_btts(odds_key)
+        sports_scanned.append(name)
+        if not fd['btts']:
+            continue
+        sports_with_games.append(name)
+        edges = find_btts_edges(kalshi_api, fd, kalshi_series, name)
+        all_edges.extend(edges)
+        print(f"   {name}: {len(edges)} edges")
+        time.sleep(2.0)
+
     print(f"\n{'='*60}")
     print(f"SCAN COMPLETE")
     print(f"Markets checked: {', '.join(sports_scanned)}")
@@ -1120,6 +1396,7 @@ def status():
         'spread_sports': list(SPREAD_SPORTS.keys()),
         'total_sports': list(TOTAL_SPORTS.keys()),
         'player_prop_sports': list(PLAYER_PROP_SPORTS.keys()),
+        'btts_sports': list(BTTS_SPORTS.keys()),
     })
 
 
@@ -1152,6 +1429,7 @@ def debug_view():
         type_colors = {
             'Moneyline': '#e74c3c', 'Spread': '#3498db',
             'Total': '#e67e22', 'Player Prop': '#9b59b6',
+            'BTTS': '#2ecc71',
         }
 
         html = f"""<!DOCTYPE html>
@@ -1177,7 +1455,7 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
 .no-edge {{ text-align: center; padding: 50px 20px; color: #888; }}
 </style></head><body><div class="container">
 <h1>Kalshi Edge Finder</h1>
-<div class="sub">Moneylines + Spreads + Totals + Player Props | Auto-refresh 5min</div>
+<div class="sub">Moneylines + Spreads + Totals + Player Props + BTTS | Auto-refresh 5min</div>
 <div class="info">Scanning: {', '.join(scanned)} | Active: {', '.join(active) if active else 'None'}</div>
 <div class="count">"""
 
