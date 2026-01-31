@@ -671,6 +671,17 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
             if abs(floor_strike - abs(fd_point)) > 0.5:
                 continue
 
+            # Find the OPPOSITE team's spread to get fair value
+            # FD includes vig on both sides, so we use opposite side to derive true probability
+            fd_opposite_name = fd_t2 if fd_team_name == fd_t1 else fd_t1
+            if fd_opposite_name not in fd_game_spreads:
+                continue
+            fd_opposite_spread = fd_game_spreads[fd_opposite_name]
+            fd_opposite_odds = fd_opposite_spread['odds']
+            fd_opposite_prob = converter.decimal_to_implied_prob(fd_opposite_odds)
+            # Fair prob for our side = 1 - opposite implied prob (strips vig from our side)
+            fd_fair_prob = 1.0 - fd_opposite_prob
+
             # Get Kalshi orderbook
             ob = kalshi_api.get_orderbook(ticker)
             if not ob:
@@ -684,27 +695,29 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
             fee = kalshi_fee(yes_price)
             eff = yes_price + fee
 
-            fd_prob = converter.decimal_to_implied_prob(fd_odds)
-
-            if eff < fd_prob:
-                edge_pct = ((fd_prob / eff) - 1) * 100
+            # +EV if Kalshi price after fees < FanDuel fair value for this side
+            # Using opposite side: total_implied = kalshi_eff + fd_opposite_prob
+            # If < 1.0, there's an edge
+            total_implied = eff + fd_opposite_prob
+            if total_implied < 1.0:
+                profit = (1.0 / total_implied - 1) * 100
                 game_name = f"{fd_games[matched_game_id]['away']} at {fd_games[matched_game_id]['home']}"
                 edge = {
                     'market_type': 'Spread',
                     'sport': sport_name,
                     'game': game_name,
                     'team': f"{team_name} -{floor_strike}",
-                    'opposite_team': fd_team_name,
+                    'opposite_team': fd_opposite_name,
                     'kalshi_price': yes_price,
                     'kalshi_price_after_fees': eff,
                     'kalshi_prob_after_fees': eff * 100,
                     'kalshi_method': f"YES on {team_name} -{floor_strike}",
-                    'fanduel_opposite_team': f"{fd_team_name} {fd_spread['point']}",
-                    'fanduel_opposite_odds': fd_odds,
-                    'fanduel_opposite_prob': fd_prob * 100,
-                    'total_implied_prob': (eff + (1 - fd_prob)) * 100,
-                    'arbitrage_profit': edge_pct,
-                    'recommendation': f"Buy YES {team_name} -{floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel: {fd_team_name} {fd_spread['point']} at {fd_odds:.2f})",
+                    'fanduel_opposite_team': f"{fd_opposite_name} {fd_opposite_spread['point']}",
+                    'fanduel_opposite_odds': fd_opposite_odds,
+                    'fanduel_opposite_prob': fd_opposite_prob * 100,
+                    'total_implied_prob': total_implied * 100,
+                    'arbitrage_profit': profit,
+                    'recommendation': f"Buy YES {team_name} -{floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel: {fd_opposite_name} {fd_opposite_spread['point']} at {fd_opposite_odds:.2f})",
                 }
                 edges.append(edge)
                 send_telegram_notification(edge)
@@ -809,13 +822,20 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
             yes_price = get_best_yes_price(ob)  # YES = Over
             no_price = get_best_no_price(ob)    # NO = Under
 
-            # Check Over: Kalshi YES vs FanDuel Over
+            # Use OPPOSITE side FanDuel odds to derive fair value (strips vig from our side)
+            # For Over: fair value = 1 - FD_Under_implied_prob
+            # For Under: fair value = 1 - FD_Over_implied_prob
+            fd_over_prob = converter.decimal_to_implied_prob(fd_total['over_odds'])
+            fd_under_prob = converter.decimal_to_implied_prob(fd_total['under_odds'])
+
+            # Check Over: Kalshi YES price vs FanDuel Under (opposite side)
             if yes_price is not None:
                 fee = kalshi_fee(yes_price)
                 eff = yes_price + fee
-                fd_over_prob = converter.decimal_to_implied_prob(fd_total['over_odds'])
-                if eff < fd_over_prob:
-                    edge_pct = ((fd_over_prob / eff) - 1) * 100
+                # total_implied = kalshi_over_eff + fd_under_prob; if < 1.0 -> edge
+                total_implied = eff + fd_under_prob
+                if total_implied < 1.0:
+                    profit = (1.0 / total_implied - 1) * 100
                     edge = {
                         'market_type': 'Total',
                         'sport': sport_name,
@@ -826,24 +846,25 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                         'kalshi_price_after_fees': eff,
                         'kalshi_prob_after_fees': eff * 100,
                         'kalshi_method': f"YES Over {floor_strike}",
-                        'fanduel_opposite_team': f"Over {fd_line}",
-                        'fanduel_opposite_odds': fd_total['over_odds'],
-                        'fanduel_opposite_prob': fd_over_prob * 100,
-                        'total_implied_prob': (eff + (1 - fd_over_prob)) * 100,
-                        'arbitrage_profit': edge_pct,
-                        'recommendation': f"Buy YES Over {floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel Over {fd_line} at {fd_total['over_odds']:.2f})",
+                        'fanduel_opposite_team': f"Under {fd_line}",
+                        'fanduel_opposite_odds': fd_total['under_odds'],
+                        'fanduel_opposite_prob': fd_under_prob * 100,
+                        'total_implied_prob': total_implied * 100,
+                        'arbitrage_profit': profit,
+                        'recommendation': f"Buy YES Over {floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel Under {fd_line} at {fd_total['under_odds']:.2f})",
                     }
                     edges.append(edge)
                     send_telegram_notification(edge)
 
-            # Check Under: Kalshi NO (= Under) vs FanDuel Under
+            # Check Under: Kalshi NO price vs FanDuel Over (opposite side)
             if no_price is not None:
                 under_cost = no_price
                 fee = kalshi_fee(under_cost)
                 eff = under_cost + fee
-                fd_under_prob = converter.decimal_to_implied_prob(fd_total['under_odds'])
-                if eff < fd_under_prob:
-                    edge_pct = ((fd_under_prob / eff) - 1) * 100
+                # total_implied = kalshi_under_eff + fd_over_prob; if < 1.0 -> edge
+                total_implied = eff + fd_over_prob
+                if total_implied < 1.0:
+                    profit = (1.0 / total_implied - 1) * 100
                     edge = {
                         'market_type': 'Total',
                         'sport': sport_name,
@@ -854,12 +875,12 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                         'kalshi_price_after_fees': eff,
                         'kalshi_prob_after_fees': eff * 100,
                         'kalshi_method': f"NO (Under) {floor_strike}",
-                        'fanduel_opposite_team': f"Under {fd_line}",
-                        'fanduel_opposite_odds': fd_total['under_odds'],
-                        'fanduel_opposite_prob': fd_under_prob * 100,
-                        'total_implied_prob': (eff + (1 - fd_under_prob)) * 100,
-                        'arbitrage_profit': edge_pct,
-                        'recommendation': f"Buy NO (Under {floor_strike}) on Kalshi at ${under_cost:.2f} (FanDuel Under {fd_line} at {fd_total['under_odds']:.2f})",
+                        'fanduel_opposite_team': f"Over {fd_line}",
+                        'fanduel_opposite_odds': fd_total['over_odds'],
+                        'fanduel_opposite_prob': fd_over_prob * 100,
+                        'total_implied_prob': total_implied * 100,
+                        'arbitrage_profit': profit,
+                        'recommendation': f"Buy NO (Under {floor_strike}) on Kalshi at ${under_cost:.2f} (FanDuel Over {fd_line} at {fd_total['over_odds']:.2f})",
                     }
                     edges.append(edge)
                     send_telegram_notification(edge)
