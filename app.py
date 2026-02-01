@@ -1139,11 +1139,27 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         games[game_code][team_abbrev] = m
 
     for game_code, team_markets in games.items():
-        if len(team_markets) != 2:
+        # Soccer has 3-way markets (Home/Draw/Away), other sports have 2-way
+        is_three_way = len(team_markets) == 3
+        if len(team_markets) < 2 or len(team_markets) > 3:
             continue
-        abbrevs = list(team_markets.keys())
-        t1_name = team_map.get(abbrevs[0], abbrevs[0])
-        t2_name = team_map.get(abbrevs[1], abbrevs[1])
+
+        # Separate draw market from team markets for 3-way
+        draw_abbrev = None
+        team_abbrevs_list = []
+        for a in team_markets:
+            if a.upper() == 'DRAW' or a.upper() == 'DRW':
+                draw_abbrev = a
+            else:
+                team_abbrevs_list.append(a)
+
+        if is_three_way and not draw_abbrev:
+            continue  # 3 entries but no draw — unexpected format
+        if len(team_abbrevs_list) != 2:
+            continue
+
+        t1_name = team_map.get(team_abbrevs_list[0], team_abbrevs_list[0])
+        t2_name = team_map.get(team_abbrevs_list[1], team_abbrevs_list[1])
 
         fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games)
         if not fd_t1 or fd_t1 not in fanduel_odds or fd_t2 not in fanduel_odds:
@@ -1157,9 +1173,10 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
             print(f"   Skipping {t1_name} vs {t2_name}: FD odds stale (last update: {fd_last_update})")
             continue
 
-        ob1 = kalshi_api.get_orderbook(team_markets[abbrevs[0]]['ticker'])
+        # Fetch orderbooks for team markets
+        ob1 = kalshi_api.get_orderbook(team_markets[team_abbrevs_list[0]]['ticker'])
         time.sleep(0.3)
-        ob2 = kalshi_api.get_orderbook(team_markets[abbrevs[1]]['ticker'])
+        ob2 = kalshi_api.get_orderbook(team_markets[team_abbrevs_list[1]]['ticker'])
         time.sleep(0.3)
         if not ob1 or not ob2:
             continue
@@ -1173,57 +1190,147 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
 
         # Build entries with ticker and side info for auto-trading
         entries = []
-        if t1_yes <= t2_no:
-            entries.append((t1_name, t1_yes, f"YES on {t1_name}", fd_t2,
-                           team_markets[abbrevs[0]]['ticker'], 'yes'))
-        else:
-            entries.append((t1_name, t2_no, f"NO on {t2_name}", fd_t2,
-                           team_markets[abbrevs[1]]['ticker'], 'no'))
-        if t2_yes <= t1_no:
-            entries.append((t2_name, t2_yes, f"YES on {t2_name}", fd_t1,
-                           team_markets[abbrevs[1]]['ticker'], 'yes'))
-        else:
-            entries.append((t2_name, t1_no, f"NO on {t1_name}", fd_t1,
-                           team_markets[abbrevs[0]]['ticker'], 'no'))
 
-        # Evaluate both entries, pick only the best edge per game
-        game_edges = []
-        for name, best_p, method, fd_opp, trade_ticker, trade_side in entries:
-            fee = kalshi_fee(best_p)
-            eff = best_p + fee
-            fd_prob = converter.decimal_to_implied_prob(fanduel_odds[fd_opp]['odds'])
-            total = eff + fd_prob
-            if total < 1.0:
-                profit = (1.0 / total - 1) * 100
+        # For 3-way soccer: each Kalshi outcome's "opposite" is the sum of the other
+        # two FD outcomes' implied probabilities. For 2-way: standard opposite.
+        if is_three_way and 'Draw' in fanduel_odds:
+            fd_draw_prob = converter.decimal_to_implied_prob(fanduel_odds['Draw']['odds'])
+            fd_t1_prob = converter.decimal_to_implied_prob(fanduel_odds[fd_t1]['odds'])
+            fd_t2_prob = converter.decimal_to_implied_prob(fanduel_odds[fd_t2]['odds'])
+
+            # Fetch draw orderbook
+            ob_draw = kalshi_api.get_orderbook(team_markets[draw_abbrev]['ticker'])
+            time.sleep(0.3)
+            draw_yes = get_best_yes_price(ob_draw) if ob_draw else None
+            draw_no = get_best_no_price(ob_draw) if ob_draw else None
+
+            # Team 1 YES: opposite is P(team2 wins) + P(draw)
+            opp_prob_t1 = fd_t2_prob + fd_draw_prob
+            fee_t1 = kalshi_fee(t1_yes)
+            eff_t1 = t1_yes + fee_t1
+            if eff_t1 + opp_prob_t1 < 1.0:
+                profit = (1.0 / (eff_t1 + opp_prob_t1) - 1) * 100
+                entries.append({
+                    'name': t1_name, 'price': t1_yes, 'eff': eff_t1,
+                    'method': f"YES on {t1_name}", 'fd_opp_name': f"{fd_t2} + Draw",
+                    'fd_opp_prob': opp_prob_t1, 'fd_opp_odds': fanduel_odds[fd_t2]['odds'],
+                    'ticker': team_markets[team_abbrevs_list[0]]['ticker'], 'side': 'yes',
+                    'profit': profit,
+                })
+
+            # Team 2 YES: opposite is P(team1 wins) + P(draw)
+            opp_prob_t2 = fd_t1_prob + fd_draw_prob
+            fee_t2 = kalshi_fee(t2_yes)
+            eff_t2 = t2_yes + fee_t2
+            if eff_t2 + opp_prob_t2 < 1.0:
+                profit = (1.0 / (eff_t2 + opp_prob_t2) - 1) * 100
+                entries.append({
+                    'name': t2_name, 'price': t2_yes, 'eff': eff_t2,
+                    'method': f"YES on {t2_name}", 'fd_opp_name': f"{fd_t1} + Draw",
+                    'fd_opp_prob': opp_prob_t2, 'fd_opp_odds': fanduel_odds[fd_t1]['odds'],
+                    'ticker': team_markets[team_abbrevs_list[1]]['ticker'], 'side': 'yes',
+                    'profit': profit,
+                })
+
+            # Draw YES: opposite is P(team1) + P(team2)
+            if draw_yes is not None:
+                opp_prob_draw = fd_t1_prob + fd_t2_prob
+                fee_draw = kalshi_fee(draw_yes)
+                eff_draw = draw_yes + fee_draw
+                if eff_draw + opp_prob_draw < 1.0:
+                    profit = (1.0 / (eff_draw + opp_prob_draw) - 1) * 100
+                    entries.append({
+                        'name': 'Draw', 'price': draw_yes, 'eff': eff_draw,
+                        'method': f"YES on Draw", 'fd_opp_name': f"{fd_t1} + {fd_t2}",
+                        'fd_opp_prob': opp_prob_draw, 'fd_opp_odds': fanduel_odds[fd_t1]['odds'],
+                        'ticker': team_markets[draw_abbrev]['ticker'], 'side': 'yes',
+                        'profit': profit,
+                    })
+
+            # Build edge dicts from 3-way entries
+            game_edges = []
+            for e in entries:
                 edge = {
                     'market_type': 'Moneyline',
                     'sport': sport_name,
                     'game': f"{fd_t1} vs {fd_t2}",
-                    'team': name,
-                    'opposite_team': fd_opp,
-                    'kalshi_price': best_p,
-                    'kalshi_price_after_fees': eff,
-                    'kalshi_prob_after_fees': eff * 100,
-                    'kalshi_method': method,
-                    'kalshi_ticker': trade_ticker,
-                    'kalshi_side': trade_side,
-                    'fanduel_opposite_team': fd_opp,
-                    'fanduel_opposite_odds': fanduel_odds[fd_opp]['odds'],
-                    'fanduel_opposite_prob': fd_prob * 100,
-                    'total_implied_prob': total * 100,
-                    'arbitrage_profit': profit,
+                    'team': e['name'],
+                    'opposite_team': e['fd_opp_name'],
+                    'kalshi_price': e['price'],
+                    'kalshi_price_after_fees': e['eff'],
+                    'kalshi_prob_after_fees': e['eff'] * 100,
+                    'kalshi_method': e['method'],
+                    'kalshi_ticker': e['ticker'],
+                    'kalshi_side': e['side'],
+                    'fanduel_opposite_team': e['fd_opp_name'],
+                    'fanduel_opposite_odds': e['fd_opp_odds'],
+                    'fanduel_opposite_prob': e['fd_opp_prob'] * 100,
+                    'total_implied_prob': (e['eff'] + e['fd_opp_prob']) * 100,
+                    'arbitrage_profit': e['profit'],
                     'is_live': game_live,
-                    'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (FanDuel: {fd_opp} at {fanduel_odds[fd_opp]['odds']:.2f})",
+                    'recommendation': f"Buy {e['method']} on Kalshi at ${e['price']:.2f} (FanDuel opposite: {e['fd_opp_prob']*100:.1f}%)",
                 }
                 game_edges.append(edge)
 
-        # Only trade the best edge per game (don't bet both sides)
-        if game_edges:
-            game_edges.sort(key=lambda e: e['arbitrage_profit'], reverse=True)
-            best_edge = game_edges[0]
-            edges.append(best_edge)
-            send_telegram_notification(best_edge)
-            auto_trade_edge(best_edge, kalshi_api)
+            if game_edges:
+                game_edges.sort(key=lambda e: e['arbitrage_profit'], reverse=True)
+                best_edge = game_edges[0]
+                edges.append(best_edge)
+                send_telegram_notification(best_edge)
+                auto_trade_edge(best_edge, kalshi_api)
+        else:
+            # Standard 2-way moneyline (NBA, NHL, etc.)
+            if t1_yes <= t2_no:
+                entries.append((t1_name, t1_yes, f"YES on {t1_name}", fd_t2,
+                               team_markets[team_abbrevs_list[0]]['ticker'], 'yes'))
+            else:
+                entries.append((t1_name, t2_no, f"NO on {t2_name}", fd_t2,
+                               team_markets[team_abbrevs_list[1]]['ticker'], 'no'))
+            if t2_yes <= t1_no:
+                entries.append((t2_name, t2_yes, f"YES on {t2_name}", fd_t1,
+                               team_markets[team_abbrevs_list[1]]['ticker'], 'yes'))
+            else:
+                entries.append((t2_name, t1_no, f"NO on {t1_name}", fd_t1,
+                               team_markets[team_abbrevs_list[0]]['ticker'], 'no'))
+
+            # Evaluate both entries, pick only the best edge per game
+            game_edges = []
+            for name, best_p, method, fd_opp, trade_ticker, trade_side in entries:
+                fee = kalshi_fee(best_p)
+                eff = best_p + fee
+                fd_prob = converter.decimal_to_implied_prob(fanduel_odds[fd_opp]['odds'])
+                total = eff + fd_prob
+                if total < 1.0:
+                    profit = (1.0 / total - 1) * 100
+                    edge = {
+                        'market_type': 'Moneyline',
+                        'sport': sport_name,
+                        'game': f"{fd_t1} vs {fd_t2}",
+                        'team': name,
+                        'opposite_team': fd_opp,
+                        'kalshi_price': best_p,
+                        'kalshi_price_after_fees': eff,
+                        'kalshi_prob_after_fees': eff * 100,
+                        'kalshi_method': method,
+                        'kalshi_ticker': trade_ticker,
+                        'kalshi_side': trade_side,
+                        'fanduel_opposite_team': fd_opp,
+                        'fanduel_opposite_odds': fanduel_odds[fd_opp]['odds'],
+                        'fanduel_opposite_prob': fd_prob * 100,
+                        'total_implied_prob': total * 100,
+                        'arbitrage_profit': profit,
+                        'is_live': game_live,
+                        'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (FanDuel: {fd_opp} at {fanduel_odds[fd_opp]['odds']:.2f})",
+                    }
+                    game_edges.append(edge)
+
+            # Only trade the best edge per game (don't bet both sides)
+            if game_edges:
+                game_edges.sort(key=lambda e: e['arbitrage_profit'], reverse=True)
+                best_edge = game_edges[0]
+                edges.append(best_edge)
+                send_telegram_notification(best_edge)
+                auto_trade_edge(best_edge, kalshi_api)
     return edges
 
 
@@ -2451,7 +2558,12 @@ def find_completed_props(kalshi_api) -> List[Dict]:
                     continue  # Require valid date to prevent stale matching
                 player_game_date = all_player_stats[espn_name].get('_game_date', '')
                 if player_game_date and ticker_date_str != player_game_date:
-                    print(f"   Skipping {player_name}: game date {player_game_date} != ticker date {ticker_date_str}")
+                    _skip_key = f"{player_name}:{player_game_date}:{ticker_date_str}"
+                    if not hasattr(find_completed_props, '_logged'):
+                        find_completed_props._logged = set()
+                    if _skip_key not in find_completed_props._logged:
+                        find_completed_props._logged.add(_skip_key)
+                        print(f"   Skipping {player_name}: game date {player_game_date} != ticker date {ticker_date_str}")
                     continue
 
                 # Verify the player's game teams BOTH appear in this ticker
@@ -2691,6 +2803,54 @@ RESOLVED_GAME_SPORTS = {
         'display': 'NHL',
         'team_abbrs': set(NHL_TEAMS.keys()),
     },
+    'epl': {
+        'espn_path': 'soccer/eng.1',
+        'ml_series': ['KXEPLGAME'],
+        'total_series': ['KXEPLTOTAL'],
+        'spread_series': ['KXEPLSPREAD'],
+        'display': 'EPL',
+        'team_abbrs': set(),  # Soccer has many teams, use fallback matching
+    },
+    'la_liga': {
+        'espn_path': 'soccer/esp.1',
+        'ml_series': ['KXLALIGAGAME'],
+        'total_series': ['KXLALIGATOTAL'],
+        'spread_series': ['KXLALIGASPREAD'],
+        'display': 'La Liga',
+        'team_abbrs': set(),
+    },
+    'bundesliga': {
+        'espn_path': 'soccer/ger.1',
+        'ml_series': ['KXBUNDESLIGAGAME'],
+        'total_series': ['KXBUNDESLIGATOTAL'],
+        'spread_series': ['KXBUNDESLIGASPREAD'],
+        'display': 'Bundesliga',
+        'team_abbrs': set(),
+    },
+    'serie_a': {
+        'espn_path': 'soccer/ita.1',
+        'ml_series': ['KXSERIEAGAME'],
+        'total_series': ['KXSERIEATOTAL'],
+        'spread_series': ['KXSERIEASPREAD'],
+        'display': 'Serie A',
+        'team_abbrs': set(),
+    },
+    'ligue_1': {
+        'espn_path': 'soccer/fra.1',
+        'ml_series': ['KXLIGUE1GAME'],
+        'total_series': ['KXLIGUE1TOTAL'],
+        'spread_series': ['KXLIGUE1SPREAD'],
+        'display': 'Ligue 1',
+        'team_abbrs': set(),
+    },
+    'ucl': {
+        'espn_path': 'soccer/uefa.champions',
+        'ml_series': ['KXUCLGAME'],
+        'total_series': ['KXUCLTOTAL'],
+        'spread_series': ['KXUCLSPREAD'],
+        'display': 'Champions League',
+        'team_abbrs': set(),
+    },
 }
 
 # Kalshi crypto series — hourly, 15-min, daily, and other crypto markets
@@ -2904,6 +3064,9 @@ def _find_game_for_ticker(date_stripped: str, abbrev_to_game: dict, team_abbrs: 
     2. Verifies the game date matches the ticker date to prevent matching
        yesterday's results to today's markets.
     """
+    _logged = getattr(_find_game_for_ticker, '_logged', set())
+    _find_game_for_ticker._logged = _logged
+
     def _date_matches(candidate):
         if not ticker_date_str:
             return True
@@ -2927,12 +3090,18 @@ def _find_game_for_ticker(date_stripped: str, abbrev_to_game: dict, team_abbrs: 
                         if require_final and not candidate['is_final']:
                             continue
                         if not _date_matches(candidate):
-                            print(f"   Skipping {t1}v{t2}: game date {candidate.get('game_date_str','')} != ticker {ticker_date_str}")
+                            log_key = f"date:{t1}v{t2}:{ticker_date_str}"
+                            if log_key not in _logged:
+                                _logged.add(log_key)
+                                print(f"   Skipping {t1}v{t2}: game date {candidate.get('game_date_str','')} != ticker {ticker_date_str}")
                             continue
                         return candidate
                     else:
                         # Teams are from different games — NOT a match
-                        print(f"   Skipping {t1}v{t2}: different games ({game1['away']}@{game1['home']} vs {game2['away']}@{game2['home']})")
+                        log_key = f"diff:{t1}v{t2}"
+                        if log_key not in _logged:
+                            _logged.add(log_key)
+                            print(f"   Skipping {t1}v{t2}: different games ({game1['away']}@{game1['home']} vs {game2['away']}@{game2['home']})")
                         continue
 
     # Method 2: Fallback for NCAAB (no team_abbrs set) — require BOTH teams in same game
@@ -3014,7 +3183,9 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 if not game:
                     continue
 
-                # Is this team the winner?
+                # Is this team the winner? Handle draws for soccer.
+                is_draw_ticker = team_abbr.upper() in ('DRAW', 'DRW')
+                is_draw_game = game['winner'] == '' and game['is_final']
                 is_winner = (team_abbr == game['winner'])
 
                 ob = kalshi_api.get_orderbook(ticker)
@@ -3022,7 +3193,25 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                     continue
                 time.sleep(0.2)
 
-                if is_winner:
+                if is_draw_ticker:
+                    # DRAW ticker: buy YES if game ended in draw, NO if it didn't
+                    if is_draw_game:
+                        yes_price = get_best_yes_price(ob)
+                        if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
+                            reason = f"Draw {game['home_score']}-{game['away_score']} (FINAL)"
+                            result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
+                                                           display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                            if result:
+                                edges.append(result)
+                    else:
+                        no_price = get_best_no_price(ob)
+                        if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
+                            reason = f"No draw — {game['winner']} won (FINAL)"
+                            result = _buy_resolved_market(ticker, 'no', no_price, reason,
+                                                           display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                            if result:
+                                edges.append(result)
+                elif is_winner:
                     # Buy YES on the winner
                     yes_price = get_best_yes_price(ob)
                     if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
@@ -3032,10 +3221,13 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                         if result:
                             edges.append(result)
                 else:
-                    # Buy NO on the loser (they lost, so NO pays out)
+                    # Buy NO on the loser (they lost or drew, so NO pays out)
                     no_price = get_best_no_price(ob)
                     if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
-                        reason = f"{team_abbr} lost to {game['winner']} (FINAL)"
+                        if is_draw_game:
+                            reason = f"{team_abbr} drew {game['home_score']}-{game['away_score']} (FINAL)"
+                        else:
+                            reason = f"{team_abbr} lost to {game['winner']} (FINAL)"
                         result = _buy_resolved_market(ticker, 'no', no_price, reason,
                                                        display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
                         if result:
