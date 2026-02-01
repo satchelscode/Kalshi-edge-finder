@@ -3182,6 +3182,14 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
                                              require_final=True, ticker_date_str=ticker_date_str)
                 if not game:
+                    # Debug: log first unmatched ticker per series to diagnose matching issues
+                    _debug_key = f"nomatch:{ml_series}"
+                    if not hasattr(find_resolved_game_markets, '_debug_logged'):
+                        find_resolved_game_markets._debug_logged = set()
+                    if _debug_key not in find_resolved_game_markets._debug_logged:
+                        find_resolved_game_markets._debug_logged.add(_debug_key)
+                        espn_abbrs = list(abbrev_to_game.keys())[:10]
+                        print(f"   DEBUG {ml_series}: ticker={ticker} date_stripped={date_stripped} team={team_abbr} espn_abbrs={espn_abbrs}")
                     continue
 
                 # Is this team the winner? Handle draws for soccer.
