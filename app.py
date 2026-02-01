@@ -3222,13 +3222,6 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                                              team_abbr=team_abbr)
                 if not game:
                     # Debug: log first unmatched ticker per series to diagnose matching issues
-                    _debug_key = f"nomatch:{ml_series}"
-                    if not hasattr(find_resolved_game_markets, '_debug_logged'):
-                        find_resolved_game_markets._debug_logged = set()
-                    if _debug_key not in find_resolved_game_markets._debug_logged:
-                        find_resolved_game_markets._debug_logged.add(_debug_key)
-                        espn_abbrs = list(abbrev_to_game.keys())[:10]
-                        print(f"   DEBUG {ml_series}: ticker={ticker} date_stripped={date_stripped} team={team_abbr} espn_abbrs={espn_abbrs}")
                     continue
 
                 # Is this team the winner? Handle draws for soccer.
@@ -3492,15 +3485,6 @@ def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> L
             continue
 
         print(f"   Scanning {series}: {len(kalshi_markets)} markets")
-
-        # Debug: show first market's structure to identify fields and market types
-        if kalshi_markets:
-            m0 = kalshi_markets[0]
-            time_fields = {k: v for k, v in m0.items()
-                          if 'time' in k.lower() or 'date' in k.lower() or 'expir' in k.lower() or 'close' in k.lower()}
-            print(f"   DEBUG {series} time fields: {time_fields}")
-            print(f"   DEBUG {series} first: ticker={m0.get('ticker','')}, title={m0.get('title','')}")
-            print(f"   DEBUG {series} strikes: floor={m0.get('floor_strike')}, cap={m0.get('cap_strike')}")
 
         skipped_no_time = 0
         skipped_too_far = 0
