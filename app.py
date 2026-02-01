@@ -2816,19 +2816,19 @@ def _find_game_for_ticker(date_stripped: str, abbrev_to_game: dict, team_abbrs: 
                           require_final: bool = False,
                           ticker_date_str: str = '') -> Optional[Dict]:
     """Match a Kalshi ticker's team portion to an ESPN game.
-    Uses exact two-team parsing instead of substring matching to avoid
-    false matches (e.g. ESPN 'SA' matching Kalshi 'SAC').
 
-    CRITICAL: If ticker_date_str is provided, verifies the game date matches
-    the ticker date to prevent matching yesterday's results to today's markets.
+    CRITICAL SAFETY CHECKS:
+    1. Requires BOTH teams in the ticker to be from the SAME ESPN game.
+       Without this, a SAC-vs-DET final could match a SAC@WAS ticker.
+    2. Verifies the game date matches the ticker date to prevent matching
+       yesterday's results to today's markets.
     """
     def _date_matches(candidate):
-        """Check that the game date matches the ticker date."""
         if not ticker_date_str:
-            return True  # No date check requested
+            return True
         game_date = candidate.get('game_date_str', '')
         if not game_date:
-            return True  # No game date available, allow match
+            return True
         return game_date == ticker_date_str
 
     # Method 1: Try all split points to find two known Kalshi abbreviations
@@ -2836,20 +2836,32 @@ def _find_game_for_ticker(date_stripped: str, abbrev_to_game: dict, team_abbrs: 
         for i in range(1, len(date_stripped)):
             t1, t2 = date_stripped[:i], date_stripped[i:]
             if t1 in team_abbrs and t2 in team_abbrs:
-                # Found valid two-team split — check if either maps to a game
-                for t in (t1, t2):
-                    if t in abbrev_to_game:
-                        candidate = abbrev_to_game[t]
+                # BOTH teams must map to the SAME game
+                if t1 in abbrev_to_game and t2 in abbrev_to_game:
+                    game1 = abbrev_to_game[t1]
+                    game2 = abbrev_to_game[t2]
+                    # Verify same game: both teams are home/away of that game
+                    if (game1['home'] == game2['home'] and game1['away'] == game2['away']):
+                        candidate = game1
                         if require_final and not candidate['is_final']:
                             continue
                         if not _date_matches(candidate):
-                            print(f"   Skipping {t}: game date {candidate.get('game_date_str','')} != ticker date {ticker_date_str}")
+                            print(f"   Skipping {t1}v{t2}: game date {candidate.get('game_date_str','')} != ticker {ticker_date_str}")
                             continue
                         return candidate
-    # Method 2: Fallback — direct lookup (for NCAAB or if team_abbrs is empty)
+                    else:
+                        # Teams are from different games — NOT a match
+                        print(f"   Skipping {t1}v{t2}: different games ({game1['away']}@{game1['home']} vs {game2['away']}@{game2['home']})")
+                        continue
+
+    # Method 2: Fallback for NCAAB (no team_abbrs set) — require BOTH teams in same game
     for abbr in abbrev_to_game:
         if abbr in date_stripped:
             candidate = abbrev_to_game[abbr]
+            # Verify the OTHER team in this game is also in date_stripped
+            other_team = candidate['away'] if abbr == candidate['home'] else candidate['home']
+            if other_team not in date_stripped:
+                continue  # Only one team matches — wrong game
             if require_final and not candidate['is_final']:
                 continue
             if not _date_matches(candidate):
