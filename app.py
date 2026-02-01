@@ -2339,8 +2339,9 @@ def _get_live_games(espn_path: str) -> List[Dict]:
         live_games = []
         for event in data.get('events', []):
             status = event.get('status', {}).get('type', {}).get('name', '')
-            if status in ('STATUS_IN_PROGRESS', 'STATUS_FINAL', 'STATUS_END_PERIOD',
-                          'STATUS_HALFTIME', 'STATUS_FIRST_HALF', 'STATUS_SECOND_HALF'):
+            if status in ('STATUS_IN_PROGRESS', 'STATUS_FINAL', 'STATUS_FULL_TIME',
+                          'STATUS_END_PERIOD', 'STATUS_HALFTIME',
+                          'STATUS_FIRST_HALF', 'STATUS_SECOND_HALF'):
                 game_id = event.get('id', '')
                 # Extract game date from ESPN event
                 game_date_str = ''
@@ -2938,7 +2939,7 @@ def _get_game_scores(espn_path: str) -> List[Dict]:
                 'winner': winner,
                 'loser': loser,
                 'status': status,
-                'is_final': status == 'STATUS_FINAL',
+                'is_final': status in ('STATUS_FINAL', 'STATUS_FULL_TIME'),
                 'is_live': status in ('STATUS_IN_PROGRESS', 'STATUS_END_PERIOD',
                                        'STATUS_HALFTIME', 'STATUS_FIRST_HALF', 'STATUS_SECOND_HALF'),
                 'game_date_str': game_date_str,
