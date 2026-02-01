@@ -3571,12 +3571,20 @@ def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> L
             # Three types: "above X", "below X / X or below", "X to Y" (range)
             floor_strike = m.get('floor_strike')
             cap_strike = m.get('cap_strike')
-            title_lower = title.lower()
 
-            # Detect market type
-            is_above = 'above' in title_lower or 'or more' in title_lower or 'or higher' in title_lower
-            is_below = 'below' in title_lower or 'or less' in title_lower or 'or lower' in title_lower
-            is_range = (' to ' in title_lower or ' - ' in title_lower) and not is_above and not is_below
+            # Check ALL text fields for market type keywords — Kalshi range markets
+            # put "or below"/"or above" in yes_sub_title/subtitle, not the main title
+            all_text = ' '.join([
+                title,
+                m.get('subtitle', '') or '',
+                m.get('yes_sub_title', '') or '',
+                m.get('no_sub_title', '') or '',
+            ]).lower()
+
+            # Detect market type from all text fields
+            is_above = 'above' in all_text or 'or more' in all_text or 'or higher' in all_text
+            is_below = 'below' in all_text or 'or less' in all_text or 'or lower' in all_text
+            is_range = (' to ' in all_text or ' - ' in all_text) and not is_above and not is_below
 
             # For range markets: need BOTH floor and cap strikes
             if is_range or (cap_strike is not None and floor_strike is not None
@@ -3622,10 +3630,27 @@ def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> L
                     reason_detail = f"${current_price:,.0f} IN range ${range_low:,.0f}-${range_high:,.0f}"
             else:
                 # Single-threshold market: above or below
-                if floor_strike is not None:
+                # For "below" markets: the meaningful threshold is cap_strike, not floor_strike
+                # (floor_strike=1 is just the minimum, cap_strike=$73,749.99 is the real threshold)
+                if is_below and cap_strike is not None:
+                    threshold = float(cap_strike)
+                elif is_above and floor_strike is not None:
                     threshold = float(floor_strike)
+                elif floor_strike is not None and cap_strike is not None:
+                    # Both set — use the one closer to current price as threshold
+                    f, c = float(floor_strike), float(cap_strike)
+                    if f == c:
+                        threshold = f
+                    else:
+                        # This is really a range market that wasn't detected — treat as range
+                        skipped_no_threshold += 1
+                        continue
+                elif floor_strike is not None:
+                    threshold = float(floor_strike)
+                elif cap_strike is not None:
+                    threshold = float(cap_strike)
                 else:
-                    price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', title)
+                    price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', all_text)
                     if price_match:
                         try:
                             threshold = float(price_match.group(1).replace(',', ''))
@@ -3637,6 +3662,12 @@ def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> L
                         continue
 
                 if threshold <= 0:
+                    skipped_no_threshold += 1
+                    continue
+
+                # Sanity check: threshold must be within 50% of current price
+                # Prevents using floor_strike=$1 as threshold for BTC at $77,000
+                if abs(current_price - threshold) / current_price > 0.50:
                     skipped_no_threshold += 1
                     continue
 
@@ -4094,10 +4125,16 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
                         elif minutes_to_close <= 60:
                             required_buffer = 0.012  # 1.2%
 
-                # Parse market type (same logic as crypto)
-                is_above = 'above' in title or 'or more' in title or 'or higher' in title
-                is_below = 'below' in title or 'or less' in title or 'or lower' in title
-                is_range = (' to ' in title or ' - ' in title) and not is_above and not is_below
+                # Parse market type — check all text fields (subtitle has "or below" etc.)
+                idx_all_text = ' '.join([
+                    title,
+                    m.get('subtitle', '') or '',
+                    m.get('yes_sub_title', '') or '',
+                    m.get('no_sub_title', '') or '',
+                ]).lower()
+                is_above = 'above' in idx_all_text or 'or more' in idx_all_text or 'or higher' in idx_all_text
+                is_below = 'below' in idx_all_text or 'or less' in idx_all_text or 'or lower' in idx_all_text
+                is_range = (' to ' in idx_all_text or ' - ' in idx_all_text) and not is_above and not is_below
 
                 if is_range or (cap_strike is not None and floor_strike is not None
                                and float(cap_strike) != float(floor_strike) and not is_above and not is_below):
@@ -4134,10 +4171,24 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
                         )
                         reason_detail = f"${price:,.0f} IN range ${range_low:,.0f}-${range_high:,.0f}"
                 else:
-                    if floor_strike is not None:
+                    # Use correct strike for below vs above markets
+                    if is_below and cap_strike is not None:
+                        threshold = float(cap_strike)
+                    elif is_above and floor_strike is not None:
                         threshold = float(floor_strike)
+                    elif floor_strike is not None and cap_strike is not None:
+                        f, c = float(floor_strike), float(cap_strike)
+                        if f == c:
+                            threshold = f
+                        else:
+                            skipped_no_threshold += 1
+                            continue
+                    elif floor_strike is not None:
+                        threshold = float(floor_strike)
+                    elif cap_strike is not None:
+                        threshold = float(cap_strike)
                     else:
-                        price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', title)
+                        price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', idx_all_text)
                         if price_match:
                             try:
                                 threshold = float(price_match.group(1).replace(',', ''))
@@ -4149,6 +4200,11 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
                             continue
 
                     if threshold <= 0:
+                        skipped_no_threshold += 1
+                        continue
+
+                    # Sanity check: threshold within 50% of current price
+                    if abs(price - threshold) / price > 0.50:
                         skipped_no_threshold += 1
                         continue
 
