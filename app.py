@@ -363,6 +363,15 @@ def is_game_live(commence_time_str: str) -> bool:
         return False
 
 
+def _get_today_date_strs() -> set:
+    """Return date strings for both UTC and US Eastern to handle evening overlap.
+    Kalshi tickers use US dates but UTC can roll to the next day during evening games."""
+    now_utc = datetime.now(timezone.utc)
+    utc_str = now_utc.strftime('%y%b%d').upper()
+    eastern_str = (now_utc - timedelta(hours=5)).strftime('%y%b%d').upper()
+    return {utc_str, eastern_str}
+
+
 def are_odds_stale(commence_time_str: str, last_update_str: str) -> bool:
     """Check if FanDuel odds are stale for a live game.
     Returns True if the game has started but FD odds haven't updated since before
@@ -1097,10 +1106,11 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
     fanduel_odds = fd_data['odds']
     fanduel_games = fd_data['games']
     edges = []
-    today_str = datetime.utcnow().strftime('%y%b%d').upper()
+    date_strs = _get_today_date_strs()
 
     kalshi_markets = kalshi_api.get_markets(series_ticker)
-    today_markets = [m for m in kalshi_markets if today_str in m.get('ticker', '')]
+    today_markets = [m for m in kalshi_markets
+                     if any(ds in m.get('ticker', '') for ds in date_strs)]
     if not today_markets:
         return edges
 
@@ -1124,7 +1134,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         t1_name = team_map.get(abbrevs[0], abbrevs[0])
         t2_name = team_map.get(abbrevs[1], abbrevs[1])
 
-        fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games, kalshi_date_str=today_str)
+        fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games)
         if not fd_t1 or fd_t1 not in fanduel_odds or fd_t2 not in fanduel_odds:
             continue
         commence_str = fanduel_games.get(matched_gid, {}).get('commence_time', '')
@@ -1223,10 +1233,11 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
     fd_spreads = fd_data['spreads']
     fd_games = fd_data['games']
     edges = []
-    today_str = datetime.utcnow().strftime('%y%b%d').upper()
+    date_strs = _get_today_date_strs()
 
     kalshi_markets = kalshi_api.get_markets(series_ticker)
-    today_markets = [m for m in kalshi_markets if today_str in m.get('ticker', '')]
+    today_markets = [m for m in kalshi_markets
+                     if any(ds in m.get('ticker', '') for ds in date_strs)]
     if not today_markets:
         return edges
 
@@ -1279,7 +1290,7 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
         t2_name = team_map.get(team_abbrevs[1], team_abbrevs[1])
 
         # Require BOTH teams match the SAME FanDuel game
-        fd_t1, fd_t2, matched_game_id = match_kalshi_to_fanduel_game(t1_name, t2_name, fd_games, kalshi_date_str=today_str)
+        fd_t1, fd_t2, matched_game_id = match_kalshi_to_fanduel_game(t1_name, t2_name, fd_games)
         if not fd_t1 or not matched_game_id or matched_game_id not in fd_spreads:
             continue
 
@@ -1399,10 +1410,11 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
     fd_totals = fd_data['totals']
     fd_games = fd_data['games']
     edges = []
-    today_str = datetime.utcnow().strftime('%y%b%d').upper()
+    date_strs = _get_today_date_strs()
 
     kalshi_markets = kalshi_api.get_markets(series_ticker)
-    today_markets = [m for m in kalshi_markets if today_str in m.get('ticker', '')]
+    today_markets = [m for m in kalshi_markets
+                     if any(ds in m.get('ticker', '') for ds in date_strs)]
     if not today_markets:
         return edges
 
@@ -1575,10 +1587,11 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
     fd_props = fd_data['props']
     fd_games = fd_data['games']
     edges = []
-    today_str = datetime.utcnow().strftime('%y%b%d').upper()
+    date_strs = _get_today_date_strs()
 
     kalshi_markets = kalshi_api.get_markets(series_ticker)
-    today_markets = [m for m in kalshi_markets if today_str in m.get('ticker', '')]
+    today_markets = [m for m in kalshi_markets
+                     if any(ds in m.get('ticker', '') for ds in date_strs)]
     if not today_markets:
         return edges
 
@@ -1702,10 +1715,11 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
     fd_btts = fd_data['btts']
     fd_games = fd_data['games']
     edges = []
-    today_str = datetime.utcnow().strftime('%y%b%d').upper()
+    date_strs = _get_today_date_strs()
 
     kalshi_markets = kalshi_api.get_markets(series_ticker)
-    today_markets = [m for m in kalshi_markets if today_str in m.get('ticker', '')]
+    today_markets = [m for m in kalshi_markets
+                     if any(ds in m.get('ticker', '') for ds in date_strs)]
     if not today_markets:
         return edges
 
@@ -1888,11 +1902,12 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
     """Find edges on tennis match-winner markets."""
     converter = OddsConverter()
     edges = []
-    today_str = datetime.utcnow().strftime('%y%b%d').upper()
+    date_strs = _get_today_date_strs()
 
     # Step 1: Fetch Kalshi markets
     kalshi_markets = kalshi_api.get_markets(series_ticker)
-    today_markets = [m for m in kalshi_markets if today_str in m.get('ticker', '')]
+    today_markets = [m for m in kalshi_markets
+                     if any(ds in m.get('ticker', '') for ds in date_strs)]
     if not today_markets:
         return edges
 
@@ -2194,12 +2209,13 @@ def find_completed_props(kalshi_api) -> List[Dict]:
     print(f"   Box scores loaded: {len(all_player_stats)} players")
 
     # Step 3: For each prop type, find Kalshi markets where target is already met
-    today_str = datetime.utcnow().strftime('%y%b%d').upper()
+    date_strs = _get_today_date_strs()
 
     for series_ticker, stat_info in PROP_STAT_MAP.items():
         stat_name = stat_info['stat_name']
         kalshi_markets = kalshi_api.get_markets(series_ticker)
-        today_markets = [m for m in kalshi_markets if today_str in m.get('ticker', '')]
+        today_markets = [m for m in kalshi_markets
+                         if any(ds in m.get('ticker', '') for ds in date_strs)]
 
         for m in today_markets:
             ticker = m.get('ticker', '')
