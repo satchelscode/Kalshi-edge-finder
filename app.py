@@ -2582,10 +2582,33 @@ RESOLVED_GAME_SPORTS = {
     },
 }
 
-# Kalshi series for non-sport resolved markets
-# Bitcoin daily close: KXBTCD-YYMMDD-T[threshold]
-# Bitcoin range: KXBTC-YYMMDD-B[lower]-[upper]
-CRYPTO_SERIES = ['KXBTCD', 'KXBTC']
+# Kalshi crypto series — hourly, 15-min, daily, and other crypto markets
+# KXBTCD = BTC hourly/daily above/below
+# KXBTC = BTC range markets
+# KXETHD = ETH hourly/daily
+# KXSOLD = SOL hourly/daily
+CRYPTO_SERIES = ['KXBTCD', 'KXBTC', 'KXETHD', 'KXSOLD', 'KXDOGED', 'KXSHIBD']
+
+# CoinGecko IDs for each crypto
+CRYPTO_PRICE_IDS = {
+    'KXBTCD': 'bitcoin', 'KXBTC': 'bitcoin',
+    'KXETHD': 'ethereum',
+    'KXSOLD': 'solana',
+    'KXDOGED': 'dogecoin',
+    'KXSHIBD': 'shiba-inu',
+}
+
+# Volatility buffer: how far price must be from threshold to consider it "safe"
+# Based on time remaining. BTC moves ~0.5% per hour on average, tail risk ~2%
+# Format: (max_minutes_to_close, required_buffer_pct)
+CRYPTO_BUFFER_TIERS = [
+    (2, 0.002),     # < 2 min:  0.2% buffer (tiny move possible)
+    (5, 0.005),     # < 5 min:  0.5% buffer
+    (15, 0.01),     # < 15 min: 1% buffer
+    (30, 0.015),    # < 30 min: 1.5% buffer
+    (60, 0.02),     # < 60 min: 2% buffer
+    (0, 0),         # Expired:  0% buffer (outcome is known)
+]
 
 
 def _get_game_scores(espn_path: str) -> List[Dict]:
@@ -2980,56 +3003,98 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
 
 
 def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
-    """Find Bitcoin/crypto markets where the price is already known.
-    e.g., 'Bitcoin above $80,000 on Jan 31' when the date has passed."""
+    """Find crypto markets where the outcome is already determined or nearly certain.
+
+    Two modes:
+    1. EXPIRED: market close time has passed — outcome is 100% known, buy at any price < $0.99
+    2. NEAR-EXPIRY: market closing soon — if price is far enough from threshold
+       (based on time-remaining volatility buffer), it's essentially guaranteed.
+       e.g., BTC at $78,780 with 27 min left and threshold $75,250 (4.5% buffer) = safe YES
+    """
     edges = []
 
-    # Get current BTC price
+    # Get current prices for all cryptos we track
+    all_ids = list(set(CRYPTO_PRICE_IDS.values()))
     try:
         resp = requests.get(
-            'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd',
+            f'https://api.coingecko.com/api/v3/simple/price?ids={",".join(all_ids)}&vs_currencies=usd',
             timeout=10
         )
         resp.raise_for_status()
-        btc_price = resp.json().get('bitcoin', {}).get('usd', 0)
+        price_data = resp.json()
     except Exception as e:
         print(f"   CoinGecko error: {e}")
         return edges
 
-    if not btc_price:
-        return edges
+    crypto_prices = {}
+    for cg_id, data in price_data.items():
+        crypto_prices[cg_id] = data.get('usd', 0)
 
-    print(f"   Bitcoin price: ${btc_price:,.0f}")
+    for cg_id, price in crypto_prices.items():
+        if price > 0:
+            print(f"   {cg_id}: ${price:,.2f}")
 
-    date_strs = _get_today_date_strs()
     now_utc = datetime.now(timezone.utc)
 
     for series in CRYPTO_SERIES:
+        cg_id = CRYPTO_PRICE_IDS.get(series)
+        if not cg_id or cg_id not in crypto_prices or crypto_prices[cg_id] <= 0:
+            continue
+
+        current_price = crypto_prices[cg_id]
+
         kalshi_markets = kalshi_api.get_markets(series)
         if not kalshi_markets:
             continue
+
+        print(f"   Scanning {series}: {len(kalshi_markets)} markets")
 
         for m in kalshi_markets:
             ticker = m.get('ticker', '')
             title = m.get('title', '') or ''
             close_time = m.get('close_time', '') or m.get('expiration_time', '') or ''
 
-            # Only look at markets that have expired or close soon
-            # (the outcome is determined by a specific time that has passed)
+            # Calculate time remaining to market close
+            minutes_to_close = None
+            is_expired = False
             if close_time:
                 try:
                     ct = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
-                    if ct > now_utc:
-                        continue  # Market hasn't expired yet — outcome not determined
+                    remaining = (ct - now_utc).total_seconds() / 60.0
+                    if remaining <= 0:
+                        is_expired = True
+                        minutes_to_close = 0
+                    else:
+                        minutes_to_close = remaining
                 except Exception:
                     pass
+
+            # Skip markets too far from expiry (> 60 min) — too much can change
+            if minutes_to_close is not None and minutes_to_close > 60 and not is_expired:
+                continue
+
+            # If no close_time info, skip (can't determine safety)
+            if minutes_to_close is None and not is_expired:
+                continue
+
+            # Determine required buffer based on time remaining
+            required_buffer = 0.03  # default 3% if we can't determine time
+            if is_expired:
+                required_buffer = 0  # outcome is known
+            else:
+                for max_min, buf in CRYPTO_BUFFER_TIERS:
+                    if max_min == 0:
+                        continue
+                    if minutes_to_close <= max_min:
+                        required_buffer = buf
+                        break
 
             # Parse the threshold from floor_strike or title
             floor_strike = m.get('floor_strike')
             if floor_strike is not None:
                 threshold = float(floor_strike)
             else:
-                # Try to parse from title: "Bitcoin above $80,000"
+                # Try to parse from title: "Bitcoin above $80,000" or "$78,750 or above"
                 price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', title)
                 if price_match:
                     try:
@@ -3039,28 +3104,41 @@ def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
                 else:
                     continue
 
-            # Determine outcome
+            # Skip if threshold is 0 or nonsensical
+            if threshold <= 0:
+                continue
+
+            # Calculate buffer between current price and threshold
+            buffer_pct = abs(current_price - threshold) / current_price
+
+            # Is the buffer large enough given time remaining?
+            if buffer_pct < required_buffer:
+                continue  # Too close to call
+
+            # Determine which side wins
             ob = kalshi_api.get_orderbook(ticker)
             if not ob:
                 continue
-            time.sleep(0.2)
+            time.sleep(0.15)
 
-            if btc_price > threshold:
-                # Price is above threshold — YES wins
+            time_str = f"{minutes_to_close:.0f}min left" if minutes_to_close and not is_expired else "EXPIRED"
+
+            if current_price > threshold:
+                # Price above threshold — YES wins
                 yes_price = get_best_yes_price(ob)
                 if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
-                    reason = f"BTC ${btc_price:,.0f} > ${threshold:,.0f} (resolved)"
+                    reason = f"${current_price:,.0f} > ${threshold:,.0f} ({time_str}, buffer {buffer_pct:.1%})"
                     result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
-                                                   'Crypto', f"BTC > ${threshold:,.0f}", kalshi_api, ob)
+                                                   'Crypto', f"Above ${threshold:,.0f}", kalshi_api, ob)
                     if result:
                         edges.append(result)
-            elif btc_price < threshold:
-                # Price is below threshold — NO wins
+            elif current_price < threshold:
+                # Price below threshold — NO wins
                 no_price = get_best_no_price(ob)
                 if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
-                    reason = f"BTC ${btc_price:,.0f} < ${threshold:,.0f} (resolved)"
+                    reason = f"${current_price:,.0f} < ${threshold:,.0f} ({time_str}, buffer {buffer_pct:.1%})"
                     result = _buy_resolved_market(ticker, 'no', no_price, reason,
-                                                   'Crypto', f"BTC vs ${threshold:,.0f}", kalshi_api, ob)
+                                                   'Crypto', f"Below ${threshold:,.0f}", kalshi_api, ob)
                     if result:
                         edges.append(result)
 
