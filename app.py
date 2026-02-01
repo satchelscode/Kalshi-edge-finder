@@ -8,6 +8,7 @@ import hashlib
 import threading
 from flask import Flask, render_template, jsonify, request, redirect
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple
 import json
 from difflib import SequenceMatcher
@@ -363,12 +364,17 @@ def is_game_live(commence_time_str: str) -> bool:
         return False
 
 
+def _get_eastern_now() -> datetime:
+    """Get current time in US Eastern (handles EST/EDT automatically)."""
+    return datetime.now(ZoneInfo('America/New_York'))
+
+
 def _get_today_date_strs() -> set:
     """Return date strings for both UTC and US Eastern to handle evening overlap.
-    Kalshi tickers use US dates but UTC can roll to the next day during evening games."""
+    Kalshi tickers use US Eastern dates but UTC can roll to the next day during evening games."""
     now_utc = datetime.now(timezone.utc)
     utc_str = now_utc.strftime('%y%b%d').upper()
-    eastern_str = (now_utc - timedelta(hours=5)).strftime('%y%b%d').upper()
+    eastern_str = _get_eastern_now().strftime('%y%b%d').upper()
     return {utc_str, eastern_str}
 
 
@@ -1614,10 +1620,41 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
                 'game_id': game_id,
             })
 
+    # Build team abbrev -> set of FD game_ids for game verification
+    # Determine which team map to use based on series_ticker
+    prop_team_map = {}
+    if 'NBA' in series_ticker:
+        prop_team_map = NBA_TEAMS
+    elif 'NHL' in series_ticker:
+        prop_team_map = NHL_TEAMS
+    # Build reverse lookup: team full name words -> game_id
+    fd_game_team_abbrs = {}  # game_id -> set of team abbreviation keys
+    for game_id, ginfo in fd_games.items():
+        fd_game_team_abbrs[game_id] = set()
+        for abbr, full_name in prop_team_map.items():
+            if _name_matches(full_name, ginfo.get('home', '')) or _name_matches(full_name, ginfo.get('away', '')):
+                fd_game_team_abbrs[game_id].add(abbr)
+
     for m in today_markets:
         ticker = m.get('ticker', '')
         title = m.get('title', '')
         subtitle = m.get('subtitle', '')
+
+        # Extract game teams from ticker for cross-checking
+        # Ticker: KXNBAPTS-26JAN31SACCHA-PLAYERLINE-N
+        ticker_game_abbrs = set()
+        ticker_parts = ticker.split('-')
+        if len(ticker_parts) >= 2:
+            game_part = ticker_parts[1]
+            date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
+            # Try to split into two known team abbreviations
+            if prop_team_map:
+                team_abbr_set = set(prop_team_map.keys())
+                for i in range(1, len(date_stripped)):
+                    t1, t2 = date_stripped[:i], date_stripped[i:]
+                    if t1 in team_abbr_set and t2 in team_abbr_set:
+                        ticker_game_abbrs = {t1, t2}
+                        break
 
         # Extract player name and line from title: "Nikola Jokic: 25+ points"
         # or from subtitle: "Nikola Jokic: 25+"
@@ -1635,11 +1672,20 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
         for fd_player, fd_entries in fd_lookup.items():
             if _match_player_name(player_name, fd_player):
                 for entry in fd_entries:
+                    # Game verification: if we extracted team abbrs from ticker,
+                    # verify the FD game contains those same teams
+                    if ticker_game_abbrs and entry['game_id'] in fd_game_team_abbrs:
+                        game_abbrs = fd_game_team_abbrs[entry['game_id']]
+                        if not ticker_game_abbrs.issubset(game_abbrs):
+                            continue  # Wrong game — skip this entry
+
                     # FanDuel uses X.5, Kalshi uses X+. "25+" on Kalshi = "Over 24.5" on FanDuel
                     fd_line = entry['point']
-                    # Match if lines are equivalent (Kalshi 25+ ~= FanDuel Over 24.5)
-                    if abs(kalshi_line - (fd_line + 0.5)) <= 1.0:
-                        score = 1.0 - abs(kalshi_line - (fd_line + 0.5))
+                    # Match only if lines are equivalent or very close
+                    # Kalshi 25+ = FD Over 24.5 (diff = 0), allow ±0.5 for rounding
+                    line_diff = abs(kalshi_line - (fd_line + 0.5))
+                    if line_diff <= 0.5:
+                        score = 1.0 - line_diff
                         if score > best_fd_score:
                             best_fd_score = score
                             best_fd_match = entry
@@ -1766,10 +1812,6 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
                 matched_game_id = gid
                 break
 
-        # Fallback: if only one FD game and one Kalshi game, match them
-        if not matched_game_id and len(fd_btts) == 1 and len(game_groups) == 1:
-            matched_game_id = list(fd_btts.keys())[0]
-
         if not matched_game_id or matched_game_id not in fd_btts:
             continue
 
@@ -1886,13 +1928,17 @@ def _tennis_name_matches(kalshi_name: str, fd_name: str) -> bool:
     k_parts = k.split()
     f_parts = f.split()
     if k_parts and f_parts and k_parts[-1] == f_parts[-1]:
-        # Last names match — check first name initial or full match
+        # Last names match — check first name carefully
         if len(k_parts) == 1 or len(f_parts) == 1:
             return True  # Only last name available
         if k_parts[0] == f_parts[0]:
             return True  # First + last match
-        if k_parts[0][0] == f_parts[0][0]:
-            return True  # Initial + last match
+        # Require first 3+ chars match (not just initial) to avoid A. Zverev vs Andrey Zverev
+        if len(k_parts[0]) >= 3 and len(f_parts[0]) >= 3 and k_parts[0][:3] == f_parts[0][:3]:
+            return True  # First 3 chars + last match
+        # One side has initial only (1-2 chars): accept if initial matches
+        if (len(k_parts[0]) <= 2 or len(f_parts[0]) <= 2) and k_parts[0][0] == f_parts[0][0]:
+            return True  # One side is abbreviated, initial match is acceptable
         # Multi-word last names: check last 2 words
         if len(k_parts) >= 2 and len(f_parts) >= 2:
             if k_parts[-2] == f_parts[-2]:
@@ -2174,7 +2220,8 @@ def _parse_espn_stat(stat_str: str, parse_type: str, stat_config=None) -> int:
 
 
 def _get_live_games(espn_path: str) -> List[Dict]:
-    """Get currently live games from ESPN scoreboard for any sport."""
+    """Get currently live games from ESPN scoreboard for any sport.
+    Includes game_date_str to prevent matching yesterday's finals to today's markets."""
     try:
         resp = requests.get(
             f'https://site.api.espn.com/apis/site/v2/sports/{espn_path}/scoreboard',
@@ -2188,6 +2235,16 @@ def _get_live_games(espn_path: str) -> List[Dict]:
             if status in ('STATUS_IN_PROGRESS', 'STATUS_FINAL', 'STATUS_END_PERIOD',
                           'STATUS_HALFTIME', 'STATUS_FIRST_HALF', 'STATUS_SECOND_HALF'):
                 game_id = event.get('id', '')
+                # Extract game date from ESPN event
+                game_date_str = ''
+                event_date = event.get('date', '') or ''
+                if event_date and len(event_date) >= 10:
+                    try:
+                        gd = datetime.fromisoformat(event_date.replace('Z', '+00:00'))
+                        gd_eastern = gd.astimezone(ZoneInfo('America/New_York'))
+                        game_date_str = gd_eastern.strftime('%y%b%d').upper()
+                    except Exception:
+                        pass
                 competitors = event.get('competitions', [{}])[0].get('competitors', [])
                 teams = {}
                 for c in competitors:
@@ -2198,6 +2255,7 @@ def _get_live_games(espn_path: str) -> List[Dict]:
                     'home': teams.get('home', ''),
                     'away': teams.get('away', ''),
                     'status': status,
+                    'game_date_str': game_date_str,
                 })
         return live_games
     except Exception as e:
@@ -2206,8 +2264,9 @@ def _get_live_games(espn_path: str) -> List[Dict]:
 
 
 def _get_box_score(game_id: str, espn_path: str, sport_config: dict,
-                   home_abbr: str = '', away_abbr: str = '') -> Dict[str, Dict]:
-    """Fetch box score for a game. Returns {player_name: {stat_name: value, ..., '_team': 'SA', '_game_teams': ('CHA','SA')}}."""
+                   home_abbr: str = '', away_abbr: str = '',
+                   game_date_str: str = '') -> Dict[str, Dict]:
+    """Fetch box score for a game. Returns {player_name: {stat_name: value, ..., '_team': 'SA', '_game_teams': ('CHA','SA'), '_game_date': '26JAN31'}}."""
     try:
         resp = requests.get(
             f'https://site.api.espn.com/apis/site/v2/sports/{espn_path}/summary?event={game_id}',
@@ -2248,6 +2307,7 @@ def _get_box_score(game_id: str, espn_path: str, sport_config: dict,
                     player_data = player_stats.get(name, {})
                     player_data['_team'] = team_abbr  # Track which team this player is on
                     player_data['_game_teams'] = (home_abbr, away_abbr)  # Both teams in this game
+                    player_data['_game_date'] = game_date_str  # Track game date for cross-day verification
                     for stat_name, cfg in group_config['stats'].items():
                         idx = cfg['index']
                         parse = cfg['parse']
@@ -2334,7 +2394,8 @@ def find_completed_props(kalshi_api) -> List[Dict]:
         all_player_stats = {}
         for game in live_games:
             box = _get_box_score(game['game_id'], espn_path, sport_config,
-                                home_abbr=game['home'], away_abbr=game['away'])
+                                home_abbr=game['home'], away_abbr=game['away'],
+                                game_date_str=game.get('game_date_str', ''))
             all_player_stats.update(box)
             time.sleep(0.3)
 
@@ -2381,7 +2442,19 @@ def find_completed_props(kalshi_api) -> List[Dict]:
                 if not espn_name:
                     continue
 
-                # CRITICAL: Verify the player's game teams BOTH appear in this ticker
+                # CRITICAL: Verify the game date matches the ticker date
+                # This prevents matching yesterday's FINAL stats to today's markets
+                # (e.g., Bam Adebayo 21pts from Jan 31 MIA@CHI matching Feb 1 MIA@CHI ticker)
+                ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
+                ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
+                if not ticker_date_str:
+                    continue  # Require valid date to prevent stale matching
+                player_game_date = all_player_stats[espn_name].get('_game_date', '')
+                if player_game_date and ticker_date_str != player_game_date:
+                    print(f"   Skipping {player_name}: game date {player_game_date} != ticker date {ticker_date_str}")
+                    continue
+
+                # Verify the player's game teams BOTH appear in this ticker
                 # This prevents matching a player's stats from one game against a
                 # different game's Kalshi market (e.g., Jan 31 SA@CHA stats vs Feb 1 SA@NYK market)
                 player_game_teams = all_player_stats[espn_name].get('_game_teams', ('', ''))
@@ -2668,8 +2741,8 @@ def _get_game_scores(espn_path: str) -> List[Dict]:
             if event_date and len(event_date) >= 10:
                 try:
                     gd = datetime.fromisoformat(event_date.replace('Z', '+00:00'))
-                    # Convert to US Eastern for the actual game date
-                    gd_eastern = gd - timedelta(hours=5)
+                    # Convert to US Eastern for the actual game date (handles EST/EDT)
+                    gd_eastern = gd.astimezone(ZoneInfo('America/New_York'))
                     game_date_str = gd_eastern.strftime('%y%b%d').upper()
                 except Exception:
                     pass
@@ -2686,7 +2759,15 @@ def _get_game_scores(espn_path: str) -> List[Dict]:
             away = teams.get('away', {})
             total = home.get('score', 0) + away.get('score', 0)
             home_margin = home.get('score', 0) - away.get('score', 0)
-            winner = home.get('abbr', '') if home_margin > 0 else away.get('abbr', '')
+            if home_margin > 0:
+                winner = home.get('abbr', '')
+                loser = away.get('abbr', '')
+            elif home_margin < 0:
+                winner = away.get('abbr', '')
+                loser = home.get('abbr', '')
+            else:
+                winner = ''  # Tie — no winner (shouldn't happen in final NBA/NHL)
+                loser = ''
             games.append({
                 'home': home.get('abbr', ''),
                 'away': away.get('abbr', ''),
@@ -2695,7 +2776,7 @@ def _get_game_scores(espn_path: str) -> List[Dict]:
                 'total': total,
                 'home_margin': home_margin,
                 'winner': winner,
-                'loser': away.get('abbr', '') if home_margin > 0 else home.get('abbr', ''),
+                'loser': loser,
                 'status': status,
                 'is_final': status == 'STATUS_FINAL',
                 'is_live': status in ('STATUS_IN_PROGRESS', 'STATUS_END_PERIOD',
@@ -2924,6 +3005,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 # Extract ticker date (e.g. '26FEB01') and team portion (e.g. 'ORLSAS')
                 ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
                 ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
+                if not ticker_date_str:
+                    continue  # Require valid date to prevent stale matching
                 date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
 
                 game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
@@ -2984,6 +3067,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 game_part = parts[1]
                 ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
                 ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
+                if not ticker_date_str:
+                    continue  # Require valid date to prevent stale matching
                 date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
 
                 game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
@@ -3060,6 +3145,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 game_part = parts[1]
                 ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
                 ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
+                if not ticker_date_str:
+                    continue  # Require valid date to prevent stale matching
                 date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
 
                 game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
@@ -3163,14 +3250,14 @@ def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
 
         print(f"   Scanning {series}: {len(kalshi_markets)} markets")
 
-        # Debug: show first market's fields to identify close_time key
+        # Debug: show first market's structure to identify fields and market types
         if kalshi_markets:
             m0 = kalshi_markets[0]
             time_fields = {k: v for k, v in m0.items()
                           if 'time' in k.lower() or 'date' in k.lower() or 'expir' in k.lower() or 'close' in k.lower()}
-            print(f"   DEBUG {series} first market time fields: {time_fields}")
-            if 'floor_strike' in m0 or 'cap_strike' in m0:
-                print(f"   DEBUG {series} strikes: floor={m0.get('floor_strike')}, cap={m0.get('cap_strike')}")
+            print(f"   DEBUG {series} time fields: {time_fields}")
+            print(f"   DEBUG {series} first: ticker={m0.get('ticker','')}, title={m0.get('title','')}")
+            print(f"   DEBUG {series} strikes: floor={m0.get('floor_strike')}, cap={m0.get('cap_strike')}")
 
         skipped_no_time = 0
         skipped_too_far = 0
@@ -3222,64 +3309,120 @@ def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
                         required_buffer = buf
                         break
 
-            # Parse the threshold from floor_strike or title
+            # Determine market type from title and strikes
+            # Three types: "above X", "below X / X or below", "X to Y" (range)
             floor_strike = m.get('floor_strike')
-            if floor_strike is not None:
-                threshold = float(floor_strike)
-            else:
-                # Try to parse from title: "Bitcoin above $80,000" or "$78,750 or above"
-                price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', title)
-                if price_match:
-                    try:
-                        threshold = float(price_match.group(1).replace(',', ''))
-                    except ValueError:
-                        skipped_no_threshold += 1
-                        continue
-                else:
+            cap_strike = m.get('cap_strike')
+            title_lower = title.lower()
+
+            # Detect market type
+            is_above = 'above' in title_lower or 'or more' in title_lower or 'or higher' in title_lower
+            is_below = 'below' in title_lower or 'or less' in title_lower or 'or lower' in title_lower
+            is_range = (' to ' in title_lower or ' - ' in title_lower) and not is_above and not is_below
+
+            # For range markets: need BOTH floor and cap strikes
+            if is_range or (cap_strike is not None and floor_strike is not None
+                           and float(cap_strike) != float(floor_strike) and not is_above and not is_below):
+                # Range market: YES = price is in [floor, cap]
+                if floor_strike is None or cap_strike is None:
+                    skipped_no_threshold += 1
+                    continue
+                range_low = float(floor_strike)
+                range_high = float(cap_strike)
+                if range_low <= 0 or range_high <= 0:
                     skipped_no_threshold += 1
                     continue
 
-            # Skip if threshold is 0 or nonsensical
-            if threshold <= 0:
-                skipped_no_threshold += 1
-                continue
+                # Check buffer from BOTH edges of the range
+                if current_price > range_high:
+                    # Price above range — NO wins (not in range)
+                    buffer_pct = (current_price - range_high) / current_price
+                    if buffer_pct < required_buffer:
+                        skipped_buffer += 1
+                        continue
+                    side = 'no'
+                    reason_detail = f"${current_price:,.0f} above range ${range_low:,.0f}-${range_high:,.0f}"
+                elif current_price < range_low:
+                    # Price below range — NO wins (not in range)
+                    buffer_pct = (range_low - current_price) / current_price
+                    if buffer_pct < required_buffer:
+                        skipped_buffer += 1
+                        continue
+                    side = 'no'
+                    reason_detail = f"${current_price:,.0f} below range ${range_low:,.0f}-${range_high:,.0f}"
+                else:
+                    # Price IN range — YES might win, but too risky (can exit range)
+                    # Only bet YES on range if expired (outcome known for certain)
+                    if not is_expired:
+                        skipped_buffer += 1
+                        continue
+                    side = 'yes'
+                    buffer_pct = min(
+                        (current_price - range_low) / current_price,
+                        (range_high - current_price) / current_price
+                    )
+                    reason_detail = f"${current_price:,.0f} IN range ${range_low:,.0f}-${range_high:,.0f}"
+            else:
+                # Single-threshold market: above or below
+                if floor_strike is not None:
+                    threshold = float(floor_strike)
+                else:
+                    price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', title)
+                    if price_match:
+                        try:
+                            threshold = float(price_match.group(1).replace(',', ''))
+                        except ValueError:
+                            skipped_no_threshold += 1
+                            continue
+                    else:
+                        skipped_no_threshold += 1
+                        continue
 
-            # Calculate buffer between current price and threshold
-            buffer_pct = abs(current_price - threshold) / current_price
+                if threshold <= 0:
+                    skipped_no_threshold += 1
+                    continue
 
-            # Is the buffer large enough given time remaining?
-            if buffer_pct < required_buffer:
-                skipped_buffer += 1
-                continue  # Too close to call
+                buffer_pct = abs(current_price - threshold) / current_price
+                if buffer_pct < required_buffer:
+                    skipped_buffer += 1
+                    continue
+
+                if is_below:
+                    # "Below X" market: YES = price < X, NO = price >= X
+                    if current_price < threshold:
+                        side = 'yes'
+                        reason_detail = f"${current_price:,.0f} < ${threshold:,.0f} (below market)"
+                    else:
+                        side = 'no'
+                        reason_detail = f"${current_price:,.0f} > ${threshold:,.0f} (below market, NO wins)"
+                else:
+                    # "Above X" market (default): YES = price >= X, NO = price < X
+                    if current_price > threshold:
+                        side = 'yes'
+                        reason_detail = f"${current_price:,.0f} > ${threshold:,.0f}"
+                    else:
+                        side = 'no'
+                        reason_detail = f"${current_price:,.0f} < ${threshold:,.0f}"
 
             checked += 1
+            time_str = f"{minutes_to_close:.0f}min left" if minutes_to_close and not is_expired else "EXPIRED"
 
-            # Determine which side wins
             ob = kalshi_api.get_orderbook(ticker)
             if not ob:
                 continue
             time.sleep(0.15)
 
-            time_str = f"{minutes_to_close:.0f}min left" if minutes_to_close and not is_expired else "EXPIRED"
+            if side == 'yes':
+                ask_price = get_best_yes_price(ob)
+            else:
+                ask_price = get_best_no_price(ob)
 
-            if current_price > threshold:
-                # Price above threshold — YES wins
-                yes_price = get_best_yes_price(ob)
-                if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
-                    reason = f"${current_price:,.0f} > ${threshold:,.0f} ({time_str}, buffer {buffer_pct:.1%})"
-                    result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
-                                                   'Crypto', f"Above ${threshold:,.0f}", kalshi_api, ob)
-                    if result:
-                        edges.append(result)
-            elif current_price < threshold:
-                # Price below threshold — NO wins
-                no_price = get_best_no_price(ob)
-                if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
-                    reason = f"${current_price:,.0f} < ${threshold:,.0f} ({time_str}, buffer {buffer_pct:.1%})"
-                    result = _buy_resolved_market(ticker, 'no', no_price, reason,
-                                                   'Crypto', f"Below ${threshold:,.0f}", kalshi_api, ob)
-                    if result:
-                        edges.append(result)
+            if ask_price and ask_price < COMPLETED_PROP_MAX_PRICE:
+                reason = f"{reason_detail} ({time_str}, buffer {buffer_pct:.1%})"
+                result = _buy_resolved_market(ticker, side, ask_price, reason,
+                                               'Crypto', reason_detail, kalshi_api, ob)
+                if result:
+                    edges.append(result)
 
         print(f"   {series} filter: {skipped_no_time} no-time, {skipped_too_far} too-far, "
               f"{skipped_buffer} buffer, {skipped_no_threshold} no-threshold, {checked} checked")
