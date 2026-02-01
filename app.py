@@ -1032,9 +1032,12 @@ class KalshiAPI:
                 if cursor:
                     params['cursor'] = cursor
                 response = self.session.get(f"{self.BASE_URL}/markets", params=params, timeout=10)
-                if response.status_code == 429:
-                    print(f"   Kalshi 429 on {series_ticker} markets, backing off 5s...")
-                    time.sleep(5.0)
+                # Retry up to 3 times on 429 with exponential backoff
+                for retry_delay in [5, 10, 20]:
+                    if response.status_code != 429:
+                        break
+                    print(f"   Kalshi 429 on {series_ticker}, backing off {retry_delay}s...")
+                    time.sleep(retry_delay)
                     response = self.session.get(f"{self.BASE_URL}/markets", params=params, timeout=10)
                 response.raise_for_status()
                 data = response.json()
@@ -1043,7 +1046,7 @@ class KalshiAPI:
                 cursor = data.get('cursor')
                 if not cursor:
                     break
-                time.sleep(1.0)
+                time.sleep(1.5)
             print(f"   Kalshi {series_ticker}: {len(all_markets)} markets")
             return all_markets
         except Exception as e:
@@ -1065,9 +1068,11 @@ class KalshiAPI:
     def get_orderbook(self, ticker: str) -> Optional[Dict]:
         try:
             response = self.session.get(f"{self.BASE_URL}/markets/{ticker}/orderbook", timeout=10)
-            if response.status_code == 429:
-                print(f"   Kalshi 429 on {ticker}, backing off 5s...")
-                time.sleep(5.0)
+            for retry_delay in [3, 8, 15]:
+                if response.status_code != 429:
+                    break
+                print(f"   Kalshi 429 on {ticker} orderbook, backing off {retry_delay}s...")
+                time.sleep(retry_delay)
                 response = self.session.get(f"{self.BASE_URL}/markets/{ticker}/orderbook", timeout=10)
             response.raise_for_status()
             return response.json()
@@ -2186,8 +2191,8 @@ def _get_live_games(espn_path: str) -> List[Dict]:
                 competitors = event.get('competitions', [{}])[0].get('competitors', [])
                 teams = {}
                 for c in competitors:
-                    abbrev = c.get('team', {}).get('abbreviation', '')
-                    teams[c.get('homeAway', '')] = abbrev
+                    espn_abbr = c.get('team', {}).get('abbreviation', '')
+                    teams[c.get('homeAway', '')] = ESPN_TO_KALSHI.get(espn_abbr, espn_abbr)
                 live_games.append({
                     'game_id': game_id,
                     'home': teams.get('home', ''),
@@ -2213,7 +2218,8 @@ def _get_box_score(game_id: str, espn_path: str, sport_config: dict,
 
         player_stats = {}
         for team_data in data.get('boxscore', {}).get('players', []):
-            team_abbr = team_data.get('team', {}).get('abbreviation', '')
+            espn_team = team_data.get('team', {}).get('abbreviation', '')
+            team_abbr = ESPN_TO_KALSHI.get(espn_team, espn_team)
             for stat_group in team_data.get('statistics', []):
                 labels = stat_group.get('labels', [])
 
@@ -2578,6 +2584,14 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
 #         Bitcoin price, economic data, and more
 # ============================================================
 
+# ESPN abbreviation → Kalshi abbreviation mapping (only teams that differ)
+# NBA: ESPN uses shorter abbrevs (GS, NY, NO, SA) vs Kalshi (GSW, NYK, NOP, SAS)
+# NHL: ESPN and Kalshi both use TB, NJ, SJ, LA — no mapping needed
+ESPN_TO_KALSHI = {
+    'GS': 'GSW', 'NY': 'NYK', 'NO': 'NOP', 'SA': 'SAS',
+    'UTAH': 'UTA', 'PHO': 'PHX',
+}
+
 # ESPN sport configs for game-level resolution (ML, totals, spreads)
 RESOLVED_GAME_SPORTS = {
     'nba': {
@@ -2586,6 +2600,7 @@ RESOLVED_GAME_SPORTS = {
         'total_series': ['KXNBATOTAL'],
         'spread_series': ['KXNBASPREAD'],
         'display': 'NBA',
+        'team_abbrs': set(NBA_TEAMS.keys()),
     },
     'ncaab': {
         'espn_path': 'basketball/mens-college-basketball',
@@ -2593,6 +2608,7 @@ RESOLVED_GAME_SPORTS = {
         'total_series': ['KXNCAAMBTOTAL'],
         'spread_series': ['KXNCAAMBSPREAD'],
         'display': 'NCAAB',
+        'team_abbrs': set(),  # NCAAB has too many teams for exact matching
     },
     'nhl': {
         'espn_path': 'hockey/nhl',
@@ -2600,6 +2616,7 @@ RESOLVED_GAME_SPORTS = {
         'total_series': ['KXNHLTOTAL'],
         'spread_series': ['KXNHLSPREAD'],
         'display': 'NHL',
+        'team_abbrs': set(NHL_TEAMS.keys()),
     },
 }
 
@@ -2633,7 +2650,8 @@ CRYPTO_BUFFER_TIERS = [
 
 
 def _get_game_scores(espn_path: str) -> List[Dict]:
-    """Get all games with scores from ESPN (live + final)."""
+    """Get all games with scores from ESPN (live + final).
+    Includes game_date_str (e.g. '26JAN31') to verify against Kalshi ticker dates."""
     try:
         resp = requests.get(
             f'https://site.api.espn.com/apis/site/v2/sports/{espn_path}/scoreboard',
@@ -2644,11 +2662,24 @@ def _get_game_scores(espn_path: str) -> List[Dict]:
         games = []
         for event in data.get('events', []):
             status = event.get('status', {}).get('type', {}).get('name', '')
+            # Extract game date from ESPN event (ISO format: "2026-01-31T00:00Z")
+            game_date_str = ''
+            event_date = event.get('date', '') or ''
+            if event_date and len(event_date) >= 10:
+                try:
+                    gd = datetime.fromisoformat(event_date.replace('Z', '+00:00'))
+                    # Convert to US Eastern for the actual game date
+                    gd_eastern = gd - timedelta(hours=5)
+                    game_date_str = gd_eastern.strftime('%y%b%d').upper()
+                except Exception:
+                    pass
             comps = event.get('competitions', [{}])[0].get('competitors', [])
             teams = {}
             for c in comps:
                 ha = c.get('homeAway', '')
-                abbr = c.get('team', {}).get('abbreviation', '')
+                espn_abbr = c.get('team', {}).get('abbreviation', '')
+                # Translate ESPN abbreviation to Kalshi abbreviation
+                abbr = ESPN_TO_KALSHI.get(espn_abbr, espn_abbr)
                 score = int(c.get('score', '0') or '0')
                 teams[ha] = {'abbr': abbr, 'score': score}
             home = teams.get('home', {})
@@ -2669,6 +2700,7 @@ def _get_game_scores(espn_path: str) -> List[Dict]:
                 'is_final': status == 'STATUS_FINAL',
                 'is_live': status in ('STATUS_IN_PROGRESS', 'STATUS_END_PERIOD',
                                        'STATUS_HALFTIME', 'STATUS_FIRST_HALF', 'STATUS_SECOND_HALF'),
+                'game_date_str': game_date_str,
             })
         return games
     except Exception as e:
@@ -2684,7 +2716,9 @@ def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
     if not AUTO_TRADE_ENABLED:
         return None
 
-    if _order_tracker.has_position(ticker):
+    # Use has_game_position to prevent betting both sides of the same game
+    if _order_tracker.has_game_position(ticker):
+        print(f"   Skipping {ticker}: already have position in this game")
         return None
 
     fee = kalshi_fee(price)
@@ -2778,6 +2812,64 @@ def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
     return None
 
 
+def _find_game_for_ticker(date_stripped: str, abbrev_to_game: dict, team_abbrs: set,
+                          require_final: bool = False,
+                          ticker_date_str: str = '') -> Optional[Dict]:
+    """Match a Kalshi ticker's team portion to an ESPN game.
+
+    CRITICAL SAFETY CHECKS:
+    1. Requires BOTH teams in the ticker to be from the SAME ESPN game.
+       Without this, a SAC-vs-DET final could match a SAC@WAS ticker.
+    2. Verifies the game date matches the ticker date to prevent matching
+       yesterday's results to today's markets.
+    """
+    def _date_matches(candidate):
+        if not ticker_date_str:
+            return True
+        game_date = candidate.get('game_date_str', '')
+        if not game_date:
+            return True
+        return game_date == ticker_date_str
+
+    # Method 1: Try all split points to find two known Kalshi abbreviations
+    if team_abbrs:
+        for i in range(1, len(date_stripped)):
+            t1, t2 = date_stripped[:i], date_stripped[i:]
+            if t1 in team_abbrs and t2 in team_abbrs:
+                # BOTH teams must map to the SAME game
+                if t1 in abbrev_to_game and t2 in abbrev_to_game:
+                    game1 = abbrev_to_game[t1]
+                    game2 = abbrev_to_game[t2]
+                    # Verify same game: both teams are home/away of that game
+                    if (game1['home'] == game2['home'] and game1['away'] == game2['away']):
+                        candidate = game1
+                        if require_final and not candidate['is_final']:
+                            continue
+                        if not _date_matches(candidate):
+                            print(f"   Skipping {t1}v{t2}: game date {candidate.get('game_date_str','')} != ticker {ticker_date_str}")
+                            continue
+                        return candidate
+                    else:
+                        # Teams are from different games — NOT a match
+                        print(f"   Skipping {t1}v{t2}: different games ({game1['away']}@{game1['home']} vs {game2['away']}@{game2['home']})")
+                        continue
+
+    # Method 2: Fallback for NCAAB (no team_abbrs set) — require BOTH teams in same game
+    for abbr in abbrev_to_game:
+        if abbr in date_stripped:
+            candidate = abbrev_to_game[abbr]
+            # Verify the OTHER team in this game is also in date_stripped
+            other_team = candidate['away'] if abbr == candidate['home'] else candidate['home']
+            if other_team not in date_stripped:
+                continue  # Only one team matches — wrong game
+            if require_final and not candidate['is_final']:
+                continue
+            if not _date_matches(candidate):
+                continue
+            return candidate
+    return None
+
+
 def find_resolved_game_markets(kalshi_api) -> List[Dict]:
     """Find game-level markets (ML, totals, spreads) where the outcome is already known.
     - FINAL games: ML winner known, total known, spread result known
@@ -2789,6 +2881,7 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
     for sport_key, config in RESOLVED_GAME_SPORTS.items():
         espn_path = config['espn_path']
         display = config['display']
+        team_abbrs = config.get('team_abbrs', set())
 
         game_scores = _get_game_scores(espn_path)
         if not game_scores:
@@ -2801,8 +2894,12 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
             continue
 
         print(f"   {display}: {len(final_games)} final, {len(live_games)} live games")
+        for g in final_games[:3]:
+            print(f"      FINAL [{g.get('game_date_str','')}]: {g['away']} {g['away_score']} @ {g['home']} {g['home_score']}")
+        for g in live_games[:3]:
+            print(f"      LIVE [{g.get('game_date_str','')}]: {g['away']} @ {g['home']}")
 
-        # Build lookup: team_abbrev -> game info
+        # Build lookup: team_abbrev -> game info (uses Kalshi abbreviations now)
         all_relevant = final_games + live_games
         abbrev_to_game = {}
         for g in all_relevant:
@@ -2814,25 +2911,23 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
             kalshi_markets = kalshi_api.get_markets(ml_series)
             today_markets = [m for m in kalshi_markets
                              if any(ds in m.get('ticker', '') for ds in date_strs)]
+            print(f"   {ml_series}: {len(kalshi_markets)} total, {len(today_markets)} today")
+            time.sleep(0.5)
 
             for m in today_markets:
                 ticker = m.get('ticker', '')
-                # Extract team abbrev from last segment: KXNBAGAME-26JAN31ATLIND-ATL -> ATL
                 parts = ticker.split('-')
                 if len(parts) < 3:
                     continue
                 team_abbr = parts[-1]
                 game_part = parts[1]
+                # Extract ticker date (e.g. '26FEB01') and team portion (e.g. 'ORLSAS')
+                ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
+                ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
                 date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
 
-                # Find matching game
-                game = None
-                for abbr in abbrev_to_game:
-                    if abbr in date_stripped:
-                        candidate = abbrev_to_game[abbr]
-                        if candidate['is_final']:
-                            game = candidate
-                            break
+                game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
+                                             require_final=True, ticker_date_str=ticker_date_str)
                 if not game:
                     continue
 
@@ -2868,6 +2963,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
             kalshi_markets = kalshi_api.get_markets(total_series)
             today_markets = [m for m in kalshi_markets
                              if any(ds in m.get('ticker', '') for ds in date_strs)]
+            print(f"   {total_series}: {len(kalshi_markets)} total, {len(today_markets)} today")
+            time.sleep(0.5)
 
             for m in today_markets:
                 ticker = m.get('ticker', '')
@@ -2885,14 +2982,12 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 floor_strike = float(floor_strike)
 
                 game_part = parts[1]
+                ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
+                ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
                 date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
 
-                # Find matching game
-                game = None
-                for abbr in abbrev_to_game:
-                    if abbr in date_stripped:
-                        game = abbrev_to_game[abbr]
-                        break
+                game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
+                                             ticker_date_str=ticker_date_str)
                 if not game:
                     continue
 
@@ -2943,6 +3038,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
             kalshi_markets = kalshi_api.get_markets(spread_series)
             today_markets = [m for m in kalshi_markets
                              if any(ds in m.get('ticker', '') for ds in date_strs)]
+            print(f"   {spread_series}: {len(kalshi_markets)} total, {len(today_markets)} today")
+            time.sleep(0.5)
 
             for m in today_markets:
                 ticker = m.get('ticker', '')
@@ -2961,16 +3058,12 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 floor_strike = float(floor_strike)
 
                 game_part = parts[1]
+                ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
+                ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
                 date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
 
-                # Find matching FINAL game
-                game = None
-                for abbr in abbrev_to_game:
-                    if abbr in date_stripped:
-                        candidate = abbrev_to_game[abbr]
-                        if candidate['is_final']:
-                            game = candidate
-                            break
+                game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
+                                             require_final=True, ticker_date_str=ticker_date_str)
                 if not game:
                     continue
 
@@ -3070,10 +3163,27 @@ def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
 
         print(f"   Scanning {series}: {len(kalshi_markets)} markets")
 
+        # Debug: show first market's fields to identify close_time key
+        if kalshi_markets:
+            m0 = kalshi_markets[0]
+            time_fields = {k: v for k, v in m0.items()
+                          if 'time' in k.lower() or 'date' in k.lower() or 'expir' in k.lower() or 'close' in k.lower()}
+            print(f"   DEBUG {series} first market time fields: {time_fields}")
+            if 'floor_strike' in m0 or 'cap_strike' in m0:
+                print(f"   DEBUG {series} strikes: floor={m0.get('floor_strike')}, cap={m0.get('cap_strike')}")
+
+        skipped_no_time = 0
+        skipped_too_far = 0
+        skipped_buffer = 0
+        skipped_no_threshold = 0
+        checked = 0
+
         for m in kalshi_markets:
             ticker = m.get('ticker', '')
             title = m.get('title', '') or ''
-            close_time = m.get('close_time', '') or m.get('expiration_time', '') or ''
+            # Try multiple possible field names for close time
+            close_time = (m.get('close_time', '') or m.get('expiration_time', '') or
+                         m.get('expected_expiration_time', '') or m.get('end_date_time', '') or '')
 
             # Calculate time remaining to market close
             minutes_to_close = None
@@ -3092,10 +3202,12 @@ def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
 
             # Skip markets too far from expiry (> 60 min) — too much can change
             if minutes_to_close is not None and minutes_to_close > 60 and not is_expired:
+                skipped_too_far += 1
                 continue
 
             # If no close_time info, skip (can't determine safety)
             if minutes_to_close is None and not is_expired:
+                skipped_no_time += 1
                 continue
 
             # Determine required buffer based on time remaining
@@ -3121,12 +3233,15 @@ def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
                     try:
                         threshold = float(price_match.group(1).replace(',', ''))
                     except ValueError:
+                        skipped_no_threshold += 1
                         continue
                 else:
+                    skipped_no_threshold += 1
                     continue
 
             # Skip if threshold is 0 or nonsensical
             if threshold <= 0:
+                skipped_no_threshold += 1
                 continue
 
             # Calculate buffer between current price and threshold
@@ -3134,7 +3249,10 @@ def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
 
             # Is the buffer large enough given time remaining?
             if buffer_pct < required_buffer:
+                skipped_buffer += 1
                 continue  # Too close to call
+
+            checked += 1
 
             # Determine which side wins
             ob = kalshi_api.get_orderbook(ticker)
@@ -3162,6 +3280,10 @@ def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
                                                    'Crypto', f"Below ${threshold:,.0f}", kalshi_api, ob)
                     if result:
                         edges.append(result)
+
+        print(f"   {series} filter: {skipped_no_time} no-time, {skipped_too_far} too-far, "
+              f"{skipped_buffer} buffer, {skipped_no_threshold} no-threshold, {checked} checked")
+        time.sleep(0.5)
 
     return edges
 
@@ -3216,11 +3338,13 @@ def find_resolved_econ_markets(kalshi_api) -> List[Dict]:
         kalshi_markets = kalshi_api.get_markets(series)
         if not kalshi_markets:
             continue
+        time.sleep(0.5)
 
         for m in kalshi_markets:
             ticker = m.get('ticker', '')
             title = m.get('title', '') or ''
-            close_time = m.get('close_time', '') or m.get('expiration_time', '') or ''
+            close_time = (m.get('close_time', '') or m.get('expiration_time', '') or
+                         m.get('expected_expiration_time', '') or '')
 
             # Only resolved markets (close time passed)
             if close_time:
@@ -3271,6 +3395,7 @@ def find_all_resolved_markets(kalshi_api) -> List[Dict]:
     game_resolved = find_resolved_game_markets(kalshi_api)
     all_resolved.extend(game_resolved)
     print(f"   Game markets: {len(game_resolved)} resolved")
+    time.sleep(2.0)
 
     # 2. Completed player props (existing function)
     # (already called separately in scan_all_sports)
@@ -3280,6 +3405,7 @@ def find_all_resolved_markets(kalshi_api) -> List[Dict]:
     crypto_resolved = find_resolved_crypto_markets(kalshi_api)
     all_resolved.extend(crypto_resolved)
     print(f"   Crypto markets: {len(crypto_resolved)} resolved")
+    time.sleep(2.0)
 
     # 4. Economic data markets
     print(f"   Scanning resolved economic data markets...")
