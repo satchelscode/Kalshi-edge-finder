@@ -2552,6 +2552,646 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
 
 
 # ============================================================
+# RESOLVED MARKET FINDER — Buy any Kalshi market with a known outcome
+# Covers: completed game ML/total/spread, live totals over the line,
+#         Bitcoin price, economic data, and more
+# ============================================================
+
+# ESPN sport configs for game-level resolution (ML, totals, spreads)
+RESOLVED_GAME_SPORTS = {
+    'nba': {
+        'espn_path': 'basketball/nba',
+        'ml_series': ['KXNBAGAME'],
+        'total_series': ['KXNBATOTAL'],
+        'spread_series': ['KXNBASPREAD'],
+        'display': 'NBA',
+    },
+    'ncaab': {
+        'espn_path': 'basketball/mens-college-basketball',
+        'ml_series': ['KXNCAAMBGAME'],
+        'total_series': ['KXNCAAMBTOTAL'],
+        'spread_series': ['KXNCAAMBSPREAD'],
+        'display': 'NCAAB',
+    },
+    'nhl': {
+        'espn_path': 'hockey/nhl',
+        'ml_series': ['KXNHLGAME'],
+        'total_series': ['KXNHLTOTAL'],
+        'spread_series': ['KXNHLSPREAD'],
+        'display': 'NHL',
+    },
+}
+
+# Kalshi series for non-sport resolved markets
+# Bitcoin daily close: KXBTCD-YYMMDD-T[threshold]
+# Bitcoin range: KXBTC-YYMMDD-B[lower]-[upper]
+CRYPTO_SERIES = ['KXBTCD', 'KXBTC']
+
+
+def _get_game_scores(espn_path: str) -> List[Dict]:
+    """Get all games with scores from ESPN (live + final)."""
+    try:
+        resp = requests.get(
+            f'https://site.api.espn.com/apis/site/v2/sports/{espn_path}/scoreboard',
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        games = []
+        for event in data.get('events', []):
+            status = event.get('status', {}).get('type', {}).get('name', '')
+            comps = event.get('competitions', [{}])[0].get('competitors', [])
+            teams = {}
+            for c in comps:
+                ha = c.get('homeAway', '')
+                abbr = c.get('team', {}).get('abbreviation', '')
+                score = int(c.get('score', '0') or '0')
+                teams[ha] = {'abbr': abbr, 'score': score}
+            home = teams.get('home', {})
+            away = teams.get('away', {})
+            total = home.get('score', 0) + away.get('score', 0)
+            home_margin = home.get('score', 0) - away.get('score', 0)
+            winner = home.get('abbr', '') if home_margin > 0 else away.get('abbr', '')
+            games.append({
+                'home': home.get('abbr', ''),
+                'away': away.get('abbr', ''),
+                'home_score': home.get('score', 0),
+                'away_score': away.get('score', 0),
+                'total': total,
+                'home_margin': home_margin,
+                'winner': winner,
+                'loser': away.get('abbr', '') if home_margin > 0 else home.get('abbr', ''),
+                'status': status,
+                'is_final': status == 'STATUS_FINAL',
+                'is_live': status in ('STATUS_IN_PROGRESS', 'STATUS_END_PERIOD',
+                                       'STATUS_HALFTIME', 'STATUS_FIRST_HALF', 'STATUS_SECOND_HALF'),
+            })
+        return games
+    except Exception as e:
+        print(f"   ESPN scoreboard error ({espn_path}): {e}")
+        return []
+
+
+def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
+                         sport: str, game_name: str, kalshi_api, ob: dict = None) -> Optional[Dict]:
+    """Buy a resolved market at max size. side = 'yes' or 'no'."""
+    global _order_tracker
+
+    if not AUTO_TRADE_ENABLED:
+        return None
+
+    if _order_tracker.has_position(ticker):
+        return None
+
+    fee = kalshi_fee(price)
+    profit_per = 1.0 - price - fee
+    if profit_per <= 0:
+        return None
+
+    # Get balance for max sizing
+    balance = kalshi_api.get_balance()
+    avail = 0
+    if balance:
+        avail = balance.get('balance', 0) / 100
+    if avail <= 0:
+        return None
+
+    # Calculate max contracts we can afford
+    cost_per = price + fee
+    contracts = int(avail / cost_per) if cost_per > 0 else 0
+    if contracts <= 0:
+        return None
+
+    # If we have the orderbook, limit to available liquidity
+    if ob:
+        ob_data = ob.get('orderbook', {})
+        if side == 'yes':
+            # YES ask comes from NO bids
+            no_bids = ob_data.get('no', [])
+            total_available = sum(qty for p, qty in no_bids if (100 - p) / 100.0 < COMPLETED_PROP_MAX_PRICE)
+        else:
+            # NO ask comes from YES bids
+            yes_bids = ob_data.get('yes', [])
+            total_available = sum(qty for p, qty in yes_bids if (100 - p) / 100.0 < COMPLETED_PROP_MAX_PRICE)
+        contracts = min(contracts, total_available) if total_available > 0 else contracts
+
+    fee_total = math.ceil(0.07 * contracts * price * (1 - price) * 100) / 100
+    total_cost = (price * contracts) + fee_total
+    total_profit = (1.0 * contracts) - total_cost
+
+    if total_profit <= 0:
+        return None
+
+    price_cents = int(round(price * 100))
+
+    print(f"   >>> RESOLVED MARKET: {ticker} {side.upper()} {contracts}x @ ${price:.2f} = ${total_cost:.2f} (profit ${total_profit:.2f}) — {reason}")
+
+    order = kalshi_api.place_order(ticker, side, price_cents, contracts)
+    if order:
+        edge = {
+            'market_type': 'Resolved Market',
+            'sport': sport,
+            'game': game_name,
+            'team': reason,
+            'opposite_team': '',
+            'kalshi_price': price,
+            'kalshi_price_after_fees': price + fee,
+            'kalshi_prob_after_fees': (price + fee) * 100,
+            'kalshi_method': f"{side.upper()} on {ticker}",
+            'kalshi_ticker': ticker,
+            'kalshi_side': side,
+            'fanduel_opposite_team': reason,
+            'fanduel_opposite_odds': 0,
+            'fanduel_opposite_prob': 0,
+            'total_implied_prob': (price + fee) * 100,
+            'arbitrage_profit': profit_per / (price + fee) * 100,
+            'is_live': True,
+            'is_completed_prop': True,
+            'recommendation': f"BUY {side.upper()} {ticker} at ${price:.2f} — {reason}",
+        }
+        send_telegram_notification(edge)
+        order_info = {
+            'ticker': ticker,
+            'side': side,
+            'price': price,
+            'fee': fee_total,
+            'contracts': contracts,
+            'cost': total_cost,
+            'potential_profit': total_profit,
+            'edge_pct': profit_per / (price + fee) * 100,
+            'sport': sport,
+            'market_type': 'Resolved Market',
+            'game': game_name,
+            'team': reason,
+            'recommendation': f"{side.upper()} {ticker} — {reason}",
+            'timestamp': datetime.utcnow().isoformat(),
+            'order_id': order.get('order_id', ''),
+            'status': order.get('status', 'unknown'),
+        }
+        _order_tracker.add_order(ticker, order_info)
+        send_order_telegram(order_info, 'RESOLVED MARKET')
+        return order_info
+    return None
+
+
+def find_resolved_game_markets(kalshi_api) -> List[Dict]:
+    """Find game-level markets (ML, totals, spreads) where the outcome is already known.
+    - FINAL games: ML winner known, total known, spread result known
+    - LIVE games: if current total already exceeds the over line, Over is guaranteed
+    """
+    edges = []
+    date_strs = _get_today_date_strs()
+
+    for sport_key, config in RESOLVED_GAME_SPORTS.items():
+        espn_path = config['espn_path']
+        display = config['display']
+
+        game_scores = _get_game_scores(espn_path)
+        if not game_scores:
+            continue
+
+        final_games = [g for g in game_scores if g['is_final']]
+        live_games = [g for g in game_scores if g['is_live']]
+
+        if not final_games and not live_games:
+            continue
+
+        print(f"   {display}: {len(final_games)} final, {len(live_games)} live games")
+
+        # Build lookup: team_abbrev -> game info
+        all_relevant = final_games + live_games
+        abbrev_to_game = {}
+        for g in all_relevant:
+            abbrev_to_game[g['home']] = g
+            abbrev_to_game[g['away']] = g
+
+        # --- MONEYLINE: buy winner on final games ---
+        for ml_series in config.get('ml_series', []):
+            kalshi_markets = kalshi_api.get_markets(ml_series)
+            today_markets = [m for m in kalshi_markets
+                             if any(ds in m.get('ticker', '') for ds in date_strs)]
+
+            for m in today_markets:
+                ticker = m.get('ticker', '')
+                # Extract team abbrev from last segment: KXNBAGAME-26JAN31ATLIND-ATL -> ATL
+                parts = ticker.split('-')
+                if len(parts) < 3:
+                    continue
+                team_abbr = parts[-1]
+                game_part = parts[1]
+                date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
+
+                # Find matching game
+                game = None
+                for abbr in abbrev_to_game:
+                    if abbr in date_stripped:
+                        candidate = abbrev_to_game[abbr]
+                        if candidate['is_final']:
+                            game = candidate
+                            break
+                if not game:
+                    continue
+
+                # Is this team the winner?
+                is_winner = (team_abbr == game['winner'])
+
+                ob = kalshi_api.get_orderbook(ticker)
+                if not ob:
+                    continue
+                time.sleep(0.2)
+
+                if is_winner:
+                    # Buy YES on the winner
+                    yes_price = get_best_yes_price(ob)
+                    if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
+                        reason = f"{game['winner']} beat {game['loser']} {game['home_score'] if game['winner'] == game['home'] else game['away_score']}-{game['away_score'] if game['winner'] == game['home'] else game['home_score']} (FINAL)"
+                        result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
+                                                       display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                        if result:
+                            edges.append(result)
+                else:
+                    # Buy NO on the loser (they lost, so NO pays out)
+                    no_price = get_best_no_price(ob)
+                    if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
+                        reason = f"{team_abbr} lost to {game['winner']} (FINAL)"
+                        result = _buy_resolved_market(ticker, 'no', no_price, reason,
+                                                       display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                        if result:
+                            edges.append(result)
+
+        # --- TOTALS: Over guaranteed if current score > line (live or final) ---
+        for total_series in config.get('total_series', []):
+            kalshi_markets = kalshi_api.get_markets(total_series)
+            today_markets = [m for m in kalshi_markets
+                             if any(ds in m.get('ticker', '') for ds in date_strs)]
+
+            for m in today_markets:
+                ticker = m.get('ticker', '')
+                parts = ticker.split('-')
+                if len(parts) < 3:
+                    continue
+
+                # Extract line from last segment or floor_strike
+                floor_strike = m.get('floor_strike')
+                if floor_strike is None:
+                    try:
+                        floor_strike = float(parts[-1]) + 0.5
+                    except ValueError:
+                        continue
+                floor_strike = float(floor_strike)
+
+                game_part = parts[1]
+                date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
+
+                # Find matching game
+                game = None
+                for abbr in abbrev_to_game:
+                    if abbr in date_stripped:
+                        game = abbrev_to_game[abbr]
+                        break
+                if not game:
+                    continue
+
+                actual_total = game['total']
+
+                # For LIVE games: Over is guaranteed if score already exceeds line
+                # For FINAL games: we know the exact result
+                if game['is_live'] and actual_total > floor_strike:
+                    # Over is guaranteed — current total already exceeds the line
+                    ob = kalshi_api.get_orderbook(ticker)
+                    if not ob:
+                        continue
+                    time.sleep(0.2)
+                    yes_price = get_best_yes_price(ob)
+                    if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
+                        reason = f"Over {floor_strike} GUARANTEED — current total {actual_total} (LIVE)"
+                        result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
+                                                       display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                        if result:
+                            edges.append(result)
+
+                elif game['is_final']:
+                    ob = kalshi_api.get_orderbook(ticker)
+                    if not ob:
+                        continue
+                    time.sleep(0.2)
+                    if actual_total > floor_strike:
+                        # Over hit
+                        yes_price = get_best_yes_price(ob)
+                        if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
+                            reason = f"Over {floor_strike} — final total {actual_total} (FINAL)"
+                            result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
+                                                           display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                            if result:
+                                edges.append(result)
+                    elif actual_total < floor_strike:
+                        # Under hit
+                        no_price = get_best_no_price(ob)
+                        if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
+                            reason = f"Under {floor_strike} — final total {actual_total} (FINAL)"
+                            result = _buy_resolved_market(ticker, 'no', no_price, reason,
+                                                           display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                            if result:
+                                edges.append(result)
+
+        # --- SPREADS: only on FINAL games where margin is known ---
+        for spread_series in config.get('spread_series', []):
+            kalshi_markets = kalshi_api.get_markets(spread_series)
+            today_markets = [m for m in kalshi_markets
+                             if any(ds in m.get('ticker', '') for ds in date_strs)]
+
+            for m in today_markets:
+                ticker = m.get('ticker', '')
+                title = m.get('title', '')
+                parts = ticker.split('-')
+                if len(parts) < 3:
+                    continue
+
+                # Extract spread line from floor_strike or ticker
+                floor_strike = m.get('floor_strike')
+                if floor_strike is None:
+                    try:
+                        floor_strike = float(parts[-1]) + 0.5
+                    except ValueError:
+                        continue
+                floor_strike = float(floor_strike)
+
+                game_part = parts[1]
+                date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
+
+                # Find matching FINAL game
+                game = None
+                for abbr in abbrev_to_game:
+                    if abbr in date_stripped:
+                        candidate = abbrev_to_game[abbr]
+                        if candidate['is_final']:
+                            game = candidate
+                            break
+                if not game:
+                    continue
+
+                # Determine which team the spread applies to from the title
+                # Title format: "Team A -5.5" or "Home team by X+"
+                # The floor_strike is the spread line; YES = favorite covers
+                # In Kalshi spread markets, YES typically means the favorite covers
+                # We need to figure out which team from the title
+                actual_margin = game['home_margin']  # positive = home won by X
+
+                # Check if home or away team is in the title
+                home_in_title = game['home'] in (title or ticker)
+                away_in_title = game['away'] in (title or ticker)
+
+                # The spread market: YES = the named team covers the spread
+                # floor_strike is the spread line (e.g., -5.5 means favorite by 6+)
+                # Actual margin relative to the team in the spread
+                if home_in_title and not away_in_title:
+                    team_margin = actual_margin  # home perspective
+                elif away_in_title and not home_in_title:
+                    team_margin = -actual_margin  # away perspective
+                else:
+                    continue  # can't determine which team
+
+                # Did the spread hit? YES = team_margin > floor_strike
+                ob = kalshi_api.get_orderbook(ticker)
+                if not ob:
+                    continue
+                time.sleep(0.2)
+
+                if team_margin > floor_strike:
+                    # Spread covered - YES wins
+                    yes_price = get_best_yes_price(ob)
+                    if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
+                        reason = f"Spread covered — margin {team_margin} > {floor_strike} (FINAL)"
+                        result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
+                                                       display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                        if result:
+                            edges.append(result)
+                elif team_margin < floor_strike:
+                    # Spread NOT covered - NO wins
+                    no_price = get_best_no_price(ob)
+                    if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
+                        reason = f"Spread missed — margin {team_margin} < {floor_strike} (FINAL)"
+                        result = _buy_resolved_market(ticker, 'no', no_price, reason,
+                                                       display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                        if result:
+                            edges.append(result)
+
+    return edges
+
+
+def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
+    """Find Bitcoin/crypto markets where the price is already known.
+    e.g., 'Bitcoin above $80,000 on Jan 31' when the date has passed."""
+    edges = []
+
+    # Get current BTC price
+    try:
+        resp = requests.get(
+            'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd',
+            timeout=10
+        )
+        resp.raise_for_status()
+        btc_price = resp.json().get('bitcoin', {}).get('usd', 0)
+    except Exception as e:
+        print(f"   CoinGecko error: {e}")
+        return edges
+
+    if not btc_price:
+        return edges
+
+    print(f"   Bitcoin price: ${btc_price:,.0f}")
+
+    date_strs = _get_today_date_strs()
+    now_utc = datetime.now(timezone.utc)
+
+    for series in CRYPTO_SERIES:
+        kalshi_markets = kalshi_api.get_markets(series)
+        if not kalshi_markets:
+            continue
+
+        for m in kalshi_markets:
+            ticker = m.get('ticker', '')
+            title = m.get('title', '') or ''
+            close_time = m.get('close_time', '') or m.get('expiration_time', '') or ''
+
+            # Only look at markets that have expired or close soon
+            # (the outcome is determined by a specific time that has passed)
+            if close_time:
+                try:
+                    ct = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
+                    if ct > now_utc:
+                        continue  # Market hasn't expired yet — outcome not determined
+                except Exception:
+                    pass
+
+            # Parse the threshold from floor_strike or title
+            floor_strike = m.get('floor_strike')
+            if floor_strike is not None:
+                threshold = float(floor_strike)
+            else:
+                # Try to parse from title: "Bitcoin above $80,000"
+                price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', title)
+                if price_match:
+                    try:
+                        threshold = float(price_match.group(1).replace(',', ''))
+                    except ValueError:
+                        continue
+                else:
+                    continue
+
+            # Determine outcome
+            ob = kalshi_api.get_orderbook(ticker)
+            if not ob:
+                continue
+            time.sleep(0.2)
+
+            if btc_price > threshold:
+                # Price is above threshold — YES wins
+                yes_price = get_best_yes_price(ob)
+                if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
+                    reason = f"BTC ${btc_price:,.0f} > ${threshold:,.0f} (resolved)"
+                    result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
+                                                   'Crypto', f"BTC > ${threshold:,.0f}", kalshi_api, ob)
+                    if result:
+                        edges.append(result)
+            elif btc_price < threshold:
+                # Price is below threshold — NO wins
+                no_price = get_best_no_price(ob)
+                if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
+                    reason = f"BTC ${btc_price:,.0f} < ${threshold:,.0f} (resolved)"
+                    result = _buy_resolved_market(ticker, 'no', no_price, reason,
+                                                   'Crypto', f"BTC vs ${threshold:,.0f}", kalshi_api, ob)
+                    if result:
+                        edges.append(result)
+
+    return edges
+
+
+def find_resolved_econ_markets(kalshi_api) -> List[Dict]:
+    """Find economic data markets where the number has already been released.
+    Uses BLS API for CPI data. Scans Kalshi CPI/inflation series."""
+    edges = []
+
+    # Fetch latest CPI from BLS (free, no auth)
+    try:
+        resp = requests.get(
+            'https://api.bls.gov/publicAPI/v1/timeseries/data/CUSR0000SA0?latest=true',
+            timeout=15
+        )
+        resp.raise_for_status()
+        bls_data = resp.json()
+        cpi_observations = bls_data.get('Results', {}).get('series', [{}])[0].get('data', [])
+    except Exception as e:
+        print(f"   BLS API error: {e}")
+        return edges
+
+    if not cpi_observations:
+        return edges
+
+    # Get latest CPI and compute YoY change
+    latest_cpi = None
+    prev_year_cpi = None
+    for obs in cpi_observations:
+        val = obs.get('value', '')
+        if val and val != '-':
+            if latest_cpi is None:
+                latest_cpi = float(val)
+                latest_period = f"{obs['year']}-{obs['period']}"
+            elif prev_year_cpi is None:
+                # This might not be exactly 12 months ago, but BLS returns in order
+                prev_year_cpi = float(val)
+
+    if not latest_cpi:
+        return edges
+
+    # Calculate YoY % change if we have prior year data
+    # BLS only returns latest with v1 — for YoY we'd need more data
+    # For now, just report the CPI level
+    print(f"   Latest CPI: {latest_cpi} ({latest_period})")
+
+    # Scan Kalshi CPI/inflation series
+    cpi_series = ['KXCPI', 'KXCPIYOY', 'KXINFLATION']
+    now_utc = datetime.now(timezone.utc)
+
+    for series in cpi_series:
+        kalshi_markets = kalshi_api.get_markets(series)
+        if not kalshi_markets:
+            continue
+
+        for m in kalshi_markets:
+            ticker = m.get('ticker', '')
+            title = m.get('title', '') or ''
+            close_time = m.get('close_time', '') or m.get('expiration_time', '') or ''
+
+            # Only resolved markets (close time passed)
+            if close_time:
+                try:
+                    ct = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
+                    if ct > now_utc:
+                        continue
+                except Exception:
+                    pass
+
+            floor_strike = m.get('floor_strike')
+            if floor_strike is None:
+                continue
+
+            threshold = float(floor_strike)
+
+            ob = kalshi_api.get_orderbook(ticker)
+            if not ob:
+                continue
+            time.sleep(0.2)
+
+            if latest_cpi > threshold:
+                yes_price = get_best_yes_price(ob)
+                if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
+                    reason = f"CPI {latest_cpi} > {threshold} (released)"
+                    result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
+                                                   'Econ', f"CPI vs {threshold}", kalshi_api, ob)
+                    if result:
+                        edges.append(result)
+            elif latest_cpi < threshold:
+                no_price = get_best_no_price(ob)
+                if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
+                    reason = f"CPI {latest_cpi} < {threshold} (released)"
+                    result = _buy_resolved_market(ticker, 'no', no_price, reason,
+                                                   'Econ', f"CPI vs {threshold}", kalshi_api, ob)
+                    if result:
+                        edges.append(result)
+
+    return edges
+
+
+def find_all_resolved_markets(kalshi_api) -> List[Dict]:
+    """Master function: find ALL Kalshi markets with known outcomes."""
+    all_resolved = []
+
+    # 1. Completed game markets (ML, totals, spreads)
+    print(f"   Scanning resolved game markets...")
+    game_resolved = find_resolved_game_markets(kalshi_api)
+    all_resolved.extend(game_resolved)
+    print(f"   Game markets: {len(game_resolved)} resolved")
+
+    # 2. Completed player props (existing function)
+    # (already called separately in scan_all_sports)
+
+    # 3. Bitcoin/crypto markets
+    print(f"   Scanning resolved crypto markets...")
+    crypto_resolved = find_resolved_crypto_markets(kalshi_api)
+    all_resolved.extend(crypto_resolved)
+    print(f"   Crypto markets: {len(crypto_resolved)} resolved")
+
+    # 4. Economic data markets
+    print(f"   Scanning resolved economic data markets...")
+    econ_resolved = find_resolved_econ_markets(kalshi_api)
+    all_resolved.extend(econ_resolved)
+    print(f"   Econ markets: {len(econ_resolved)} resolved")
+
+    return all_resolved
+
+
+# ============================================================
 # MAIN SCANNER
 # ============================================================
 
@@ -2645,7 +3285,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         print(f"   {name}: {len(edges)} edges")
         time.sleep(1.0)
 
-    # 7. Live stat arbitrage — buy completed NBA props
+    # 7. Live stat arbitrage — buy completed player props
     print(f"\n--- Completed Props (Live Stat Arb) ---")
     sports_scanned.append('Live Props')
     completed = find_completed_props(kalshi_api)
@@ -2653,6 +3293,15 @@ def scan_all_sports(kalshi_api, fanduel_api):
         sports_with_games.append('Live Props')
     all_edges.extend(completed)
     print(f"   Completed props: {len(completed)} opportunities")
+
+    # 8. Resolved markets — game results, crypto prices, economic data
+    print(f"\n--- Resolved Markets (Known Outcomes) ---")
+    sports_scanned.append('Resolved')
+    resolved = find_all_resolved_markets(kalshi_api)
+    if resolved:
+        sports_with_games.append('Resolved')
+    all_edges.extend(resolved)
+    print(f"   Resolved markets: {len(resolved)} opportunities")
 
     print(f"\n{'='*60}")
     print(f"SCAN COMPLETE")
