@@ -2972,9 +2972,11 @@ def _get_game_scores(espn_path: str, is_soccer: bool = False) -> List[Dict]:
         return []
 
 
+RESOLVED_MAX_WIN = 5.00  # Max profit target per resolved market ($5 during testing)
+
 def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
                          sport: str, game_name: str, kalshi_api, ob: dict = None) -> Optional[Dict]:
-    """Buy a resolved market at max size. side = 'yes' or 'no'."""
+    """Buy a resolved market capped at RESOLVED_MAX_WIN profit. side = 'yes' or 'no'."""
     global _order_tracker
 
     if not AUTO_TRADE_ENABLED:
@@ -3003,6 +3005,11 @@ def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
     contracts = int(avail / cost_per) if cost_per > 0 else 0
     if contracts <= 0:
         return None
+
+    # Cap contracts so max profit doesn't exceed RESOLVED_MAX_WIN
+    if profit_per > 0:
+        max_contracts_for_cap = int(RESOLVED_MAX_WIN / profit_per)
+        contracts = min(contracts, max(1, max_contracts_for_cap))
 
     # If we have the orderbook, limit to available liquidity
     if ob:
@@ -3780,6 +3787,506 @@ def find_resolved_econ_markets(kalshi_api) -> List[Dict]:
     return edges
 
 
+# ============================================================
+# WEATHER TEMPERATURE SCANNER
+# ============================================================
+
+# NWS station -> Kalshi series mapping
+# NWS settles next morning; if current/observed high is already above a threshold, YES is locked in
+WEATHER_MARKETS = {
+    'KXHIGHNY': {
+        'station': 'KNYC',   # Central Park, NYC
+        'display': 'NYC High Temp',
+    },
+    'KXHIGHLAX': {
+        'station': 'KLAX',   # LA International
+        'display': 'LA High Temp',
+    },
+}
+
+
+def _get_nws_observed_high(station: str) -> Optional[float]:
+    """Get the observed high temperature (°F) from NWS for today.
+    Returns the max of current temp and any reported max temp fields."""
+    try:
+        resp = requests.get(
+            f'https://api.weather.gov/stations/{station}/observations/latest',
+            headers={'User-Agent': 'KalshiEdgeFinder/1.0'},
+            timeout=15
+        )
+        resp.raise_for_status()
+        props = resp.json().get('properties', {})
+
+        temps_f = []
+
+        # Current temperature
+        temp_c = props.get('temperature', {}).get('value')
+        if temp_c is not None:
+            temps_f.append(temp_c * 9 / 5 + 32)
+
+        # Max temperature since 7am (if reported)
+        max_since7 = props.get('maxTemperatureSince7Am', {}).get('value') if props.get('maxTemperatureSince7Am') else None
+        if max_since7 is not None:
+            temps_f.append(max_since7 * 9 / 5 + 32)
+
+        # Max temperature last 24 hours
+        max_24h = props.get('maxTemperatureLast24Hours', {}).get('value') if props.get('maxTemperatureLast24Hours') else None
+        if max_24h is not None:
+            temps_f.append(max_24h * 9 / 5 + 32)
+
+        if temps_f:
+            return max(temps_f)
+        return None
+    except Exception as e:
+        print(f"   NWS {station} error: {e}")
+        return None
+
+
+def find_resolved_weather_markets(kalshi_api) -> List[Dict]:
+    """Find weather temperature markets where outcome is already known.
+
+    Strategy: The daily high temperature can only go UP during the day.
+    If the observed high is already 45°F, then 'above 40°F' is guaranteed YES.
+    Kalshi settles next morning from NWS report, so there's a multi-hour window.
+
+    After ~3 PM local, the high is essentially locked in (temp usually drops).
+    Before 3 PM, we only bet on thresholds well below the current observed high.
+    """
+    edges = []
+
+    now_et = _get_eastern_now()
+    hour_et = now_et.hour
+
+    for series, config in WEATHER_MARKETS.items():
+        station = config['station']
+        display = config['display']
+
+        observed_high = _get_nws_observed_high(station)
+        if observed_high is None:
+            print(f"   {display}: no temperature data from {station}")
+            continue
+
+        print(f"   {display}: observed high {observed_high:.1f}°F (station {station})")
+
+        # Buffer: how far below the observed high a threshold must be to be "safe"
+        # After 3 PM local, the high is basically set (1°F buffer)
+        # Before 3 PM, we need more buffer since temp could still rise
+        if hour_et >= 18:      # 6 PM+: day is over, high is final
+            buffer_f = 0
+        elif hour_et >= 15:    # 3 PM - 6 PM: high is likely set
+            buffer_f = 1
+        elif hour_et >= 12:    # noon - 3 PM: still warming
+            buffer_f = 3
+        else:                  # morning: too early, big buffer
+            buffer_f = 6
+
+        # The "safe high" is the observed high minus buffer
+        safe_high = observed_high - buffer_f
+
+        kalshi_markets = kalshi_api.get_markets(series)
+        if not kalshi_markets:
+            continue
+
+        print(f"   {display}: {len(kalshi_markets)} markets, safe_high={safe_high:.0f}°F (buffer={buffer_f}°F)")
+
+        checked = 0
+        for m in kalshi_markets:
+            ticker = m.get('ticker', '')
+            title = (m.get('title', '') or '').lower()
+            floor_strike = m.get('floor_strike')
+            cap_strike = m.get('cap_strike')
+
+            # Determine threshold from strikes or title
+            is_above = 'above' in title or 'or more' in title or 'or higher' in title
+            is_below = 'below' in title or 'or less' in title or 'or lower' in title
+            is_range = (' to ' in title or ' - ' in title) and not is_above and not is_below
+
+            if is_range and floor_strike is not None and cap_strike is not None:
+                range_low = float(floor_strike)
+                range_high = float(cap_strike)
+                if safe_high > range_high:
+                    # Observed high is above the range top — NO wins (high won't be in this range)
+                    # Actually: the high COULD be in this range if it hasn't peaked yet
+                    # But we only bet NO on ranges that are BELOW the safe_high
+                    # Wait — "highest temp in range X-Y" means the daily high falls in [X,Y]
+                    # If observed high is already above Y, the daily high is >= observed > Y
+                    # So the high is NOT in range [X,Y] — NO wins
+                    side = 'no'
+                    reason_detail = f"Observed high {observed_high:.0f}°F > range {range_low:.0f}-{range_high:.0f}°F"
+                elif safe_high < range_low:
+                    # Temp hasn't reached range_low — can't bet YES (might not reach it)
+                    # Could bet NO if we're confident temp won't reach range — skip for safety
+                    continue
+                else:
+                    continue  # In range, uncertain
+            elif is_above or (floor_strike is not None and not is_below and not is_range):
+                threshold = float(floor_strike) if floor_strike is not None else None
+                if threshold is None:
+                    temp_match = re.search(r'(\d+)', title)
+                    if temp_match:
+                        threshold = float(temp_match.group(1))
+                if threshold is None:
+                    continue
+
+                if safe_high >= threshold:
+                    side = 'yes'
+                    reason_detail = f"Observed {observed_high:.0f}°F >= {threshold:.0f}°F threshold"
+                else:
+                    continue  # Not safe to bet
+            elif is_below:
+                threshold = float(floor_strike) if floor_strike is not None else None
+                if threshold is None:
+                    continue
+                if safe_high >= threshold:
+                    # High is already above the "below X" threshold, so NO wins
+                    side = 'no'
+                    reason_detail = f"Observed {observed_high:.0f}°F >= {threshold:.0f}°F (below market)"
+                else:
+                    continue
+            else:
+                continue
+
+            checked += 1
+            ob = kalshi_api.get_orderbook(ticker)
+            if not ob:
+                continue
+            time.sleep(0.15)
+
+            if side == 'yes':
+                ask_price = get_best_yes_price(ob)
+            else:
+                ask_price = get_best_no_price(ob)
+
+            if ask_price and ask_price < COMPLETED_PROP_MAX_PRICE:
+                reason = f"{reason_detail} ({display}, buffer {buffer_f}°F)"
+                result = _buy_resolved_market(ticker, side, ask_price, reason,
+                                               'Weather', display, kalshi_api, ob)
+                if result:
+                    edges.append(result)
+
+        print(f"   {display}: {checked} checked")
+        time.sleep(0.5)
+
+    return edges
+
+
+# ============================================================
+# S&P 500 / NASDAQ SNIPER
+# ============================================================
+
+# Index price configs: Yahoo Finance symbol -> Kalshi series list
+INDEX_SNIPER_CONFIG = {
+    '^GSPC': {  # S&P 500
+        'series': ['KXINX', 'KXINXU'],
+        'display': 'S&P 500',
+    },
+    '^NDX': {   # Nasdaq-100
+        'series': ['KXNASDAQ100', 'KXNASDAQ100U'],
+        'display': 'Nasdaq-100',
+    },
+}
+
+
+def _get_stock_price(symbol: str) -> Optional[float]:
+    """Get current stock/index price from Yahoo Finance."""
+    try:
+        resp = requests.get(
+            f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}',
+            params={'interval': '1m', 'range': '1d'},
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        result = data.get('chart', {}).get('result', [])
+        if result:
+            meta = result[0].get('meta', {})
+            price = meta.get('regularMarketPrice')
+            if price and price > 0:
+                return float(price)
+    except Exception as e:
+        print(f"   Yahoo Finance {symbol} error: {e}")
+    return None
+
+
+def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> List[Dict]:
+    """Find stock index markets where the outcome is already determined or nearly certain.
+    Same logic as crypto scanner but for S&P 500 and Nasdaq-100.
+
+    buffer_override: if set, use this fixed buffer % instead of time-based.
+                     Used by the index sniper for tighter buffers near close.
+    """
+    edges = []
+    now_utc = datetime.now(timezone.utc)
+    now_et = _get_eastern_now()
+
+    # Stock market hours: 9:30 AM - 4:00 PM ET
+    market_open = now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)
+    market_close_time = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    minutes_to_market_close = (market_close_time - now_et).total_seconds() / 60.0
+
+    if not market_open or minutes_to_market_close < -30:
+        return edges  # Market not open or already closed long ago
+
+    for symbol, config in INDEX_SNIPER_CONFIG.items():
+        price = _get_stock_price(symbol)
+        if not price:
+            continue
+        display = config['display']
+        print(f"   {display}: ${price:,.2f}")
+
+        for series in config['series']:
+            kalshi_markets = kalshi_api.get_markets(series)
+            if not kalshi_markets:
+                continue
+
+            print(f"   Scanning {series}: {len(kalshi_markets)} markets")
+
+            skipped_buffer = 0
+            skipped_no_threshold = 0
+            checked = 0
+
+            for m in kalshi_markets:
+                ticker = m.get('ticker', '')
+                title = (m.get('title', '') or '').lower()
+                floor_strike = m.get('floor_strike')
+                cap_strike = m.get('cap_strike')
+
+                # Parse close time from market
+                close_time = (m.get('close_time', '') or m.get('expiration_time', '') or
+                             m.get('expected_expiration_time', '') or '')
+                minutes_to_close = None
+                is_expired = False
+                if close_time:
+                    try:
+                        ct = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
+                        remaining = (ct - now_utc).total_seconds() / 60.0
+                        if remaining <= 0:
+                            is_expired = True
+                            minutes_to_close = 0
+                        else:
+                            minutes_to_close = remaining
+                    except Exception:
+                        pass
+
+                # Skip markets closing > 60 min from now (too much can change)
+                if minutes_to_close is not None and minutes_to_close > 60 and not is_expired:
+                    continue
+                if minutes_to_close is None and not is_expired:
+                    continue
+
+                # Buffer: S&P moves ~0.3% per hour normally, tail risk ~1%
+                if buffer_override is not None:
+                    required_buffer = 0 if is_expired else buffer_override
+                else:
+                    required_buffer = 0.02  # default 2%
+                    if is_expired:
+                        required_buffer = 0
+                    elif minutes_to_close is not None:
+                        if minutes_to_close <= 2:
+                            required_buffer = 0.001  # 0.1%
+                        elif minutes_to_close <= 5:
+                            required_buffer = 0.003  # 0.3%
+                        elif minutes_to_close <= 15:
+                            required_buffer = 0.005  # 0.5%
+                        elif minutes_to_close <= 30:
+                            required_buffer = 0.008  # 0.8%
+                        elif minutes_to_close <= 60:
+                            required_buffer = 0.012  # 1.2%
+
+                # Parse market type (same logic as crypto)
+                is_above = 'above' in title or 'or more' in title or 'or higher' in title
+                is_below = 'below' in title or 'or less' in title or 'or lower' in title
+                is_range = (' to ' in title or ' - ' in title) and not is_above and not is_below
+
+                if is_range or (cap_strike is not None and floor_strike is not None
+                               and float(cap_strike) != float(floor_strike) and not is_above and not is_below):
+                    if floor_strike is None or cap_strike is None:
+                        skipped_no_threshold += 1
+                        continue
+                    range_low = float(floor_strike)
+                    range_high = float(cap_strike)
+                    if range_low <= 0 or range_high <= 0:
+                        skipped_no_threshold += 1
+                        continue
+                    if price > range_high:
+                        buffer_pct = (price - range_high) / price
+                        if buffer_pct < required_buffer:
+                            skipped_buffer += 1
+                            continue
+                        side = 'no'
+                        reason_detail = f"${price:,.0f} above range ${range_low:,.0f}-${range_high:,.0f}"
+                    elif price < range_low:
+                        buffer_pct = (range_low - price) / price
+                        if buffer_pct < required_buffer:
+                            skipped_buffer += 1
+                            continue
+                        side = 'no'
+                        reason_detail = f"${price:,.0f} below range ${range_low:,.0f}-${range_high:,.0f}"
+                    else:
+                        if not is_expired:
+                            skipped_buffer += 1
+                            continue
+                        side = 'yes'
+                        buffer_pct = min(
+                            (price - range_low) / price,
+                            (range_high - price) / price
+                        )
+                        reason_detail = f"${price:,.0f} IN range ${range_low:,.0f}-${range_high:,.0f}"
+                else:
+                    if floor_strike is not None:
+                        threshold = float(floor_strike)
+                    else:
+                        price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', title)
+                        if price_match:
+                            try:
+                                threshold = float(price_match.group(1).replace(',', ''))
+                            except ValueError:
+                                skipped_no_threshold += 1
+                                continue
+                        else:
+                            skipped_no_threshold += 1
+                            continue
+
+                    if threshold <= 0:
+                        skipped_no_threshold += 1
+                        continue
+
+                    buffer_pct = abs(price - threshold) / price
+                    if buffer_pct < required_buffer:
+                        skipped_buffer += 1
+                        continue
+
+                    if is_below:
+                        if price < threshold:
+                            side = 'yes'
+                            reason_detail = f"${price:,.0f} < ${threshold:,.0f} (below market)"
+                        else:
+                            side = 'no'
+                            reason_detail = f"${price:,.0f} > ${threshold:,.0f} (below market, NO wins)"
+                    else:
+                        if price > threshold:
+                            side = 'yes'
+                            reason_detail = f"${price:,.0f} > ${threshold:,.0f}"
+                        else:
+                            side = 'no'
+                            reason_detail = f"${price:,.0f} < ${threshold:,.0f}"
+
+                checked += 1
+                time_str = f"{minutes_to_close:.0f}min left" if minutes_to_close and not is_expired else "EXPIRED"
+
+                ob = kalshi_api.get_orderbook(ticker)
+                if not ob:
+                    continue
+                time.sleep(0.15)
+
+                if side == 'yes':
+                    ask_price = get_best_yes_price(ob)
+                else:
+                    ask_price = get_best_no_price(ob)
+
+                if ask_price and ask_price < COMPLETED_PROP_MAX_PRICE:
+                    reason = f"{reason_detail} ({time_str}, buffer {buffer_pct:.1%})"
+                    result = _buy_resolved_market(ticker, side, ask_price, reason,
+                                                   display, reason_detail, kalshi_api, ob)
+                    if result:
+                        edges.append(result)
+
+            print(f"   {series} filter: {skipped_buffer} buffer, {skipped_no_threshold} no-threshold, {checked} checked")
+            time.sleep(0.5)
+
+    return edges
+
+
+def _index_sniper_loop():
+    """Dedicated thread that scans S&P 500 / Nasdaq markets at precise times before market close (4 PM ET).
+    Same concept as crypto sniper but for stock indices."""
+    time.sleep(60)
+    print("Index sniper thread started")
+
+    while True:
+        try:
+            now_et = _get_eastern_now()
+
+            # Calculate next market close (4:00 PM ET today or tomorrow)
+            today_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+            if now_et >= today_close + timedelta(minutes=5):
+                # Already past today's close, wait for tomorrow
+                tomorrow = now_et + timedelta(days=1)
+                # Skip weekends
+                while tomorrow.weekday() >= 5:  # 5=Saturday, 6=Sunday
+                    tomorrow += timedelta(days=1)
+                next_close = tomorrow.replace(hour=16, minute=0, second=0, microsecond=0)
+            else:
+                next_close = today_close
+                # If it's a weekend, skip
+                if now_et.weekday() >= 5:
+                    tomorrow = now_et + timedelta(days=1)
+                    while tomorrow.weekday() >= 5:
+                        tomorrow += timedelta(days=1)
+                    next_close = tomorrow.replace(hour=16, minute=0, second=0, microsecond=0)
+
+            seconds_until_close = (next_close - now_et).total_seconds()
+
+            # Sleep until 90 seconds before close
+            sleep_time = max(0, seconds_until_close - 90)
+            if sleep_time > 0:
+                print(f"   Index sniper: next close {next_close.strftime('%I:%M %p ET %a')}, "
+                      f"sleeping {sleep_time/60:.1f}min")
+                time.sleep(sleep_time)
+
+            # Only run during market hours on weekdays
+            now_et = _get_eastern_now()
+            if now_et.weekday() >= 5:
+                time.sleep(60)
+                continue
+
+            kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+
+            # S&P moves ~0.1% in 90 seconds. Use tight buffers.
+            scan_schedule = [
+                (90, 0.0008),   # 90s out: 0.08% buffer
+                (60, 0.0005),   # 60s out: 0.05% buffer
+                (15, 0.0001),   # 15s out: 0.01% buffer
+            ]
+
+            for i, (target_secs, sniper_buffer) in enumerate(scan_schedule):
+                now_et = _get_eastern_now()
+                secs_left = (next_close - now_et).total_seconds()
+
+                if secs_left < -30:
+                    break
+
+                scan_label = f"{secs_left:.0f}s before close" if secs_left > 0 else "EXPIRED"
+                print(f"   Index sniper scan {i+1}/3 ({scan_label}, buffer={sniper_buffer:.3%}):")
+
+                results = find_resolved_index_markets(kalshi, buffer_override=sniper_buffer)
+                if results:
+                    print(f"   Index sniper: {len(results)} edges found!")
+
+                if i < len(scan_schedule) - 1:
+                    now_et = _get_eastern_now()
+                    secs_left = (next_close - now_et).total_seconds()
+                    next_target = scan_schedule[i + 1][0]
+                    wait = max(1, secs_left - next_target)
+                    time.sleep(wait)
+
+            time.sleep(30)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Index sniper error: {e}")
+            time.sleep(60)
+
+
+def start_index_sniper():
+    """Start the index sniper thread (called once on app boot)."""
+    t = threading.Thread(target=_index_sniper_loop, daemon=True)
+    t.start()
+    print("Index sniper thread launched")
+
+
 def find_all_resolved_markets(kalshi_api) -> List[Dict]:
     """Master function: find ALL Kalshi markets with known outcomes."""
     all_resolved = []
@@ -3806,6 +4313,22 @@ def find_all_resolved_markets(kalshi_api) -> List[Dict]:
     econ_resolved = find_resolved_econ_markets(kalshi_api)
     all_resolved.extend(econ_resolved)
     print(f"   Econ markets: {len(econ_resolved)} resolved")
+    time.sleep(1.0)
+
+    # 5. Weather temperature markets
+    print(f"   Scanning resolved weather markets...")
+    weather_resolved = find_resolved_weather_markets(kalshi_api)
+    all_resolved.extend(weather_resolved)
+    print(f"   Weather markets: {len(weather_resolved)} resolved")
+    time.sleep(1.0)
+
+    # 6. Stock index markets (S&P 500, Nasdaq-100) — also scanned by sniper thread near close
+    now_et = _get_eastern_now()
+    if now_et.weekday() < 5 and 9 <= now_et.hour < 17:
+        print(f"   Scanning resolved index markets...")
+        index_resolved = find_resolved_index_markets(kalshi_api)
+        all_resolved.extend(index_resolved)
+        print(f"   Index markets: {len(index_resolved)} resolved")
 
     return all_resolved
 
@@ -4062,6 +4585,7 @@ def start_crypto_sniper():
 # Start scanner when module loads (gunicorn will call this)
 start_background_scanner()
 start_crypto_sniper()
+start_index_sniper()
 
 
 # ============================================================
