@@ -1148,7 +1148,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         draw_abbrev = None
         team_abbrevs_list = []
         for a in team_markets:
-            if a.upper() == 'DRAW' or a.upper() == 'DRW':
+            if a.upper() in ('DRAW', 'DRW', 'TIE'):
                 draw_abbrev = a
             else:
                 team_abbrevs_list.append(a)
@@ -3144,7 +3144,7 @@ def _find_game_for_ticker(date_stripped: str, abbrev_to_game: dict, team_abbrs: 
 
     # Method 3: Direct team_abbr lookup (for soccer where abbreviations may not
     # appear as substrings in date_stripped due to ESPN/Kalshi abbreviation differences)
-    if team_abbr and team_abbr.upper() not in ('DRAW', 'DRW'):
+    if team_abbr and team_abbr.upper() not in ('DRAW', 'DRW', 'TIE'):
         if team_abbr in abbrev_to_game:
             candidate = abbrev_to_game[team_abbr]
             if (not require_final or candidate['is_final']) and _date_matches(candidate):
@@ -3232,7 +3232,7 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                     continue
 
                 # Is this team the winner? Handle draws for soccer.
-                is_draw_ticker = team_abbr.upper() in ('DRAW', 'DRW')
+                is_draw_ticker = team_abbr.upper() in ('DRAW', 'DRW', 'TIE')
                 is_draw_game = game['winner'] == '' and game['is_final']
                 is_winner = (team_abbr == game['winner'])
 
