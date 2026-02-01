@@ -3965,8 +3965,83 @@ def start_background_scanner():
     print("Background scanner thread launched")
 
 
+def _crypto_sniper_loop():
+    """Dedicated thread that scans crypto markets at precise times before each hourly close.
+
+    Crypto markets (BTC, ETH, SOL, etc.) settle on the hour. The main scan loop
+    runs every ~30s but the full scan takes minutes, so it can easily miss the
+    optimal 1-2 minute window right before close when buffers are smallest.
+
+    This thread sleeps until just before each hourly close, then runs the crypto
+    scanner at 90s, 60s, and 15s before close to maximize the chance of finding
+    cheap markets with known outcomes.
+    """
+    # Wait for initial startup to complete
+    time.sleep(45)
+    print("Crypto sniper thread started")
+
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            # Next close is at the top of the next hour
+            next_close = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            seconds_until_close = (next_close - now).total_seconds()
+
+            # Sleep until 90 seconds before close
+            sleep_time = max(0, seconds_until_close - 90)
+            if sleep_time > 0:
+                next_close_et = next_close.astimezone(ZoneInfo('America/New_York'))
+                print(f"   Crypto sniper: next close {next_close_et.strftime('%I:%M %p ET')}, "
+                      f"sleeping {sleep_time/60:.1f}min")
+                time.sleep(sleep_time)
+
+            # Run 3 scans: at ~90s, ~60s, and ~15s before close
+            kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+            scan_times = [90, 60, 15]  # seconds before close to scan
+
+            for i, target_secs in enumerate(scan_times):
+                now = datetime.now(timezone.utc)
+                secs_left = (next_close - now).total_seconds()
+
+                # If we've passed the close time, do one final expired scan
+                if secs_left < -30:
+                    break
+
+                scan_label = f"{secs_left:.0f}s before close" if secs_left > 0 else "EXPIRED"
+                print(f"   Crypto sniper scan {i+1}/3 ({scan_label}):")
+
+                results = find_resolved_crypto_markets(kalshi)
+                if results:
+                    print(f"   Crypto sniper: {len(results)} edges found!")
+
+                # Sleep until next scan time
+                if i < len(scan_times) - 1:
+                    now = datetime.now(timezone.utc)
+                    secs_left = (next_close - now).total_seconds()
+                    next_target = scan_times[i + 1]
+                    wait = max(1, secs_left - next_target)
+                    time.sleep(wait)
+
+            # After the close window, sleep 30s then let the loop recalculate
+            time.sleep(30)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Crypto sniper error: {e}")
+            time.sleep(60)
+
+
+def start_crypto_sniper():
+    """Start the crypto sniper thread (called once on app boot)."""
+    t = threading.Thread(target=_crypto_sniper_loop, daemon=True)
+    t.start()
+    print("Crypto sniper thread launched")
+
+
 # Start scanner when module loads (gunicorn will call this)
 start_background_scanner()
+start_crypto_sniper()
 
 
 # ============================================================
