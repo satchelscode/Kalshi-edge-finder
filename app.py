@@ -8,6 +8,7 @@ import hashlib
 import threading
 from flask import Flask, render_template, jsonify, request, redirect
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple
 import json
 from difflib import SequenceMatcher
@@ -363,12 +364,17 @@ def is_game_live(commence_time_str: str) -> bool:
         return False
 
 
+def _get_eastern_now() -> datetime:
+    """Get current time in US Eastern (handles EST/EDT automatically)."""
+    return datetime.now(ZoneInfo('America/New_York'))
+
+
 def _get_today_date_strs() -> set:
     """Return date strings for both UTC and US Eastern to handle evening overlap.
-    Kalshi tickers use US dates but UTC can roll to the next day during evening games."""
+    Kalshi tickers use US Eastern dates but UTC can roll to the next day during evening games."""
     now_utc = datetime.now(timezone.utc)
     utc_str = now_utc.strftime('%y%b%d').upper()
-    eastern_str = (now_utc - timedelta(hours=5)).strftime('%y%b%d').upper()
+    eastern_str = _get_eastern_now().strftime('%y%b%d').upper()
     return {utc_str, eastern_str}
 
 
@@ -2195,7 +2201,7 @@ def _get_live_games(espn_path: str) -> List[Dict]:
                 if event_date and len(event_date) >= 10:
                     try:
                         gd = datetime.fromisoformat(event_date.replace('Z', '+00:00'))
-                        gd_eastern = gd - timedelta(hours=5)
+                        gd_eastern = gd.astimezone(ZoneInfo('America/New_York'))
                         game_date_str = gd_eastern.strftime('%y%b%d').upper()
                     except Exception:
                         pass
@@ -2693,8 +2699,8 @@ def _get_game_scores(espn_path: str) -> List[Dict]:
             if event_date and len(event_date) >= 10:
                 try:
                     gd = datetime.fromisoformat(event_date.replace('Z', '+00:00'))
-                    # Convert to US Eastern for the actual game date
-                    gd_eastern = gd - timedelta(hours=5)
+                    # Convert to US Eastern for the actual game date (handles EST/EDT)
+                    gd_eastern = gd.astimezone(ZoneInfo('America/New_York'))
                     game_date_str = gd_eastern.strftime('%y%b%d').upper()
                 except Exception:
                     pass
