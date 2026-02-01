@@ -1620,10 +1620,41 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
                 'game_id': game_id,
             })
 
+    # Build team abbrev -> set of FD game_ids for game verification
+    # Determine which team map to use based on series_ticker
+    prop_team_map = {}
+    if 'NBA' in series_ticker:
+        prop_team_map = NBA_TEAMS
+    elif 'NHL' in series_ticker:
+        prop_team_map = NHL_TEAMS
+    # Build reverse lookup: team full name words -> game_id
+    fd_game_team_abbrs = {}  # game_id -> set of team abbreviation keys
+    for game_id, ginfo in fd_games.items():
+        fd_game_team_abbrs[game_id] = set()
+        for abbr, full_name in prop_team_map.items():
+            if _name_matches(full_name, ginfo.get('home', '')) or _name_matches(full_name, ginfo.get('away', '')):
+                fd_game_team_abbrs[game_id].add(abbr)
+
     for m in today_markets:
         ticker = m.get('ticker', '')
         title = m.get('title', '')
         subtitle = m.get('subtitle', '')
+
+        # Extract game teams from ticker for cross-checking
+        # Ticker: KXNBAPTS-26JAN31SACCHA-PLAYERLINE-N
+        ticker_game_abbrs = set()
+        ticker_parts = ticker.split('-')
+        if len(ticker_parts) >= 2:
+            game_part = ticker_parts[1]
+            date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
+            # Try to split into two known team abbreviations
+            if prop_team_map:
+                team_abbr_set = set(prop_team_map.keys())
+                for i in range(1, len(date_stripped)):
+                    t1, t2 = date_stripped[:i], date_stripped[i:]
+                    if t1 in team_abbr_set and t2 in team_abbr_set:
+                        ticker_game_abbrs = {t1, t2}
+                        break
 
         # Extract player name and line from title: "Nikola Jokic: 25+ points"
         # or from subtitle: "Nikola Jokic: 25+"
@@ -1641,11 +1672,20 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
         for fd_player, fd_entries in fd_lookup.items():
             if _match_player_name(player_name, fd_player):
                 for entry in fd_entries:
+                    # Game verification: if we extracted team abbrs from ticker,
+                    # verify the FD game contains those same teams
+                    if ticker_game_abbrs and entry['game_id'] in fd_game_team_abbrs:
+                        game_abbrs = fd_game_team_abbrs[entry['game_id']]
+                        if not ticker_game_abbrs.issubset(game_abbrs):
+                            continue  # Wrong game — skip this entry
+
                     # FanDuel uses X.5, Kalshi uses X+. "25+" on Kalshi = "Over 24.5" on FanDuel
                     fd_line = entry['point']
-                    # Match if lines are equivalent (Kalshi 25+ ~= FanDuel Over 24.5)
-                    if abs(kalshi_line - (fd_line + 0.5)) <= 1.0:
-                        score = 1.0 - abs(kalshi_line - (fd_line + 0.5))
+                    # Match only if lines are equivalent or very close
+                    # Kalshi 25+ = FD Over 24.5 (diff = 0), allow ±0.5 for rounding
+                    line_diff = abs(kalshi_line - (fd_line + 0.5))
+                    if line_diff <= 0.5:
+                        score = 1.0 - line_diff
                         if score > best_fd_score:
                             best_fd_score = score
                             best_fd_match = entry
@@ -1772,10 +1812,6 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
                 matched_game_id = gid
                 break
 
-        # Fallback: if only one FD game and one Kalshi game, match them
-        if not matched_game_id and len(fd_btts) == 1 and len(game_groups) == 1:
-            matched_game_id = list(fd_btts.keys())[0]
-
         if not matched_game_id or matched_game_id not in fd_btts:
             continue
 
@@ -1892,13 +1928,17 @@ def _tennis_name_matches(kalshi_name: str, fd_name: str) -> bool:
     k_parts = k.split()
     f_parts = f.split()
     if k_parts and f_parts and k_parts[-1] == f_parts[-1]:
-        # Last names match — check first name initial or full match
+        # Last names match — check first name carefully
         if len(k_parts) == 1 or len(f_parts) == 1:
             return True  # Only last name available
         if k_parts[0] == f_parts[0]:
             return True  # First + last match
-        if k_parts[0][0] == f_parts[0][0]:
-            return True  # Initial + last match
+        # Require first 3+ chars match (not just initial) to avoid A. Zverev vs Andrey Zverev
+        if len(k_parts[0]) >= 3 and len(f_parts[0]) >= 3 and k_parts[0][:3] == f_parts[0][:3]:
+            return True  # First 3 chars + last match
+        # One side has initial only (1-2 chars): accept if initial matches
+        if (len(k_parts[0]) <= 2 or len(f_parts[0]) <= 2) and k_parts[0][0] == f_parts[0][0]:
+            return True  # One side is abbreviated, initial match is acceptable
         # Multi-word last names: check last 2 words
         if len(k_parts) >= 2 and len(f_parts) >= 2:
             if k_parts[-2] == f_parts[-2]:
@@ -2407,8 +2447,10 @@ def find_completed_props(kalshi_api) -> List[Dict]:
                 # (e.g., Bam Adebayo 21pts from Jan 31 MIA@CHI matching Feb 1 MIA@CHI ticker)
                 ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
                 ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
+                if not ticker_date_str:
+                    continue  # Require valid date to prevent stale matching
                 player_game_date = all_player_stats[espn_name].get('_game_date', '')
-                if ticker_date_str and player_game_date and ticker_date_str != player_game_date:
+                if player_game_date and ticker_date_str != player_game_date:
                     print(f"   Skipping {player_name}: game date {player_game_date} != ticker date {ticker_date_str}")
                     continue
 
@@ -2717,7 +2759,15 @@ def _get_game_scores(espn_path: str) -> List[Dict]:
             away = teams.get('away', {})
             total = home.get('score', 0) + away.get('score', 0)
             home_margin = home.get('score', 0) - away.get('score', 0)
-            winner = home.get('abbr', '') if home_margin > 0 else away.get('abbr', '')
+            if home_margin > 0:
+                winner = home.get('abbr', '')
+                loser = away.get('abbr', '')
+            elif home_margin < 0:
+                winner = away.get('abbr', '')
+                loser = home.get('abbr', '')
+            else:
+                winner = ''  # Tie — no winner (shouldn't happen in final NBA/NHL)
+                loser = ''
             games.append({
                 'home': home.get('abbr', ''),
                 'away': away.get('abbr', ''),
@@ -2726,7 +2776,7 @@ def _get_game_scores(espn_path: str) -> List[Dict]:
                 'total': total,
                 'home_margin': home_margin,
                 'winner': winner,
-                'loser': away.get('abbr', '') if home_margin > 0 else home.get('abbr', ''),
+                'loser': loser,
                 'status': status,
                 'is_final': status == 'STATUS_FINAL',
                 'is_live': status in ('STATUS_IN_PROGRESS', 'STATUS_END_PERIOD',
@@ -2955,6 +3005,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 # Extract ticker date (e.g. '26FEB01') and team portion (e.g. 'ORLSAS')
                 ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
                 ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
+                if not ticker_date_str:
+                    continue  # Require valid date to prevent stale matching
                 date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
 
                 game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
@@ -3015,6 +3067,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 game_part = parts[1]
                 ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
                 ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
+                if not ticker_date_str:
+                    continue  # Require valid date to prevent stale matching
                 date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
 
                 game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
@@ -3091,6 +3145,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 game_part = parts[1]
                 ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
                 ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
+                if not ticker_date_str:
+                    continue  # Require valid date to prevent stale matching
                 date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
 
                 game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
