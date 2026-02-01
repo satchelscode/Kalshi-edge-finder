@@ -2174,7 +2174,8 @@ def _parse_espn_stat(stat_str: str, parse_type: str, stat_config=None) -> int:
 
 
 def _get_live_games(espn_path: str) -> List[Dict]:
-    """Get currently live games from ESPN scoreboard for any sport."""
+    """Get currently live games from ESPN scoreboard for any sport.
+    Includes game_date_str to prevent matching yesterday's finals to today's markets."""
     try:
         resp = requests.get(
             f'https://site.api.espn.com/apis/site/v2/sports/{espn_path}/scoreboard',
@@ -2188,6 +2189,16 @@ def _get_live_games(espn_path: str) -> List[Dict]:
             if status in ('STATUS_IN_PROGRESS', 'STATUS_FINAL', 'STATUS_END_PERIOD',
                           'STATUS_HALFTIME', 'STATUS_FIRST_HALF', 'STATUS_SECOND_HALF'):
                 game_id = event.get('id', '')
+                # Extract game date from ESPN event
+                game_date_str = ''
+                event_date = event.get('date', '') or ''
+                if event_date and len(event_date) >= 10:
+                    try:
+                        gd = datetime.fromisoformat(event_date.replace('Z', '+00:00'))
+                        gd_eastern = gd - timedelta(hours=5)
+                        game_date_str = gd_eastern.strftime('%y%b%d').upper()
+                    except Exception:
+                        pass
                 competitors = event.get('competitions', [{}])[0].get('competitors', [])
                 teams = {}
                 for c in competitors:
@@ -2198,6 +2209,7 @@ def _get_live_games(espn_path: str) -> List[Dict]:
                     'home': teams.get('home', ''),
                     'away': teams.get('away', ''),
                     'status': status,
+                    'game_date_str': game_date_str,
                 })
         return live_games
     except Exception as e:
@@ -2206,8 +2218,9 @@ def _get_live_games(espn_path: str) -> List[Dict]:
 
 
 def _get_box_score(game_id: str, espn_path: str, sport_config: dict,
-                   home_abbr: str = '', away_abbr: str = '') -> Dict[str, Dict]:
-    """Fetch box score for a game. Returns {player_name: {stat_name: value, ..., '_team': 'SA', '_game_teams': ('CHA','SA')}}."""
+                   home_abbr: str = '', away_abbr: str = '',
+                   game_date_str: str = '') -> Dict[str, Dict]:
+    """Fetch box score for a game. Returns {player_name: {stat_name: value, ..., '_team': 'SA', '_game_teams': ('CHA','SA'), '_game_date': '26JAN31'}}."""
     try:
         resp = requests.get(
             f'https://site.api.espn.com/apis/site/v2/sports/{espn_path}/summary?event={game_id}',
@@ -2248,6 +2261,7 @@ def _get_box_score(game_id: str, espn_path: str, sport_config: dict,
                     player_data = player_stats.get(name, {})
                     player_data['_team'] = team_abbr  # Track which team this player is on
                     player_data['_game_teams'] = (home_abbr, away_abbr)  # Both teams in this game
+                    player_data['_game_date'] = game_date_str  # Track game date for cross-day verification
                     for stat_name, cfg in group_config['stats'].items():
                         idx = cfg['index']
                         parse = cfg['parse']
@@ -2334,7 +2348,8 @@ def find_completed_props(kalshi_api) -> List[Dict]:
         all_player_stats = {}
         for game in live_games:
             box = _get_box_score(game['game_id'], espn_path, sport_config,
-                                home_abbr=game['home'], away_abbr=game['away'])
+                                home_abbr=game['home'], away_abbr=game['away'],
+                                game_date_str=game.get('game_date_str', ''))
             all_player_stats.update(box)
             time.sleep(0.3)
 
@@ -2381,7 +2396,17 @@ def find_completed_props(kalshi_api) -> List[Dict]:
                 if not espn_name:
                     continue
 
-                # CRITICAL: Verify the player's game teams BOTH appear in this ticker
+                # CRITICAL: Verify the game date matches the ticker date
+                # This prevents matching yesterday's FINAL stats to today's markets
+                # (e.g., Bam Adebayo 21pts from Jan 31 MIA@CHI matching Feb 1 MIA@CHI ticker)
+                ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
+                ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
+                player_game_date = all_player_stats[espn_name].get('_game_date', '')
+                if ticker_date_str and player_game_date and ticker_date_str != player_game_date:
+                    print(f"   Skipping {player_name}: game date {player_game_date} != ticker date {ticker_date_str}")
+                    continue
+
+                # Verify the player's game teams BOTH appear in this ticker
                 # This prevents matching a player's stats from one game against a
                 # different game's Kalshi market (e.g., Jan 31 SA@CHA stats vs Feb 1 SA@NYK market)
                 player_game_teams = all_player_stats[espn_name].get('_game_teams', ('', ''))
