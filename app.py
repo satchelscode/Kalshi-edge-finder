@@ -4006,10 +4006,14 @@ def find_resolved_weather_markets(kalshi_api) -> List[Dict]:
         if not kalshi_markets:
             continue
 
-        print(f"   {display}: {len(kalshi_markets)} markets, safe_high={safe_high:.0f}°F (buffer={buffer_f}°F)")
+        # CRITICAL: Only trade TODAY's markets — the observed high is for TODAY only
+        # Ticker format: KXHIGHLAX-26FEB01-B71.5 where 26FEB01 = 2026 Feb 01
+        today_str = now_et.strftime('%y%b%d').upper()  # e.g., "26FEB01"
+        today_markets = [m for m in kalshi_markets if today_str in m.get('ticker', '')]
+        print(f"   {display}: {len(kalshi_markets)} total markets, {len(today_markets)} today ({today_str}), safe_high={safe_high:.0f}°F (buffer={buffer_f}°F)")
 
         checked = 0
-        for m in kalshi_markets:
+        for m in today_markets:
             ticker = m.get('ticker', '')
 
             # Classify market type using shared function
