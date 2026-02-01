@@ -2355,9 +2355,13 @@ def _get_live_games(espn_path: str) -> List[Dict]:
                         pass
                 competitors = event.get('competitions', [{}])[0].get('competitors', [])
                 teams = {}
+                _is_soccer = espn_path.startswith('soccer/')
                 for c in competitors:
                     espn_abbr = c.get('team', {}).get('abbreviation', '')
-                    teams[c.get('homeAway', '')] = ESPN_TO_KALSHI.get(espn_abbr, espn_abbr)
+                    abbr = ESPN_TO_KALSHI.get(espn_abbr, espn_abbr)
+                    if _is_soccer:
+                        abbr = ESPN_TO_KALSHI_SOCCER.get(espn_abbr, abbr)
+                    teams[c.get('homeAway', '')] = abbr
                 live_games.append({
                     'game_id': game_id,
                     'home': teams.get('home', ''),
@@ -2778,6 +2782,22 @@ ESPN_TO_KALSHI = {
     'UTAH': 'UTA', 'PHO': 'PHX',
 }
 
+# Soccer-specific ESPN→Kalshi mapping (separate to avoid conflicts with NBA/NHL abbrevs)
+# e.g. MIL = Milwaukee Bucks in NBA but AC Milan in Serie A
+ESPN_TO_KALSHI_SOCCER = {
+    # EPL
+    'LIV': 'LFC', 'MAN': 'MUN', 'MNC': 'MCI', 'CHE': 'CFC', 'BHA': 'BRI',
+    # Serie A
+    'ROMA': 'ROM', 'COMO': 'COM', 'BOL': 'BFC', 'MIL': 'ACM',
+    # Ligue 1
+    'LILL': 'LIL', 'LYON': 'OL', 'METZ': 'FCM', 'OLM': 'OM',
+    'LOR': 'FCL', 'NAN': 'FCN', 'MON': 'ASM', 'TOU': 'TFC',
+    # Bundesliga
+    'DOR': 'BVB', 'B04': 'LEV',
+    # La Liga
+    'MLL': 'MAL', 'BET': 'RBB',
+}
+
 # ESPN sport configs for game-level resolution (ML, totals, spreads)
 RESOLVED_GAME_SPORTS = {
     'nba': {
@@ -2883,7 +2903,7 @@ CRYPTO_BUFFER_TIERS = [
 ]
 
 
-def _get_game_scores(espn_path: str) -> List[Dict]:
+def _get_game_scores(espn_path: str, is_soccer: bool = False) -> List[Dict]:
     """Get all games with scores from ESPN (live + final).
     Includes game_date_str (e.g. '26JAN31') to verify against Kalshi ticker dates."""
     try:
@@ -2914,6 +2934,8 @@ def _get_game_scores(espn_path: str) -> List[Dict]:
                 espn_abbr = c.get('team', {}).get('abbreviation', '')
                 # Translate ESPN abbreviation to Kalshi abbreviation
                 abbr = ESPN_TO_KALSHI.get(espn_abbr, espn_abbr)
+                if is_soccer:
+                    abbr = ESPN_TO_KALSHI_SOCCER.get(espn_abbr, abbr)
                 score = int(c.get('score', '0') or '0')
                 teams[ha] = {'abbr': abbr, 'score': score}
             home = teams.get('home', {})
@@ -3056,7 +3078,8 @@ def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
 
 def _find_game_for_ticker(date_stripped: str, abbrev_to_game: dict, team_abbrs: set,
                           require_final: bool = False,
-                          ticker_date_str: str = '') -> Optional[Dict]:
+                          ticker_date_str: str = '',
+                          team_abbr: str = '') -> Optional[Dict]:
     """Match a Kalshi ticker's team portion to an ESPN game.
 
     CRITICAL SAFETY CHECKS:
@@ -3118,6 +3141,15 @@ def _find_game_for_ticker(date_stripped: str, abbrev_to_game: dict, team_abbrs: 
             if not _date_matches(candidate):
                 continue
             return candidate
+
+    # Method 3: Direct team_abbr lookup (for soccer where abbreviations may not
+    # appear as substrings in date_stripped due to ESPN/Kalshi abbreviation differences)
+    if team_abbr and team_abbr.upper() not in ('DRAW', 'DRW'):
+        if team_abbr in abbrev_to_game:
+            candidate = abbrev_to_game[team_abbr]
+            if (not require_final or candidate['is_final']) and _date_matches(candidate):
+                return candidate
+
     return None
 
 
@@ -3134,7 +3166,7 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
         display = config['display']
         team_abbrs = config.get('team_abbrs', set())
 
-        game_scores = _get_game_scores(espn_path)
+        game_scores = _get_game_scores(espn_path, is_soccer=espn_path.startswith('soccer/'))
         if not game_scores:
             continue
 
@@ -3156,6 +3188,12 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
         for g in all_relevant:
             abbrev_to_game[g['home']] = g
             abbrev_to_game[g['away']] = g
+            # For soccer: also add 3-char truncated versions of >3-char abbreviations
+            # that weren't handled by ESPN_TO_KALSHI (catches unmapped teams)
+            if not team_abbrs:
+                for key in ('home', 'away'):
+                    if len(g[key]) > 3 and g[key][:3] not in abbrev_to_game:
+                        abbrev_to_game[g[key][:3]] = g
 
         # --- MONEYLINE: buy winner on final games ---
         for ml_series in config.get('ml_series', []):
@@ -3180,7 +3218,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
 
                 game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
-                                             require_final=True, ticker_date_str=ticker_date_str)
+                                             require_final=True, ticker_date_str=ticker_date_str,
+                                             team_abbr=team_abbr)
                 if not game:
                     # Debug: log first unmatched ticker per series to diagnose matching issues
                     _debug_key = f"nomatch:{ml_series}"
