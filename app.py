@@ -3472,6 +3472,96 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
     return edges
 
 
+def _classify_kalshi_market(m: dict) -> Optional[Dict]:
+    """Classify a Kalshi market as 'above', 'below', or 'range'.
+
+    Checks ALL text fields (title, subtitle, yes_sub_title, no_sub_title) for
+    keywords, plus structural detection from floor_strike/cap_strike values.
+
+    Returns dict with:
+      {'type': 'above', 'threshold': float}
+      {'type': 'below', 'threshold': float}
+      {'type': 'range', 'range_low': float, 'range_high': float}
+      None if market type cannot be determined (SKIP this market)
+    """
+    title = m.get('title', '') or ''
+    floor_strike = m.get('floor_strike')
+    cap_strike = m.get('cap_strike')
+
+    # Check ALL text fields for keywords
+    all_text = ' '.join([
+        title,
+        m.get('subtitle', '') or '',
+        m.get('yes_sub_title', '') or '',
+        m.get('no_sub_title', '') or '',
+    ]).lower()
+
+    is_above = 'above' in all_text or 'or more' in all_text or 'or higher' in all_text
+    is_below = 'below' in all_text or 'or less' in all_text or 'or lower' in all_text
+    is_range_kw = (' to ' in all_text or ' - ' in all_text) and not is_above and not is_below
+
+    # Structural range detection: both strikes exist and differ
+    has_both_strikes = (floor_strike is not None and cap_strike is not None)
+    strikes_differ = has_both_strikes and float(cap_strike) != float(floor_strike)
+    is_structural_range = strikes_differ and not is_above and not is_below
+
+    # --- RANGE MARKET ---
+    if (is_range_kw or is_structural_range) and has_both_strikes:
+        range_low = float(floor_strike)
+        range_high = float(cap_strike)
+        if range_low > 0 and range_high > 0 and range_high > range_low:
+            return {'type': 'range', 'range_low': range_low, 'range_high': range_high}
+        return None  # Invalid range
+
+    # --- ABOVE MARKET ---
+    if is_above:
+        # For above: threshold = floor_strike (the lower bound)
+        if floor_strike is not None:
+            threshold = float(floor_strike)
+        elif has_both_strikes:
+            threshold = float(floor_strike)
+        else:
+            # Try regex from text
+            price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', all_text)
+            if price_match:
+                try:
+                    threshold = float(price_match.group(1).replace(',', ''))
+                except ValueError:
+                    return None
+            else:
+                return None
+        if threshold > 0:
+            return {'type': 'above', 'threshold': threshold}
+        return None
+
+    # --- BELOW MARKET ---
+    if is_below:
+        # For below: threshold = cap_strike (the upper bound)
+        # floor_strike may be 1 (minimum), cap_strike has the real threshold
+        if cap_strike is not None:
+            threshold = float(cap_strike)
+        elif floor_strike is not None:
+            threshold = float(floor_strike)
+        else:
+            return None
+        if threshold > 1:  # Reject floor_strike=1 type values
+            return {'type': 'below', 'threshold': threshold}
+        return None
+
+    # --- UNKNOWN TYPE: check strikes for clues ---
+    if has_both_strikes:
+        f, c = float(floor_strike), float(cap_strike)
+        if f == c and f > 0:
+            # Same strike = single threshold but unknown direction — skip
+            return None
+        # Different strikes but no keywords — likely range, already handled above
+        return None
+
+    # Single strike with no keywords — SKIP (don't guess)
+    # Previously this defaulted to "above" which caused wrong-side buys
+    return None
+
+
 def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> List[Dict]:
     """Find crypto markets where the outcome is already determined or nearly certain.
 
@@ -3575,41 +3665,17 @@ def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> L
                             required_buffer = buf
                             break
 
-            # Determine market type from title and strikes
-            # Three types: "above X", "below X / X or below", "X to Y" (range)
-            floor_strike = m.get('floor_strike')
-            cap_strike = m.get('cap_strike')
+            # Classify market type using shared function
+            mtype = _classify_kalshi_market(m)
+            if mtype is None:
+                skipped_no_threshold += 1
+                continue
 
-            # Check ALL text fields for market type keywords — Kalshi range markets
-            # put "or below"/"or above" in yes_sub_title/subtitle, not the main title
-            all_text = ' '.join([
-                title,
-                m.get('subtitle', '') or '',
-                m.get('yes_sub_title', '') or '',
-                m.get('no_sub_title', '') or '',
-            ]).lower()
+            if mtype['type'] == 'range':
+                range_low = mtype['range_low']
+                range_high = mtype['range_high']
 
-            # Detect market type from all text fields
-            is_above = 'above' in all_text or 'or more' in all_text or 'or higher' in all_text
-            is_below = 'below' in all_text or 'or less' in all_text or 'or lower' in all_text
-            is_range = (' to ' in all_text or ' - ' in all_text) and not is_above and not is_below
-
-            # For range markets: need BOTH floor and cap strikes
-            if is_range or (cap_strike is not None and floor_strike is not None
-                           and float(cap_strike) != float(floor_strike) and not is_above and not is_below):
-                # Range market: YES = price is in [floor, cap]
-                if floor_strike is None or cap_strike is None:
-                    skipped_no_threshold += 1
-                    continue
-                range_low = float(floor_strike)
-                range_high = float(cap_strike)
-                if range_low <= 0 or range_high <= 0:
-                    skipped_no_threshold += 1
-                    continue
-
-                # Check buffer from BOTH edges of the range
                 if current_price > range_high:
-                    # Price above range — NO wins (not in range)
                     buffer_pct = (current_price - range_high) / current_price
                     if buffer_pct < required_buffer:
                         skipped_buffer += 1
@@ -3617,7 +3683,6 @@ def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> L
                     side = 'no'
                     reason_detail = f"${current_price:,.0f} above range ${range_low:,.0f}-${range_high:,.0f}"
                 elif current_price < range_low:
-                    # Price below range — NO wins (not in range)
                     buffer_pct = (range_low - current_price) / current_price
                     if buffer_pct < required_buffer:
                         skipped_buffer += 1
@@ -3625,8 +3690,7 @@ def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> L
                     side = 'no'
                     reason_detail = f"${current_price:,.0f} below range ${range_low:,.0f}-${range_high:,.0f}"
                 else:
-                    # Price IN range — YES might win, but too risky (can exit range)
-                    # Only bet YES on range if expired (outcome known for certain)
+                    # Price IN range — only bet YES if expired (outcome certain)
                     if not is_expired:
                         skipped_buffer += 1
                         continue
@@ -3636,45 +3700,13 @@ def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> L
                         (range_high - current_price) / current_price
                     )
                     reason_detail = f"${current_price:,.0f} IN range ${range_low:,.0f}-${range_high:,.0f}"
-            else:
-                # Single-threshold market: above or below
-                # For "below" markets: the meaningful threshold is cap_strike, not floor_strike
-                # (floor_strike=1 is just the minimum, cap_strike=$73,749.99 is the real threshold)
-                if is_below and cap_strike is not None:
-                    threshold = float(cap_strike)
-                elif is_above and floor_strike is not None:
-                    threshold = float(floor_strike)
-                elif floor_strike is not None and cap_strike is not None:
-                    # Both set — use the one closer to current price as threshold
-                    f, c = float(floor_strike), float(cap_strike)
-                    if f == c:
-                        threshold = f
-                    else:
-                        # This is really a range market that wasn't detected — treat as range
-                        skipped_no_threshold += 1
-                        continue
-                elif floor_strike is not None:
-                    threshold = float(floor_strike)
-                elif cap_strike is not None:
-                    threshold = float(cap_strike)
-                else:
-                    price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', all_text)
-                    if price_match:
-                        try:
-                            threshold = float(price_match.group(1).replace(',', ''))
-                        except ValueError:
-                            skipped_no_threshold += 1
-                            continue
-                    else:
-                        skipped_no_threshold += 1
-                        continue
 
-                if threshold <= 0:
-                    skipped_no_threshold += 1
-                    continue
+            else:
+                # above or below — single threshold
+                threshold = mtype['threshold']
+                mkt_type = mtype['type']  # 'above' or 'below'
 
                 # Sanity check: threshold must be within 50% of current price
-                # Prevents using floor_strike=$1 as threshold for BTC at $77,000
                 if abs(current_price - threshold) / current_price > 0.50:
                     skipped_no_threshold += 1
                     continue
@@ -3684,16 +3716,14 @@ def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> L
                     skipped_buffer += 1
                     continue
 
-                if is_below:
-                    # "Below X" market: YES = price < X, NO = price >= X
+                if mkt_type == 'below':
                     if current_price < threshold:
                         side = 'yes'
                         reason_detail = f"${current_price:,.0f} < ${threshold:,.0f} (below market)"
                     else:
                         side = 'no'
                         reason_detail = f"${current_price:,.0f} > ${threshold:,.0f} (below market, NO wins)"
-                else:
-                    # "Above X" market (default): YES = price >= X, NO = price < X
+                else:  # above
                     if current_price > threshold:
                         side = 'yes'
                         reason_detail = f"${current_price:,.0f} > ${threshold:,.0f}"
@@ -3795,39 +3825,24 @@ def find_resolved_econ_markets(kalshi_api) -> List[Dict]:
                 except Exception:
                     pass
 
-            floor_strike = m.get('floor_strike')
-            cap_strike = m.get('cap_strike')
-
-            # Check all text fields for above/below keywords (consistent with crypto/index/weather)
-            econ_all_text = ' '.join([
-                title,
-                m.get('subtitle', '') or '',
-                m.get('yes_sub_title', '') or '',
-                m.get('no_sub_title', '') or '',
-            ]).lower()
-
-            econ_is_below = 'below' in econ_all_text or 'or less' in econ_all_text or 'or lower' in econ_all_text
-
-            # For "below" markets: use cap_strike as threshold (same fix as KXBTC/weather)
-            if econ_is_below and cap_strike is not None:
-                threshold = float(cap_strike)
-            elif floor_strike is not None:
-                threshold = float(floor_strike)
-            elif cap_strike is not None:
-                threshold = float(cap_strike)
-            else:
+            # Classify market type using shared function
+            mtype = _classify_kalshi_market(m)
+            if mtype is None:
                 continue
 
-            if threshold <= 0:
-                continue
+            # Econ doesn't have range markets, but handle just in case
+            if mtype['type'] == 'range':
+                continue  # Skip range econ markets (shouldn't exist)
+
+            threshold = mtype['threshold']
+            mkt_type = mtype['type']  # 'above' or 'below'
 
             ob = kalshi_api.get_orderbook(ticker)
             if not ob:
                 continue
             time.sleep(0.2)
 
-            if econ_is_below:
-                # "Below X" market: YES = CPI < X, NO = CPI >= X
+            if mkt_type == 'below':
                 if latest_cpi < threshold:
                     yes_price = get_best_yes_price(ob)
                     if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
@@ -3844,12 +3859,11 @@ def find_resolved_econ_markets(kalshi_api) -> List[Dict]:
                                                        'Econ', f"CPI vs {threshold}", kalshi_api, ob)
                         if result:
                             edges.append(result)
-            else:
-                # "Above X" market (default): YES = CPI > X, NO = CPI < X
+            else:  # above
                 if latest_cpi > threshold:
                     yes_price = get_best_yes_price(ob)
                     if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
-                        reason = f"CPI {latest_cpi} > {threshold} (released)"
+                        reason = f"CPI {latest_cpi} > {threshold} (above market, released)"
                         result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
                                                        'Econ', f"CPI vs {threshold}", kalshi_api, ob)
                         if result:
@@ -3857,7 +3871,7 @@ def find_resolved_econ_markets(kalshi_api) -> List[Dict]:
                 elif latest_cpi < threshold:
                     no_price = get_best_no_price(ob)
                     if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
-                        reason = f"CPI {latest_cpi} < {threshold} (released)"
+                        reason = f"CPI {latest_cpi} < {threshold} (above market, released)"
                         result = _buy_resolved_market(ticker, 'no', no_price, reason,
                                                        'Econ', f"CPI vs {threshold}", kalshi_api, ob)
                         if result:
@@ -3971,82 +3985,42 @@ def find_resolved_weather_markets(kalshi_api) -> List[Dict]:
         checked = 0
         for m in kalshi_markets:
             ticker = m.get('ticker', '')
-            title = (m.get('title', '') or '')
-            floor_strike = m.get('floor_strike')
-            cap_strike = m.get('cap_strike')
 
-            # Check ALL text fields for market type keywords (same as crypto/index fix)
-            # Kalshi may put "or below"/"or above" in yes_sub_title/subtitle, not title
-            wx_all_text = ' '.join([
-                title,
-                m.get('subtitle', '') or '',
-                m.get('yes_sub_title', '') or '',
-                m.get('no_sub_title', '') or '',
-            ]).lower()
+            # Classify market type using shared function
+            mtype = _classify_kalshi_market(m)
+            if mtype is None:
+                continue
 
-            # Determine threshold from strikes or title
-            is_above = 'above' in wx_all_text or 'or more' in wx_all_text or 'or higher' in wx_all_text
-            is_below = 'below' in wx_all_text or 'or less' in wx_all_text or 'or lower' in wx_all_text
-            is_range = (' to ' in wx_all_text or ' - ' in wx_all_text) and not is_above and not is_below
-
-            # Structural range detection: if both strikes exist and differ, it's a range
-            # (same logic as crypto/index scanners — don't rely solely on keywords)
-            is_structural_range = (cap_strike is not None and floor_strike is not None
-                                   and float(cap_strike) != float(floor_strike)
-                                   and not is_above and not is_below)
-
-            if (is_range or is_structural_range) and floor_strike is not None and cap_strike is not None:
-                range_low = float(floor_strike)
-                range_high = float(cap_strike)
-                if range_low <= 0 or range_high <= 0:
-                    continue
+            if mtype['type'] == 'range':
+                range_low = mtype['range_low']
+                range_high = mtype['range_high']
                 if safe_high > range_high:
-                    # Observed high is already above Y, the daily high is >= observed > Y
-                    # So the high is NOT in range [X,Y] — NO wins
+                    # Observed high already above range top — NOT in range — NO wins
                     side = 'no'
                     reason_detail = f"Observed high {observed_high:.0f}°F > range {range_low:.0f}-{range_high:.0f}°F"
                 elif safe_high < range_low:
-                    # Temp hasn't reached range_low — can't bet YES (might not reach it)
+                    # Temp hasn't reached range_low — can't bet YES (might still rise)
                     continue
                 else:
                     continue  # In range, uncertain
-            elif is_above:
-                # Only enter "above" branch if explicitly detected as above
-                # (never fall back to "above" just because floor_strike exists)
-                threshold = float(floor_strike) if floor_strike is not None else None
-                if threshold is None:
-                    temp_match = re.search(r'(\d+)', wx_all_text)
-                    if temp_match:
-                        threshold = float(temp_match.group(1))
-                if threshold is None:
-                    continue
 
+            elif mtype['type'] == 'above':
+                threshold = mtype['threshold']
                 if safe_high >= threshold:
                     side = 'yes'
-                    reason_detail = f"Observed {observed_high:.0f}°F >= {threshold:.0f}°F threshold"
+                    reason_detail = f"Observed {observed_high:.0f}°F >= {threshold:.0f}°F threshold (above market)"
                 else:
                     continue  # Not safe to bet
-            elif is_below:
-                # CRITICAL: For "below X" markets, use cap_strike as threshold (not floor_strike)
-                # floor_strike may be 1 (minimum), cap_strike has the real threshold
-                # Same fix as KXBTC range market bug
-                if cap_strike is not None:
-                    threshold = float(cap_strike)
-                elif floor_strike is not None:
-                    threshold = float(floor_strike)
-                else:
-                    continue
 
-                # Sanity check: threshold should be a reasonable temperature (not 0 or 1)
-                if threshold <= 1:
-                    continue
-
+            elif mtype['type'] == 'below':
+                threshold = mtype['threshold']
                 if safe_high >= threshold:
                     # High is already above the "below X" threshold, so NO wins
                     side = 'no'
-                    reason_detail = f"Observed {observed_high:.0f}°F >= {threshold:.0f}°F (below market)"
+                    reason_detail = f"Observed {observed_high:.0f}°F >= {threshold:.0f}°F (below market, NO wins)"
                 else:
-                    continue
+                    continue  # Not safe to bet
+
             else:
                 continue
 
@@ -4198,27 +4172,16 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
                         elif minutes_to_close <= 60:
                             required_buffer = 0.012  # 1.2%
 
-                # Parse market type — check all text fields (subtitle has "or below" etc.)
-                idx_all_text = ' '.join([
-                    title,
-                    m.get('subtitle', '') or '',
-                    m.get('yes_sub_title', '') or '',
-                    m.get('no_sub_title', '') or '',
-                ]).lower()
-                is_above = 'above' in idx_all_text or 'or more' in idx_all_text or 'or higher' in idx_all_text
-                is_below = 'below' in idx_all_text or 'or less' in idx_all_text or 'or lower' in idx_all_text
-                is_range = (' to ' in idx_all_text or ' - ' in idx_all_text) and not is_above and not is_below
+                # Classify market type using shared function
+                mtype = _classify_kalshi_market(m)
+                if mtype is None:
+                    skipped_no_threshold += 1
+                    continue
 
-                if is_range or (cap_strike is not None and floor_strike is not None
-                               and float(cap_strike) != float(floor_strike) and not is_above and not is_below):
-                    if floor_strike is None or cap_strike is None:
-                        skipped_no_threshold += 1
-                        continue
-                    range_low = float(floor_strike)
-                    range_high = float(cap_strike)
-                    if range_low <= 0 or range_high <= 0:
-                        skipped_no_threshold += 1
-                        continue
+                if mtype['type'] == 'range':
+                    range_low = mtype['range_low']
+                    range_high = mtype['range_high']
+
                     if price > range_high:
                         buffer_pct = (price - range_high) / price
                         if buffer_pct < required_buffer:
@@ -4244,37 +4207,9 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
                         )
                         reason_detail = f"${price:,.0f} IN range ${range_low:,.0f}-${range_high:,.0f}"
                 else:
-                    # Use correct strike for below vs above markets
-                    if is_below and cap_strike is not None:
-                        threshold = float(cap_strike)
-                    elif is_above and floor_strike is not None:
-                        threshold = float(floor_strike)
-                    elif floor_strike is not None and cap_strike is not None:
-                        f, c = float(floor_strike), float(cap_strike)
-                        if f == c:
-                            threshold = f
-                        else:
-                            skipped_no_threshold += 1
-                            continue
-                    elif floor_strike is not None:
-                        threshold = float(floor_strike)
-                    elif cap_strike is not None:
-                        threshold = float(cap_strike)
-                    else:
-                        price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', idx_all_text)
-                        if price_match:
-                            try:
-                                threshold = float(price_match.group(1).replace(',', ''))
-                            except ValueError:
-                                skipped_no_threshold += 1
-                                continue
-                        else:
-                            skipped_no_threshold += 1
-                            continue
-
-                    if threshold <= 0:
-                        skipped_no_threshold += 1
-                        continue
+                    # above or below — single threshold
+                    threshold = mtype['threshold']
+                    mkt_type = mtype['type']
 
                     # Sanity check: threshold within 50% of current price
                     if abs(price - threshold) / price > 0.50:
@@ -4286,14 +4221,14 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
                         skipped_buffer += 1
                         continue
 
-                    if is_below:
+                    if mkt_type == 'below':
                         if price < threshold:
                             side = 'yes'
                             reason_detail = f"${price:,.0f} < ${threshold:,.0f} (below market)"
                         else:
                             side = 'no'
                             reason_detail = f"${price:,.0f} > ${threshold:,.0f} (below market, NO wins)"
-                    else:
+                    else:  # above
                         if price > threshold:
                             side = 'yes'
                             reason_detail = f"${price:,.0f} > ${threshold:,.0f}"
