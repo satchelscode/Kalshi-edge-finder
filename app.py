@@ -3201,8 +3201,13 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
             today_markets = [m for m in kalshi_markets
                              if any(ds in m.get('ticker', '') for ds in date_strs)]
             print(f"   {ml_series}: {len(kalshi_markets)} total, {len(today_markets)} today")
+            if today_markets:
+                for _tm in today_markets[:3]:
+                    print(f"      ticker: {_tm.get('ticker','')}")
             time.sleep(0.5)
 
+            _ml_matched = 0
+            _ml_price_high = 0
             for m in today_markets:
                 ticker = m.get('ticker', '')
                 parts = ticker.split('-')
@@ -3221,8 +3226,9 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                                              require_final=True, ticker_date_str=ticker_date_str,
                                              team_abbr=team_abbr)
                 if not game:
-                    # Debug: log first unmatched ticker per series to diagnose matching issues
+                    print(f"      NO MATCH: {ticker} date_stripped={date_stripped} team={team_abbr} abbrevs={list(abbrev_to_game.keys())[:12]}")
                     continue
+                _ml_matched += 1
 
                 # Is this team the winner? Handle draws for soccer.
                 is_draw_ticker = team_abbr.upper() in ('DRAW', 'DRW', 'TIE')
@@ -3238,6 +3244,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                     # DRAW ticker: buy YES if game ended in draw, NO if it didn't
                     if is_draw_game:
                         yes_price = get_best_yes_price(ob)
+                        if yes_price and yes_price >= COMPLETED_PROP_MAX_PRICE:
+                            _ml_price_high += 1
                         if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
                             reason = f"Draw {game['home_score']}-{game['away_score']} (FINAL)"
                             result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
@@ -3246,6 +3254,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                                 edges.append(result)
                     else:
                         no_price = get_best_no_price(ob)
+                        if no_price and no_price >= COMPLETED_PROP_MAX_PRICE:
+                            _ml_price_high += 1
                         if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
                             reason = f"No draw — {game['winner']} won (FINAL)"
                             result = _buy_resolved_market(ticker, 'no', no_price, reason,
@@ -3255,6 +3265,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 elif is_winner:
                     # Buy YES on the winner
                     yes_price = get_best_yes_price(ob)
+                    if yes_price and yes_price >= COMPLETED_PROP_MAX_PRICE:
+                        _ml_price_high += 1
                     if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
                         reason = f"{game['winner']} beat {game['loser']} {game['home_score'] if game['winner'] == game['home'] else game['away_score']}-{game['away_score'] if game['winner'] == game['home'] else game['home_score']} (FINAL)"
                         result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
@@ -3264,6 +3276,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 else:
                     # Buy NO on the loser (they lost or drew, so NO pays out)
                     no_price = get_best_no_price(ob)
+                    if no_price and no_price >= COMPLETED_PROP_MAX_PRICE:
+                        _ml_price_high += 1
                     if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
                         if is_draw_game:
                             reason = f"{team_abbr} drew {game['home_score']}-{game['away_score']} (FINAL)"
@@ -3273,6 +3287,8 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                                                        display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
                         if result:
                             edges.append(result)
+            if _ml_matched or _ml_price_high:
+                print(f"   {ml_series} resolved: {_ml_matched} matched, {_ml_price_high} price>=99c")
 
         # --- TOTALS: Over guaranteed if current score > line (live or final) ---
         for total_series in config.get('total_series', []):
