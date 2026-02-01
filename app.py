@@ -1148,7 +1148,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         draw_abbrev = None
         team_abbrevs_list = []
         for a in team_markets:
-            if a.upper() == 'DRAW' or a.upper() == 'DRW':
+            if a.upper() in ('DRAW', 'DRW', 'TIE'):
                 draw_abbrev = a
             else:
                 team_abbrevs_list.append(a)
@@ -3144,7 +3144,7 @@ def _find_game_for_ticker(date_stripped: str, abbrev_to_game: dict, team_abbrs: 
 
     # Method 3: Direct team_abbr lookup (for soccer where abbreviations may not
     # appear as substrings in date_stripped due to ESPN/Kalshi abbreviation differences)
-    if team_abbr and team_abbr.upper() not in ('DRAW', 'DRW'):
+    if team_abbr and team_abbr.upper() not in ('DRAW', 'DRW', 'TIE'):
         if team_abbr in abbrev_to_game:
             candidate = abbrev_to_game[team_abbr]
             if (not require_final or candidate['is_final']) and _date_matches(candidate):
@@ -3232,7 +3232,7 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                     continue
 
                 # Is this team the winner? Handle draws for soccer.
-                is_draw_ticker = team_abbr.upper() in ('DRAW', 'DRW')
+                is_draw_ticker = team_abbr.upper() in ('DRAW', 'DRW', 'TIE')
                 is_draw_game = game['winner'] == '' and game['is_final']
                 is_winner = (team_abbr == game['winner'])
 
@@ -3443,7 +3443,7 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
     return edges
 
 
-def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
+def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> List[Dict]:
     """Find crypto markets where the outcome is already determined or nearly certain.
 
     Two modes:
@@ -3451,6 +3451,9 @@ def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
     2. NEAR-EXPIRY: market closing soon — if price is far enough from threshold
        (based on time-remaining volatility buffer), it's essentially guaranteed.
        e.g., BTC at $78,780 with 27 min left and threshold $75,250 (4.5% buffer) = safe YES
+
+    buffer_override: if set, use this fixed buffer % instead of time-based tiers.
+                     Used by the crypto sniper for tighter buffers near close.
     """
     edges = []
 
@@ -3538,16 +3541,19 @@ def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
                 continue
 
             # Determine required buffer based on time remaining
-            required_buffer = 0.03  # default 3% if we can't determine time
-            if is_expired:
-                required_buffer = 0  # outcome is known
+            if buffer_override is not None:
+                required_buffer = 0 if is_expired else buffer_override
             else:
-                for max_min, buf in CRYPTO_BUFFER_TIERS:
-                    if max_min == 0:
-                        continue
-                    if minutes_to_close <= max_min:
-                        required_buffer = buf
-                        break
+                required_buffer = 0.03  # default 3% if we can't determine time
+                if is_expired:
+                    required_buffer = 0  # outcome is known
+                else:
+                    for max_min, buf in CRYPTO_BUFFER_TIERS:
+                        if max_min == 0:
+                            continue
+                        if minutes_to_close <= max_min:
+                            required_buffer = buf
+                            break
 
             # Determine market type from title and strikes
             # Three types: "above X", "below X / X or below", "X to Y" (range)
@@ -3965,8 +3971,92 @@ def start_background_scanner():
     print("Background scanner thread launched")
 
 
+def _crypto_sniper_loop():
+    """Dedicated thread that scans crypto markets at precise times before each hourly close.
+
+    Crypto markets (BTC, ETH, SOL, etc.) settle on the hour. The main scan loop
+    runs every ~30s but the full scan takes minutes, so it can easily miss the
+    optimal 1-2 minute window right before close when buffers are smallest.
+
+    This thread sleeps until just before each hourly close, then runs the crypto
+    scanner at 90s, 60s, and 15s before close to maximize the chance of finding
+    cheap markets with known outcomes.
+    """
+    # Wait for initial startup to complete
+    time.sleep(45)
+    print("Crypto sniper thread started")
+
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            # Next close is at the top of the next hour
+            next_close = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            seconds_until_close = (next_close - now).total_seconds()
+
+            # Sleep until 90 seconds before close
+            sleep_time = max(0, seconds_until_close - 90)
+            if sleep_time > 0:
+                next_close_et = next_close.astimezone(ZoneInfo('America/New_York'))
+                print(f"   Crypto sniper: next close {next_close_et.strftime('%I:%M %p ET')}, "
+                      f"sleeping {sleep_time/60:.1f}min")
+                time.sleep(sleep_time)
+
+            # Run 3 scans with progressively tighter buffers as close approaches.
+            # BTC moves ~0.5%/hr, so in 90s it moves ~0.08%. We use buffers
+            # slightly above the expected move to be safe but aggressive.
+            # At 90s: 0.10% buffer (~$77 for BTC at $77K — won't move $77 in 90s)
+            # At 60s: 0.06% buffer (~$46 for BTC)
+            # At 15s: 0.015% buffer (~$12 for BTC — virtually no movement)
+            kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+            scan_schedule = [
+                (90, 0.0010),   # 90s out: 0.10% buffer
+                (60, 0.0006),   # 60s out: 0.06% buffer
+                (15, 0.00015),  # 15s out: 0.015% buffer
+            ]
+
+            for i, (target_secs, sniper_buffer) in enumerate(scan_schedule):
+                now = datetime.now(timezone.utc)
+                secs_left = (next_close - now).total_seconds()
+
+                # If we've passed the close time, do one final expired scan
+                if secs_left < -30:
+                    break
+
+                scan_label = f"{secs_left:.0f}s before close" if secs_left > 0 else "EXPIRED"
+                print(f"   Crypto sniper scan {i+1}/3 ({scan_label}, buffer={sniper_buffer:.3%}):")
+
+                results = find_resolved_crypto_markets(kalshi, buffer_override=sniper_buffer)
+                if results:
+                    print(f"   Crypto sniper: {len(results)} edges found!")
+
+                # Sleep until next scan time
+                if i < len(scan_schedule) - 1:
+                    now = datetime.now(timezone.utc)
+                    secs_left = (next_close - now).total_seconds()
+                    next_target = scan_schedule[i + 1][0]
+                    wait = max(1, secs_left - next_target)
+                    time.sleep(wait)
+
+            # After the close window, sleep 30s then let the loop recalculate
+            time.sleep(30)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Crypto sniper error: {e}")
+            time.sleep(60)
+
+
+def start_crypto_sniper():
+    """Start the crypto sniper thread (called once on app boot)."""
+    t = threading.Thread(target=_crypto_sniper_loop, daemon=True)
+    t.start()
+    print("Crypto sniper thread launched")
+
+
 # Start scanner when module loads (gunicorn will call this)
 start_background_scanner()
+start_crypto_sniper()
 
 
 # ============================================================
