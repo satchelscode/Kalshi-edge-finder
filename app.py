@@ -2205,6 +2205,18 @@ def find_completed_props(kalshi_api) -> List[Dict]:
             ticker = m.get('ticker', '')
             title = m.get('title', '')
 
+            # Verify this market's game is actually live by checking team abbrevs in ticker
+            # Ticker format: KXNBAREB-26FEB01LALNYK-NYKMBRIDGES25-4
+            ticker_parts = ticker.split('-')
+            if len(ticker_parts) >= 2:
+                game_part = ticker_parts[1]  # e.g. "26FEB01LALNYK"
+                # Strip the date prefix (e.g. "26FEB01") to get team codes
+                date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
+                # Check if any live game team abbrev appears in the ticker game part
+                game_is_live = any(abbr in date_stripped for abbr in live_game_abbrevs if len(abbr) >= 2)
+                if not game_is_live:
+                    continue
+
             # Parse player name and target from title: "LaMelo Ball: 8+ assists"
             prop_match = re.match(r'^(.+?):\s*(\d+)\+', title)
             if not prop_match:
