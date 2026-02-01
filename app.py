@@ -3237,6 +3237,7 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
 
                 ob = kalshi_api.get_orderbook(ticker)
                 if not ob:
+                    print(f"      {ticker}: no orderbook")
                     continue
                 time.sleep(0.2)
 
@@ -3244,6 +3245,7 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                     # DRAW ticker: buy YES if game ended in draw, NO if it didn't
                     if is_draw_game:
                         yes_price = get_best_yes_price(ob)
+                        print(f"      {ticker}: DRAW game, YES ask={yes_price}")
                         if yes_price and yes_price >= COMPLETED_PROP_MAX_PRICE:
                             _ml_price_high += 1
                         if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
@@ -3254,6 +3256,7 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                                 edges.append(result)
                     else:
                         no_price = get_best_no_price(ob)
+                        print(f"      {ticker}: NOT draw, NO ask={no_price}")
                         if no_price and no_price >= COMPLETED_PROP_MAX_PRICE:
                             _ml_price_high += 1
                         if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
@@ -3265,6 +3268,7 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 elif is_winner:
                     # Buy YES on the winner
                     yes_price = get_best_yes_price(ob)
+                    print(f"      {ticker}: WINNER, YES ask={yes_price}")
                     if yes_price and yes_price >= COMPLETED_PROP_MAX_PRICE:
                         _ml_price_high += 1
                     if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
@@ -3276,6 +3280,7 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 else:
                     # Buy NO on the loser (they lost or drew, so NO pays out)
                     no_price = get_best_no_price(ob)
+                    print(f"      {ticker}: LOSER, NO ask={no_price}")
                     if no_price and no_price >= COMPLETED_PROP_MAX_PRICE:
                         _ml_price_high += 1
                     if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
@@ -3287,7 +3292,7 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                                                        display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
                         if result:
                             edges.append(result)
-            if _ml_matched or _ml_price_high:
+            if _ml_matched > 0 or _ml_price_high > 0:
                 print(f"   {ml_series} resolved: {_ml_matched} matched, {_ml_price_high} price>=99c")
 
         # --- TOTALS: Over guaranteed if current score > line (live or final) ---
