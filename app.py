@@ -3031,6 +3031,14 @@ def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
     if total_profit <= 0:
         return None
 
+    # SAFETY GUARDRAIL: Hard cap on total cost for resolved markets
+    # Even with RESOLVED_MAX_WIN cap, double-check total spend doesn't exceed
+    # a reasonable multiple of expected profit (prevents runaway orders)
+    max_allowed_cost = RESOLVED_MAX_WIN * 20  # Never spend more than 20x the target profit
+    if total_cost > max_allowed_cost:
+        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds max ${max_allowed_cost:.2f} — blocking order")
+        return None
+
     price_cents = int(round(price * 100))
 
     print(f"   >>> RESOLVED MARKET: {ticker} {side.upper()} {contracts}x @ ${price:.2f} = ${total_cost:.2f} (profit ${total_profit:.2f}) — {reason}")
@@ -3788,32 +3796,72 @@ def find_resolved_econ_markets(kalshi_api) -> List[Dict]:
                     pass
 
             floor_strike = m.get('floor_strike')
-            if floor_strike is None:
+            cap_strike = m.get('cap_strike')
+
+            # Check all text fields for above/below keywords (consistent with crypto/index/weather)
+            econ_all_text = ' '.join([
+                title,
+                m.get('subtitle', '') or '',
+                m.get('yes_sub_title', '') or '',
+                m.get('no_sub_title', '') or '',
+            ]).lower()
+
+            econ_is_below = 'below' in econ_all_text or 'or less' in econ_all_text or 'or lower' in econ_all_text
+
+            # For "below" markets: use cap_strike as threshold (same fix as KXBTC/weather)
+            if econ_is_below and cap_strike is not None:
+                threshold = float(cap_strike)
+            elif floor_strike is not None:
+                threshold = float(floor_strike)
+            elif cap_strike is not None:
+                threshold = float(cap_strike)
+            else:
                 continue
 
-            threshold = float(floor_strike)
+            if threshold <= 0:
+                continue
 
             ob = kalshi_api.get_orderbook(ticker)
             if not ob:
                 continue
             time.sleep(0.2)
 
-            if latest_cpi > threshold:
-                yes_price = get_best_yes_price(ob)
-                if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
-                    reason = f"CPI {latest_cpi} > {threshold} (released)"
-                    result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
-                                                   'Econ', f"CPI vs {threshold}", kalshi_api, ob)
-                    if result:
-                        edges.append(result)
-            elif latest_cpi < threshold:
-                no_price = get_best_no_price(ob)
-                if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
-                    reason = f"CPI {latest_cpi} < {threshold} (released)"
-                    result = _buy_resolved_market(ticker, 'no', no_price, reason,
-                                                   'Econ', f"CPI vs {threshold}", kalshi_api, ob)
-                    if result:
-                        edges.append(result)
+            if econ_is_below:
+                # "Below X" market: YES = CPI < X, NO = CPI >= X
+                if latest_cpi < threshold:
+                    yes_price = get_best_yes_price(ob)
+                    if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
+                        reason = f"CPI {latest_cpi} < {threshold} (below market, released)"
+                        result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
+                                                       'Econ', f"CPI vs {threshold}", kalshi_api, ob)
+                        if result:
+                            edges.append(result)
+                elif latest_cpi > threshold:
+                    no_price = get_best_no_price(ob)
+                    if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
+                        reason = f"CPI {latest_cpi} > {threshold} (below market, NO wins, released)"
+                        result = _buy_resolved_market(ticker, 'no', no_price, reason,
+                                                       'Econ', f"CPI vs {threshold}", kalshi_api, ob)
+                        if result:
+                            edges.append(result)
+            else:
+                # "Above X" market (default): YES = CPI > X, NO = CPI < X
+                if latest_cpi > threshold:
+                    yes_price = get_best_yes_price(ob)
+                    if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
+                        reason = f"CPI {latest_cpi} > {threshold} (released)"
+                        result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
+                                                       'Econ', f"CPI vs {threshold}", kalshi_api, ob)
+                        if result:
+                            edges.append(result)
+                elif latest_cpi < threshold:
+                    no_price = get_best_no_price(ob)
+                    if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
+                        reason = f"CPI {latest_cpi} < {threshold} (released)"
+                        result = _buy_resolved_market(ticker, 'no', no_price, reason,
+                                                       'Econ', f"CPI vs {threshold}", kalshi_api, ob)
+                        if result:
+                            edges.append(result)
 
     return edges
 
@@ -3923,37 +3971,41 @@ def find_resolved_weather_markets(kalshi_api) -> List[Dict]:
         checked = 0
         for m in kalshi_markets:
             ticker = m.get('ticker', '')
-            title = (m.get('title', '') or '').lower()
+            title = (m.get('title', '') or '')
             floor_strike = m.get('floor_strike')
             cap_strike = m.get('cap_strike')
 
+            # Check ALL text fields for market type keywords (same as crypto/index fix)
+            # Kalshi may put "or below"/"or above" in yes_sub_title/subtitle, not title
+            wx_all_text = ' '.join([
+                title,
+                m.get('subtitle', '') or '',
+                m.get('yes_sub_title', '') or '',
+                m.get('no_sub_title', '') or '',
+            ]).lower()
+
             # Determine threshold from strikes or title
-            is_above = 'above' in title or 'or more' in title or 'or higher' in title
-            is_below = 'below' in title or 'or less' in title or 'or lower' in title
-            is_range = (' to ' in title or ' - ' in title) and not is_above and not is_below
+            is_above = 'above' in wx_all_text or 'or more' in wx_all_text or 'or higher' in wx_all_text
+            is_below = 'below' in wx_all_text or 'or less' in wx_all_text or 'or lower' in wx_all_text
+            is_range = (' to ' in wx_all_text or ' - ' in wx_all_text) and not is_above and not is_below
 
             if is_range and floor_strike is not None and cap_strike is not None:
                 range_low = float(floor_strike)
                 range_high = float(cap_strike)
                 if safe_high > range_high:
-                    # Observed high is above the range top — NO wins (high won't be in this range)
-                    # Actually: the high COULD be in this range if it hasn't peaked yet
-                    # But we only bet NO on ranges that are BELOW the safe_high
-                    # Wait — "highest temp in range X-Y" means the daily high falls in [X,Y]
-                    # If observed high is already above Y, the daily high is >= observed > Y
+                    # Observed high is already above Y, the daily high is >= observed > Y
                     # So the high is NOT in range [X,Y] — NO wins
                     side = 'no'
                     reason_detail = f"Observed high {observed_high:.0f}°F > range {range_low:.0f}-{range_high:.0f}°F"
                 elif safe_high < range_low:
                     # Temp hasn't reached range_low — can't bet YES (might not reach it)
-                    # Could bet NO if we're confident temp won't reach range — skip for safety
                     continue
                 else:
                     continue  # In range, uncertain
             elif is_above or (floor_strike is not None and not is_below and not is_range):
                 threshold = float(floor_strike) if floor_strike is not None else None
                 if threshold is None:
-                    temp_match = re.search(r'(\d+)', title)
+                    temp_match = re.search(r'(\d+)', wx_all_text)
                     if temp_match:
                         threshold = float(temp_match.group(1))
                 if threshold is None:
@@ -3965,9 +4017,20 @@ def find_resolved_weather_markets(kalshi_api) -> List[Dict]:
                 else:
                     continue  # Not safe to bet
             elif is_below:
-                threshold = float(floor_strike) if floor_strike is not None else None
-                if threshold is None:
+                # CRITICAL: For "below X" markets, use cap_strike as threshold (not floor_strike)
+                # floor_strike may be 1 (minimum), cap_strike has the real threshold
+                # Same fix as KXBTC range market bug
+                if cap_strike is not None:
+                    threshold = float(cap_strike)
+                elif floor_strike is not None:
+                    threshold = float(floor_strike)
+                else:
                     continue
+
+                # Sanity check: threshold should be a reasonable temperature (not 0 or 1)
+                if threshold <= 1:
+                    continue
+
                 if safe_high >= threshold:
                     # High is already above the "below X" threshold, so NO wins
                     side = 'no'
