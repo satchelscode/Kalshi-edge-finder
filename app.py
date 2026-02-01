@@ -3989,9 +3989,17 @@ def find_resolved_weather_markets(kalshi_api) -> List[Dict]:
             is_below = 'below' in wx_all_text or 'or less' in wx_all_text or 'or lower' in wx_all_text
             is_range = (' to ' in wx_all_text or ' - ' in wx_all_text) and not is_above and not is_below
 
-            if is_range and floor_strike is not None and cap_strike is not None:
+            # Structural range detection: if both strikes exist and differ, it's a range
+            # (same logic as crypto/index scanners — don't rely solely on keywords)
+            is_structural_range = (cap_strike is not None and floor_strike is not None
+                                   and float(cap_strike) != float(floor_strike)
+                                   and not is_above and not is_below)
+
+            if (is_range or is_structural_range) and floor_strike is not None and cap_strike is not None:
                 range_low = float(floor_strike)
                 range_high = float(cap_strike)
+                if range_low <= 0 or range_high <= 0:
+                    continue
                 if safe_high > range_high:
                     # Observed high is already above Y, the daily high is >= observed > Y
                     # So the high is NOT in range [X,Y] — NO wins
@@ -4002,7 +4010,9 @@ def find_resolved_weather_markets(kalshi_api) -> List[Dict]:
                     continue
                 else:
                     continue  # In range, uncertain
-            elif is_above or (floor_strike is not None and not is_below and not is_range):
+            elif is_above:
+                # Only enter "above" branch if explicitly detected as above
+                # (never fall back to "above" just because floor_strike exists)
                 threshold = float(floor_strike) if floor_strike is not None else None
                 if threshold is None:
                     temp_match = re.search(r'(\d+)', wx_all_text)
