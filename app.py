@@ -153,7 +153,8 @@ TENNIS_SPORTS = {
 # Auto-trade configuration
 AUTO_TRADE_ENABLED = True
 MAX_POSITIONS = 999  # No practical limit
-TARGET_PROFIT = 1.00  # Target $1 profit per trade
+TARGET_PROFIT = 5.00  # Target $5 profit per trade (was $1)
+MAX_RISK = 250.00     # Max total cost per single order ($250)
 MIN_EDGE_PERCENT = 0.5  # Skip edges below this % (fees/slippage eat tiny edges)
 
 # Track which edges we've already notified about
@@ -499,8 +500,7 @@ def auto_trade_edge(edge: Dict, kalshi_api) -> Optional[Dict]:
 
     price = edge['kalshi_price']
 
-    # Calculate contracts to win ~$1 profit
-    # First estimate with approximate per-contract fee, then recalculate with exact fee
+    # Calculate contracts to hit TARGET_PROFIT, capped by MAX_RISK
     approx_fee = kalshi_fee(price)
     approx_profit_per = 1.0 - price - approx_fee
     if approx_profit_per <= 0:
@@ -508,12 +508,25 @@ def auto_trade_edge(edge: Dict, kalshi_api) -> Optional[Dict]:
         return None
     contracts = math.ceil(TARGET_PROFIT / approx_profit_per)
 
+    # Cap by MAX_RISK: total cost cannot exceed MAX_RISK
+    cost_per = price + approx_fee
+    if cost_per > 0:
+        max_by_risk = int(MAX_RISK / cost_per)
+        contracts = min(contracts, max(1, max_by_risk))
+
     # Recalculate with exact fee for this contract count
     fee_total = math.ceil(0.07 * contracts * price * (1 - price) * 100) / 100
     total_cost = (price * contracts) + fee_total
-    total_profit = (1.0 * contracts) - total_cost  # win $1/contract minus cost
+    total_profit = (1.0 * contracts) - total_cost
+
+    # Final safety check
+    if total_cost > MAX_RISK:
+        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds MAX_RISK ${MAX_RISK:.2f}")
+        return None
 
     price_cents = int(round(price * 100))
+
+    print(f"   >>> ARB TRADE: {ticker} {side.upper()} {contracts}x @ ${price:.2f} = ${total_cost:.2f} (profit ${total_profit:.2f})")
 
     # Place the limit order
     result = kalshi_api.place_order(
@@ -2681,7 +2694,9 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
     no_bids_sorted = sorted(no_bids, key=lambda x: x[0], reverse=True)
 
     # Calculate how many contracts we can buy at each price level
-    remaining_balance = avail
+    # Capped by TARGET_PROFIT (max win) and MAX_RISK (max cost)
+    remaining_balance = min(avail, MAX_RISK)  # Cap spending at MAX_RISK
+    remaining_profit_target = TARGET_PROFIT
     total_contracts = 0
     total_cost = 0
     best_price = None
@@ -2703,17 +2718,25 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
 
         # How many can we buy at this level?
         can_afford = int(remaining_balance / cost_per) if cost_per > 0 else 0
-        buy_qty = min(qty, can_afford)
+        # Cap by remaining profit target
+        max_by_profit = int(remaining_profit_target / profit_per) if profit_per > 0 else 0
+        buy_qty = min(qty, can_afford, max(1, max_by_profit))
 
         if buy_qty <= 0:
             break
 
         level_fee = math.ceil(0.07 * buy_qty * yes_price * (1 - yes_price) * 100) / 100
         level_cost = (yes_price * buy_qty) + level_fee
+        level_profit = (1.0 * buy_qty) - level_cost
 
         total_contracts += buy_qty
         total_cost += level_cost
         remaining_balance -= level_cost
+        remaining_profit_target -= level_profit
+
+        # Stop if we've hit our profit target
+        if remaining_profit_target <= 0:
+            break
 
     if total_contracts <= 0 or best_price is None:
         return None
@@ -2721,6 +2744,11 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
     total_profit = (1.0 * total_contracts) - total_cost
 
     if total_profit <= 0:
+        return None
+
+    # Final safety check
+    if total_cost > MAX_RISK:
+        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds MAX_RISK ${MAX_RISK:.2f}")
         return None
 
     # Place the order at the best ask price for the total contracts
@@ -2972,7 +3000,7 @@ def _get_game_scores(espn_path: str, is_soccer: bool = False) -> List[Dict]:
         return []
 
 
-RESOLVED_MAX_WIN = 5.00  # Max profit target per resolved market ($5 during testing)
+RESOLVED_MAX_WIN = TARGET_PROFIT  # Max profit per resolved market (matches global TARGET_PROFIT)
 
 def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
                          sport: str, game_name: str, kalshi_api, ob: dict = None) -> Optional[Dict]:
@@ -3000,9 +3028,10 @@ def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
     if avail <= 0:
         return None
 
-    # Calculate max contracts we can afford
+    # Calculate max contracts we can afford, capped by MAX_RISK
     cost_per = price + fee
-    contracts = int(avail / cost_per) if cost_per > 0 else 0
+    max_spend = min(avail, MAX_RISK)
+    contracts = int(max_spend / cost_per) if cost_per > 0 else 0
     if contracts <= 0:
         return None
 
@@ -3031,12 +3060,9 @@ def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
     if total_profit <= 0:
         return None
 
-    # SAFETY GUARDRAIL: Hard cap on total cost for resolved markets
-    # Even with RESOLVED_MAX_WIN cap, double-check total spend doesn't exceed
-    # a reasonable multiple of expected profit (prevents runaway orders)
-    max_allowed_cost = RESOLVED_MAX_WIN * 20  # Never spend more than 20x the target profit
-    if total_cost > max_allowed_cost:
-        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds max ${max_allowed_cost:.2f} — blocking order")
+    # SAFETY GUARDRAIL: Hard cap on total cost
+    if total_cost > MAX_RISK:
+        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds MAX_RISK ${MAX_RISK:.2f} — blocking order")
         return None
 
     price_cents = int(round(price * 100))
