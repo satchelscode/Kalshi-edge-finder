@@ -153,7 +153,7 @@ TENNIS_SPORTS = {
 AUTO_TRADE_ENABLED = True
 MAX_POSITIONS = 999  # No practical limit
 TARGET_PROFIT = 1.00  # Target $1 profit per trade
-MIN_EDGE_PERCENT = 1.5  # Skip edges below this % (fees/slippage eat small edges)
+MIN_EDGE_PERCENT = 0.5  # Skip edges below this % (fees/slippage eat tiny edges)
 
 # Track which edges we've already notified about
 _notified_edges = set()
