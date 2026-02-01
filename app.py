@@ -2072,35 +2072,107 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
 # LIVE STAT ARBITRAGE — Buy completed props during live games
 # ============================================================
 
-# ESPN stat array indices: ["MIN","PTS","FG","3PT","FT","REB","AST","TO","STL","BLK","OREB","DREB","PF","+/-"]
+# ============================================================
+# ESPN sport configs for live stat arbitrage
+# Each sport has: espn_path, stat_labels_key (skater vs goalie), and stat parsers
+# ============================================================
+
+# ESPN endpoints by sport
+ESPN_SPORTS = {
+    'nba': {
+        'espn_path': 'basketball/nba',
+        'stat_groups': {
+            'skater': {
+                # Labels: ["MIN","PTS","FG","3PT","FT","REB","AST","TO","STL","BLK","OREB","DREB","PF","+/-"]
+                'stats': {
+                    'points':   {'index': 1, 'parse': 'int'},
+                    'rebounds':  {'index': 5, 'parse': 'int'},
+                    'assists':   {'index': 6, 'parse': 'int'},
+                    'threes':    {'index': 3, 'parse': 'made'},
+                    'steals':    {'index': 8, 'parse': 'int'},
+                    'blocks':    {'index': 9, 'parse': 'int'},
+                },
+                'detect_labels': ['MIN', 'PTS'],
+            },
+        },
+    },
+    'ncaab': {
+        'espn_path': 'basketball/mens-college-basketball',
+        'stat_groups': {
+            'skater': {
+                # Same as NBA: ["MIN","PTS","FG","3PT","FT","REB","AST","TO","STL","BLK","OREB","DREB","PF"]
+                'stats': {
+                    'points':   {'index': 1, 'parse': 'int'},
+                    'rebounds':  {'index': 5, 'parse': 'int'},
+                    'assists':   {'index': 6, 'parse': 'int'},
+                    'threes':    {'index': 3, 'parse': 'made'},
+                },
+                'detect_labels': ['MIN', 'PTS'],
+            },
+        },
+    },
+    'nhl': {
+        'espn_path': 'hockey/nhl',
+        'stat_groups': {
+            'skater': {
+                # Labels: ['BS','HT','TK','+/-','TOI','PPTOI','SHTOI','ESTOI','SHFT','G','YTDG','A','S','SM','SOG','FW','FL','FO%','GV','PN','PIM']
+                'stats': {
+                    'points':  {'index': [9, 11], 'parse': 'sum'},  # G + A = points
+                    'goals':   {'index': 9, 'parse': 'int'},
+                    'assists': {'index': 11, 'parse': 'int'},
+                    'shots':   {'index': 14, 'parse': 'int'},  # SOG
+                },
+                'detect_labels': ['BS', 'HT'],
+            },
+            'goalie': {
+                # Labels: ['GA','SA','SOS','SOSA','SV','SV%','ESSV','PPSV','SHSV','TOI','YTDG','PIM']
+                'stats': {
+                    'saves': {'index': 4, 'parse': 'int'},
+                },
+                'detect_labels': ['GA', 'SA'],
+            },
+        },
+    },
+}
+
+# Map Kalshi series -> (espn_sport_key, stat_name, display_sport)
+# Only include series confirmed to exist on Kalshi
 PROP_STAT_MAP = {
-    'KXNBAPTS': {'stat_index': 1, 'stat_name': 'points', 'parse': 'int'},    # PTS
-    'KXNBAREB': {'stat_index': 5, 'stat_name': 'rebounds', 'parse': 'int'},   # REB
-    'KXNBAAST': {'stat_index': 6, 'stat_name': 'assists', 'parse': 'int'},    # AST
-    'KXNBA3PT': {'stat_index': 3, 'stat_name': 'threes', 'parse': 'made'},    # 3PT (format "2-6", take made)
+    # NBA
+    'KXNBAPTS':   {'sport': 'nba', 'stat_name': 'points',   'group': 'skater', 'display': 'NBA'},
+    'KXNBAREB':   {'sport': 'nba', 'stat_name': 'rebounds',  'group': 'skater', 'display': 'NBA'},
+    'KXNBAAST':   {'sport': 'nba', 'stat_name': 'assists',   'group': 'skater', 'display': 'NBA'},
+    'KXNBA3PT':   {'sport': 'nba', 'stat_name': 'threes',    'group': 'skater', 'display': 'NBA'},
+    # NHL
+    'KXNHLPTS':   {'sport': 'nhl', 'stat_name': 'points',  'group': 'skater', 'display': 'NHL'},
+    'KXNHLAST':   {'sport': 'nhl', 'stat_name': 'assists', 'group': 'skater', 'display': 'NHL'},
+    'KXNHLSAVES': {'sport': 'nhl', 'stat_name': 'saves',   'group': 'goalie', 'display': 'NHL'},
 }
 
 # Max price to pay for a completed prop (99 cents = $0.01 profit per contract minimum)
 COMPLETED_PROP_MAX_PRICE = 0.99
 
 
-def _parse_espn_stat(stat_str: str, parse_type: str) -> int:
+def _parse_espn_stat(stat_str: str, parse_type: str, stat_config=None) -> int:
     """Parse ESPN stat string to integer value."""
     try:
         if parse_type == 'made':
             # Format: "2-6" (made-attempted), extract made count
             return int(stat_str.split('-')[0])
+        elif parse_type == 'sum':
+            # Sum multiple indices (e.g. goals + assists for NHL points)
+            return 0  # handled in caller
         else:
             return int(stat_str)
     except (ValueError, IndexError):
         return 0
 
 
-def _get_live_nba_games() -> List[Dict]:
-    """Get currently live NBA games from ESPN scoreboard."""
+def _get_live_games(espn_path: str) -> List[Dict]:
+    """Get currently live games from ESPN scoreboard for any sport."""
     try:
         resp = requests.get(
-            'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard',
+            f'https://site.api.espn.com/apis/site/v2/sports/{espn_path}/scoreboard',
             timeout=10
         )
         resp.raise_for_status()
@@ -2108,8 +2180,8 @@ def _get_live_nba_games() -> List[Dict]:
         live_games = []
         for event in data.get('events', []):
             status = event.get('status', {}).get('type', {}).get('name', '')
-            # STATUS_IN_PROGRESS = live, STATUS_FINAL = just finished (props may still be open)
-            if status in ('STATUS_IN_PROGRESS', 'STATUS_FINAL', 'STATUS_END_PERIOD', 'STATUS_HALFTIME'):
+            if status in ('STATUS_IN_PROGRESS', 'STATUS_FINAL', 'STATUS_END_PERIOD',
+                          'STATUS_HALFTIME', 'STATUS_FIRST_HALF', 'STATUS_SECOND_HALF'):
                 game_id = event.get('id', '')
                 competitors = event.get('competitions', [{}])[0].get('competitors', [])
                 teams = {}
@@ -2124,15 +2196,15 @@ def _get_live_nba_games() -> List[Dict]:
                 })
         return live_games
     except Exception as e:
-        print(f"   ESPN scoreboard error: {e}")
+        print(f"   ESPN scoreboard error ({espn_path}): {e}")
         return []
 
 
-def _get_box_score(game_id: str) -> Dict[str, Dict[str, int]]:
-    """Fetch box score for a game. Returns {player_name: {points, rebounds, assists, threes}}."""
+def _get_box_score(game_id: str, espn_path: str, sport_config: dict) -> Dict[str, Dict[str, int]]:
+    """Fetch box score for a game. Returns {player_name: {stat_name: value, ...}}."""
     try:
         resp = requests.get(
-            f'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={game_id}',
+            f'https://site.api.espn.com/apis/site/v2/sports/{espn_path}/summary?event={game_id}',
             timeout=10
         )
         resp.raise_for_status()
@@ -2141,17 +2213,49 @@ def _get_box_score(game_id: str) -> Dict[str, Dict[str, int]]:
         player_stats = {}
         for team_data in data.get('boxscore', {}).get('players', []):
             for stat_group in team_data.get('statistics', []):
-                # stat_group['labels'] = ["MIN","PTS","FG","3PT","FT","REB","AST",...]
+                labels = stat_group.get('labels', [])
+
+                # Determine which stat group this is (skater vs goalie) by checking labels
+                matched_group = None
+                for group_name, group_config in sport_config['stat_groups'].items():
+                    detect = group_config['detect_labels']
+                    if len(labels) >= len(detect) and all(d in labels for d in detect):
+                        # Make sure it's the right group (not a false match)
+                        # Check first label matches
+                        if labels[0] == detect[0]:
+                            matched_group = (group_name, group_config)
+                            break
+
+                if not matched_group:
+                    continue
+
+                group_name, group_config = matched_group
+
                 for athlete in stat_group.get('athletes', []):
                     name = athlete.get('athlete', {}).get('displayName', '')
                     stats = athlete.get('stats', [])
-                    if name and len(stats) >= 11:
-                        player_stats[name] = {
-                            'points': _parse_espn_stat(stats[1], 'int'),
-                            'rebounds': _parse_espn_stat(stats[5], 'int'),
-                            'assists': _parse_espn_stat(stats[6], 'int'),
-                            'threes': _parse_espn_stat(stats[3], 'made'),
-                        }
+                    if not name or not stats:
+                        continue
+
+                    player_data = player_stats.get(name, {})
+                    for stat_name, cfg in group_config['stats'].items():
+                        idx = cfg['index']
+                        parse = cfg['parse']
+                        if parse == 'sum':
+                            # Sum multiple indices
+                            val = 0
+                            for i in idx:
+                                if i < len(stats):
+                                    try:
+                                        val += int(stats[i])
+                                    except (ValueError, IndexError):
+                                        pass
+                            player_data[stat_name] = val
+                        else:
+                            if isinstance(idx, int) and idx < len(stats):
+                                player_data[stat_name] = _parse_espn_stat(stats[idx], parse)
+                    player_stats[name] = player_data
+
         return player_stats
     except Exception as e:
         print(f"   ESPN box score error for game {game_id}: {e}")
@@ -2171,7 +2275,9 @@ def _match_prop_player(kalshi_player: str, box_score: Dict[str, Dict]) -> Option
         if kp_parts and en_parts and kp_parts[-1] == en_parts[-1]:
             if len(kp_parts) == 1 or len(en_parts) == 1:
                 return espn_name
-            if kp_parts[0] == en_parts[0] or kp_parts[0][0] == en_parts[0][0]:
+            if kp_parts[0] == en_parts[0]:
+                return espn_name
+            if len(kp_parts[0]) >= 3 and len(en_parts[0]) >= 3 and kp_parts[0][:3] == en_parts[0][:3]:
                 return espn_name
         # Substring
         if kp in en or en in kp:
@@ -2181,124 +2287,139 @@ def _match_prop_player(kalshi_player: str, box_score: Dict[str, Dict]) -> Option
 
 def find_completed_props(kalshi_api) -> List[Dict]:
     """Find player prop markets where the target has already been met during live games.
-    These are essentially guaranteed wins — buy YES at any price below $1."""
+    These are essentially guaranteed wins — buy YES at any price below $1.
+    Supports NBA, NCAAB, NHL, and any sport with ESPN box score data."""
     edges = []
 
-    # Step 1: Get live NBA games
-    live_games = _get_live_nba_games()
-    if not live_games:
-        return edges
+    # Group prop series by ESPN sport so we fetch each sport's scoreboard once
+    sports_to_scan = {}  # sport_key -> list of (series_ticker, stat_info)
+    for series_ticker, stat_info in PROP_STAT_MAP.items():
+        sport_key = stat_info['sport']
+        if sport_key not in sports_to_scan:
+            sports_to_scan[sport_key] = []
+        sports_to_scan[sport_key].append((series_ticker, stat_info))
 
-    live_game_ids = {g['game_id'] for g in live_games}
-    live_game_abbrevs = set()
-    for g in live_games:
-        live_game_abbrevs.add(g['home'])
-        live_game_abbrevs.add(g['away'])
-    print(f"   Live NBA games: {len(live_games)} ({', '.join(g['away']+'@'+g['home'] for g in live_games)})")
-
-    # Step 2: Fetch box scores for all live games
-    all_player_stats = {}  # player_name -> {points, rebounds, assists, threes}
-    for game in live_games:
-        box = _get_box_score(game['game_id'])
-        all_player_stats.update(box)
-        time.sleep(0.3)
-
-    if not all_player_stats:
-        return edges
-
-    print(f"   Box scores loaded: {len(all_player_stats)} players")
-
-    # Step 3: For each prop type, find Kalshi markets where target is already met
     date_strs = _get_today_date_strs()
 
-    for series_ticker, stat_info in PROP_STAT_MAP.items():
-        stat_name = stat_info['stat_name']
-        kalshi_markets = kalshi_api.get_markets(series_ticker)
-        today_markets = [m for m in kalshi_markets
-                         if any(ds in m.get('ticker', '') for ds in date_strs)]
+    for sport_key, prop_series_list in sports_to_scan.items():
+        sport_config = ESPN_SPORTS.get(sport_key)
+        if not sport_config:
+            continue
 
-        for m in today_markets:
-            ticker = m.get('ticker', '')
-            title = m.get('title', '')
+        espn_path = sport_config['espn_path']
 
-            # Verify this market's game is actually live by checking team abbrevs in ticker
-            # Ticker format: KXNBAREB-26FEB01LALNYK-NYKMBRIDGES25-4
-            ticker_parts = ticker.split('-')
-            if len(ticker_parts) >= 2:
-                game_part = ticker_parts[1]  # e.g. "26FEB01LALNYK"
-                # Strip the date prefix (e.g. "26FEB01") to get team codes
-                date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
-                # Check if any live game team abbrev appears in the ticker game part
-                game_is_live = any(abbr in date_stripped for abbr in live_game_abbrevs if len(abbr) >= 2)
-                if not game_is_live:
+        # Step 1: Get live games for this sport
+        live_games = _get_live_games(espn_path)
+        if not live_games:
+            continue
+
+        live_game_abbrevs = set()
+        for g in live_games:
+            live_game_abbrevs.add(g['home'])
+            live_game_abbrevs.add(g['away'])
+        display_sport = prop_series_list[0][1]['display']
+        print(f"   Live {display_sport} games: {len(live_games)} ({', '.join(g['away']+'@'+g['home'] for g in live_games)})")
+
+        # Step 2: Fetch box scores for all live games
+        all_player_stats = {}
+        for game in live_games:
+            box = _get_box_score(game['game_id'], espn_path, sport_config)
+            all_player_stats.update(box)
+            time.sleep(0.3)
+
+        if not all_player_stats:
+            continue
+
+        print(f"   {display_sport} box scores loaded: {len(all_player_stats)} players")
+
+        # Step 3: For each prop type in this sport, find Kalshi markets where target is already met
+        for series_ticker, stat_info in prop_series_list:
+            stat_name = stat_info['stat_name']
+            kalshi_markets = kalshi_api.get_markets(series_ticker)
+            today_markets = [m for m in kalshi_markets
+                             if any(ds in m.get('ticker', '') for ds in date_strs)]
+
+            for m in today_markets:
+                ticker = m.get('ticker', '')
+                title = m.get('title', '')
+
+                # Verify this market's game is actually live by checking team abbrevs in ticker
+                ticker_parts = ticker.split('-')
+                if len(ticker_parts) >= 2:
+                    game_part = ticker_parts[1]
+                    date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
+                    game_is_live = any(abbr in date_stripped for abbr in live_game_abbrevs if len(abbr) >= 2)
+                    if not game_is_live:
+                        continue
+
+                # Parse player name and target from title: "LaMelo Ball: 8+ assists"
+                prop_match = re.match(r'^(.+?):\s*(\d+)\+', title)
+                if not prop_match:
                     continue
 
-            # Parse player name and target from title: "LaMelo Ball: 8+ assists"
-            prop_match = re.match(r'^(.+?):\s*(\d+)\+', title)
-            if not prop_match:
-                continue
+                player_name = prop_match.group(1).strip()
+                target = int(prop_match.group(2))
 
-            player_name = prop_match.group(1).strip()
-            target = int(prop_match.group(2))
+                # Match to box score
+                espn_name = _match_prop_player(player_name, all_player_stats)
+                if not espn_name:
+                    continue
 
-            # Match to box score
-            espn_name = _match_prop_player(player_name, all_player_stats)
-            if not espn_name:
-                continue
+                current_stat = all_player_stats[espn_name].get(stat_name, 0)
 
-            current_stat = all_player_stats[espn_name].get(stat_name, 0)
+                # Check if target is already met
+                if current_stat < target:
+                    continue
 
-            # Check if target is already met
-            if current_stat < target:
-                continue
+                # Target met! Get full orderbook to buy everything available
+                ob = kalshi_api.get_orderbook(ticker)
+                if not ob:
+                    continue
+                time.sleep(0.2)
 
-            # Target met! Check the orderbook for asks below $0.99
-            ob = kalshi_api.get_orderbook(ticker)
-            if not ob:
-                continue
-            time.sleep(0.2)
+                yes_price = get_best_yes_price(ob)
+                if yes_price is None or yes_price >= COMPLETED_PROP_MAX_PRICE:
+                    continue
 
-            yes_price = get_best_yes_price(ob)
-            if yes_price is None or yes_price >= COMPLETED_PROP_MAX_PRICE:
-                continue
+                # Calculate profit
+                fee = kalshi_fee(yes_price)
+                profit_per = 1.0 - yes_price - fee
+                if profit_per <= 0:
+                    continue
 
-            # Calculate profit
-            fee = kalshi_fee(yes_price)
-            profit_per = 1.0 - yes_price - fee
-            if profit_per <= 0:
-                continue
-
-            edge = {
-                'market_type': 'Completed Prop',
-                'sport': 'NBA',
-                'game': f"{player_name} - {stat_name}",
-                'team': player_name,
-                'opposite_team': '',
-                'kalshi_price': yes_price,
-                'kalshi_price_after_fees': yes_price + fee,
-                'kalshi_prob_after_fees': (yes_price + fee) * 100,
-                'kalshi_method': f"YES on {player_name} {target}+ {stat_name}",
-                'kalshi_ticker': ticker,
-                'kalshi_side': 'yes',
-                'fanduel_opposite_team': f"Already at {current_stat} {stat_name} (target: {target}+)",
-                'fanduel_opposite_odds': 0,
-                'fanduel_opposite_prob': 0,
-                'total_implied_prob': (yes_price + fee) * 100,
-                'arbitrage_profit': profit_per / (yes_price + fee) * 100,
-                'is_live': True,
-                'is_completed_prop': True,
-                'recommendation': f"BUY {player_name} {target}+ {stat_name} at ${yes_price:.2f} — ALREADY AT {current_stat} (guaranteed)",
-            }
-            edges.append(edge)
-            print(f"   COMPLETED PROP: {player_name} has {current_stat} {stat_name} (target {target}+) — ask ${yes_price:.2f}")
-            send_telegram_notification(edge)
-            auto_trade_completed_prop(edge, kalshi_api)
+                edge = {
+                    'market_type': 'Completed Prop',
+                    'sport': display_sport,
+                    'game': f"{player_name} - {stat_name}",
+                    'team': player_name,
+                    'opposite_team': '',
+                    'kalshi_price': yes_price,
+                    'kalshi_price_after_fees': yes_price + fee,
+                    'kalshi_prob_after_fees': (yes_price + fee) * 100,
+                    'kalshi_method': f"YES on {player_name} {target}+ {stat_name}",
+                    'kalshi_ticker': ticker,
+                    'kalshi_side': 'yes',
+                    'fanduel_opposite_team': f"Already at {current_stat} {stat_name} (target: {target}+)",
+                    'fanduel_opposite_odds': 0,
+                    'fanduel_opposite_prob': 0,
+                    'total_implied_prob': (yes_price + fee) * 100,
+                    'arbitrage_profit': profit_per / (yes_price + fee) * 100,
+                    'is_live': True,
+                    'is_completed_prop': True,
+                    'orderbook': ob,  # Pass full orderbook for max sizing
+                    'recommendation': f"BUY {player_name} {target}+ {stat_name} at ${yes_price:.2f} — ALREADY AT {current_stat} (guaranteed)",
+                }
+                edges.append(edge)
+                print(f"   COMPLETED PROP: {player_name} has {current_stat} {stat_name} (target {target}+) — ask ${yes_price:.2f}")
+                send_telegram_notification(edge)
+                auto_trade_completed_prop(edge, kalshi_api)
 
     return edges
 
 
 def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
-    """Auto-trade a completed prop. Buy as many contracts as possible since it's guaranteed money."""
+    """Auto-trade a completed prop. Buy MAX contracts since it's guaranteed money.
+    Sweeps the entire ask side of the orderbook up to account balance."""
     global _order_tracker
 
     if not AUTO_TRADE_ENABLED:
@@ -2315,51 +2436,106 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
         return None
 
     price = edge['kalshi_price']
-    fee = kalshi_fee(price)
-    profit_per = 1.0 - price - fee
 
-    if profit_per <= 0:
-        return None
-
-    # For completed props, buy more contracts since it's guaranteed
-    # Target $5 profit instead of $1 since there's no risk
-    target_profit = 5.00
-    contracts = min(math.ceil(target_profit / profit_per), 100)
-
-    # Recalculate exact fee for this contract count
-    fee_total = math.ceil(0.07 * contracts * price * (1 - price) * 100) / 100
-    total_cost = (price * contracts) + fee_total
-    total_profit = (1.0 * contracts) - total_cost
-
-    # Check we can afford it
+    # Get account balance to determine max spend
     balance = kalshi_api.get_balance()
+    avail = 0
     if balance:
-        avail = balance.get('balance', 0) / 100
-        if total_cost > avail:
-            contracts = max(1, int(avail / (price + fee)))
-            fee_total = math.ceil(0.07 * contracts * price * (1 - price) * 100) / 100
-            total_cost = (price * contracts) + fee_total
-            total_profit = (1.0 * contracts) - total_cost
+        avail = balance.get('balance', 0) / 100  # cents to dollars
 
-    if contracts <= 0 or total_profit <= 0:
+    if avail <= 0:
+        print(f"   >>> No balance available for completed prop {ticker}")
         return None
 
-    price_cents = int(round(price * 100))
+    # Sweep the ask side: buy at the best ask price, as many as we can afford
+    # The orderbook has no_bids — YES ask = 100 - no_bid price
+    # We want to buy at every price level below $0.99
+    ob = edge.get('orderbook') or kalshi_api.get_orderbook(ticker)
+    if not ob:
+        return None
 
-    print(f"   >>> COMPLETED PROP TRADE: {ticker} YES {contracts}x @ ${price:.2f} = ${total_cost:.2f} (guaranteed profit ${total_profit:.2f})")
+    ob_data = ob.get('orderbook', {})
+    no_bids = ob_data.get('no', [])  # Each is [price_cents, quantity]
 
-    order = kalshi_api.place_order(ticker, 'yes', price_cents, contracts)
+    if not no_bids:
+        return None
+
+    # Sort no bids descending by price (highest no bid = cheapest YES ask)
+    no_bids_sorted = sorted(no_bids, key=lambda x: x[0], reverse=True)
+
+    # Calculate how many contracts we can buy at each price level
+    remaining_balance = avail
+    total_contracts = 0
+    total_cost = 0
+    best_price = None
+
+    for bid_price_cents, qty in no_bids_sorted:
+        yes_price = (100 - bid_price_cents) / 100.0
+        if yes_price >= COMPLETED_PROP_MAX_PRICE:
+            continue
+
+        fee_per = kalshi_fee(yes_price)
+        cost_per = yes_price + fee_per
+        profit_per = 1.0 - cost_per
+
+        if profit_per <= 0:
+            continue
+
+        if best_price is None:
+            best_price = yes_price
+
+        # How many can we buy at this level?
+        can_afford = int(remaining_balance / cost_per) if cost_per > 0 else 0
+        buy_qty = min(qty, can_afford)
+
+        if buy_qty <= 0:
+            break
+
+        level_fee = math.ceil(0.07 * buy_qty * yes_price * (1 - yes_price) * 100) / 100
+        level_cost = (yes_price * buy_qty) + level_fee
+
+        total_contracts += buy_qty
+        total_cost += level_cost
+        remaining_balance -= level_cost
+
+    if total_contracts <= 0 or best_price is None:
+        return None
+
+    total_profit = (1.0 * total_contracts) - total_cost
+
+    if total_profit <= 0:
+        return None
+
+    # Place the order at the best ask price for the total contracts
+    # Kalshi will fill at best available prices up to our limit price
+    # Use the worst (highest) YES price we're willing to pay as limit
+    worst_yes_cents = 99  # max $0.99
+    for bid_price_cents, qty in no_bids_sorted:
+        yes_price = (100 - bid_price_cents) / 100.0
+        if yes_price >= COMPLETED_PROP_MAX_PRICE:
+            continue
+        fee_per = kalshi_fee(yes_price)
+        if (1.0 - yes_price - fee_per) > 0:
+            worst_yes_cents = int(round(yes_price * 100))
+
+    # Place at best price — Kalshi limit orders fill at best available
+    price_cents = int(round(best_price * 100))
+
+    print(f"   >>> COMPLETED PROP MAX TRADE: {ticker} YES {total_contracts}x @ ${best_price:.2f} = ${total_cost:.2f} (guaranteed profit ${total_profit:.2f})")
+
+    order = kalshi_api.place_order(ticker, 'yes', price_cents, total_contracts)
     if order:
+        fee_total = math.ceil(0.07 * total_contracts * best_price * (1 - best_price) * 100) / 100
         order_info = {
             'ticker': ticker,
             'side': 'yes',
-            'price': price,
+            'price': best_price,
             'fee': fee_total,
-            'contracts': contracts,
+            'contracts': total_contracts,
             'cost': total_cost,
             'potential_profit': total_profit,
             'edge_pct': edge['arbitrage_profit'],
-            'sport': 'NBA',
+            'sport': edge.get('sport', 'NBA'),
             'market_type': 'Completed Prop',
             'game': edge.get('game', ''),
             'team': edge.get('team', ''),
