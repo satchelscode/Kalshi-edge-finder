@@ -2451,7 +2451,12 @@ def find_completed_props(kalshi_api) -> List[Dict]:
                     continue  # Require valid date to prevent stale matching
                 player_game_date = all_player_stats[espn_name].get('_game_date', '')
                 if player_game_date and ticker_date_str != player_game_date:
-                    print(f"   Skipping {player_name}: game date {player_game_date} != ticker date {ticker_date_str}")
+                    _skip_key = f"{player_name}:{player_game_date}:{ticker_date_str}"
+                    if not hasattr(find_completed_props, '_logged'):
+                        find_completed_props._logged = set()
+                    if _skip_key not in find_completed_props._logged:
+                        find_completed_props._logged.add(_skip_key)
+                        print(f"   Skipping {player_name}: game date {player_game_date} != ticker date {ticker_date_str}")
                     continue
 
                 # Verify the player's game teams BOTH appear in this ticker
@@ -2904,6 +2909,9 @@ def _find_game_for_ticker(date_stripped: str, abbrev_to_game: dict, team_abbrs: 
     2. Verifies the game date matches the ticker date to prevent matching
        yesterday's results to today's markets.
     """
+    _logged = getattr(_find_game_for_ticker, '_logged', set())
+    _find_game_for_ticker._logged = _logged
+
     def _date_matches(candidate):
         if not ticker_date_str:
             return True
@@ -2927,12 +2935,18 @@ def _find_game_for_ticker(date_stripped: str, abbrev_to_game: dict, team_abbrs: 
                         if require_final and not candidate['is_final']:
                             continue
                         if not _date_matches(candidate):
-                            print(f"   Skipping {t1}v{t2}: game date {candidate.get('game_date_str','')} != ticker {ticker_date_str}")
+                            log_key = f"date:{t1}v{t2}:{ticker_date_str}"
+                            if log_key not in _logged:
+                                _logged.add(log_key)
+                                print(f"   Skipping {t1}v{t2}: game date {candidate.get('game_date_str','')} != ticker {ticker_date_str}")
                             continue
                         return candidate
                     else:
                         # Teams are from different games — NOT a match
-                        print(f"   Skipping {t1}v{t2}: different games ({game1['away']}@{game1['home']} vs {game2['away']}@{game2['home']})")
+                        log_key = f"diff:{t1}v{t2}"
+                        if log_key not in _logged:
+                            _logged.add(log_key)
+                            print(f"   Skipping {t1}v{t2}: different games ({game1['away']}@{game1['home']} vs {game2['away']}@{game2['home']})")
                         continue
 
     # Method 2: Fallback for NCAAB (no team_abbrs set) — require BOTH teams in same game
