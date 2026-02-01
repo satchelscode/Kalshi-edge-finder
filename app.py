@@ -2650,7 +2650,8 @@ CRYPTO_BUFFER_TIERS = [
 
 
 def _get_game_scores(espn_path: str) -> List[Dict]:
-    """Get all games with scores from ESPN (live + final)."""
+    """Get all games with scores from ESPN (live + final).
+    Includes game_date_str (e.g. '26JAN31') to verify against Kalshi ticker dates."""
     try:
         resp = requests.get(
             f'https://site.api.espn.com/apis/site/v2/sports/{espn_path}/scoreboard',
@@ -2661,6 +2662,17 @@ def _get_game_scores(espn_path: str) -> List[Dict]:
         games = []
         for event in data.get('events', []):
             status = event.get('status', {}).get('type', {}).get('name', '')
+            # Extract game date from ESPN event (ISO format: "2026-01-31T00:00Z")
+            game_date_str = ''
+            event_date = event.get('date', '') or ''
+            if event_date and len(event_date) >= 10:
+                try:
+                    gd = datetime.fromisoformat(event_date.replace('Z', '+00:00'))
+                    # Convert to US Eastern for the actual game date
+                    gd_eastern = gd - timedelta(hours=5)
+                    game_date_str = gd_eastern.strftime('%y%b%d').upper()
+                except Exception:
+                    pass
             comps = event.get('competitions', [{}])[0].get('competitors', [])
             teams = {}
             for c in comps:
@@ -2688,6 +2700,7 @@ def _get_game_scores(espn_path: str) -> List[Dict]:
                 'is_final': status == 'STATUS_FINAL',
                 'is_live': status in ('STATUS_IN_PROGRESS', 'STATUS_END_PERIOD',
                                        'STATUS_HALFTIME', 'STATUS_FIRST_HALF', 'STATUS_SECOND_HALF'),
+                'game_date_str': game_date_str,
             })
         return games
     except Exception as e:
@@ -2703,7 +2716,9 @@ def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
     if not AUTO_TRADE_ENABLED:
         return None
 
-    if _order_tracker.has_position(ticker):
+    # Use has_game_position to prevent betting both sides of the same game
+    if _order_tracker.has_game_position(ticker):
+        print(f"   Skipping {ticker}: already have position in this game")
         return None
 
     fee = kalshi_fee(price)
@@ -2798,11 +2813,24 @@ def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
 
 
 def _find_game_for_ticker(date_stripped: str, abbrev_to_game: dict, team_abbrs: set,
-                          require_final: bool = False) -> Optional[Dict]:
+                          require_final: bool = False,
+                          ticker_date_str: str = '') -> Optional[Dict]:
     """Match a Kalshi ticker's team portion to an ESPN game.
     Uses exact two-team parsing instead of substring matching to avoid
     false matches (e.g. ESPN 'SA' matching Kalshi 'SAC').
+
+    CRITICAL: If ticker_date_str is provided, verifies the game date matches
+    the ticker date to prevent matching yesterday's results to today's markets.
     """
+    def _date_matches(candidate):
+        """Check that the game date matches the ticker date."""
+        if not ticker_date_str:
+            return True  # No date check requested
+        game_date = candidate.get('game_date_str', '')
+        if not game_date:
+            return True  # No game date available, allow match
+        return game_date == ticker_date_str
+
     # Method 1: Try all split points to find two known Kalshi abbreviations
     if team_abbrs:
         for i in range(1, len(date_stripped)):
@@ -2814,12 +2842,17 @@ def _find_game_for_ticker(date_stripped: str, abbrev_to_game: dict, team_abbrs: 
                         candidate = abbrev_to_game[t]
                         if require_final and not candidate['is_final']:
                             continue
+                        if not _date_matches(candidate):
+                            print(f"   Skipping {t}: game date {candidate.get('game_date_str','')} != ticker date {ticker_date_str}")
+                            continue
                         return candidate
     # Method 2: Fallback — direct lookup (for NCAAB or if team_abbrs is empty)
     for abbr in abbrev_to_game:
         if abbr in date_stripped:
             candidate = abbrev_to_game[abbr]
             if require_final and not candidate['is_final']:
+                continue
+            if not _date_matches(candidate):
                 continue
             return candidate
     return None
@@ -2850,7 +2883,9 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
 
         print(f"   {display}: {len(final_games)} final, {len(live_games)} live games")
         for g in final_games[:3]:
-            print(f"      FINAL: {g['away']} {g['away_score']} @ {g['home']} {g['home_score']}")
+            print(f"      FINAL [{g.get('game_date_str','')}]: {g['away']} {g['away_score']} @ {g['home']} {g['home_score']}")
+        for g in live_games[:3]:
+            print(f"      LIVE [{g.get('game_date_str','')}]: {g['away']} @ {g['home']}")
 
         # Build lookup: team_abbrev -> game info (uses Kalshi abbreviations now)
         all_relevant = final_games + live_games
@@ -2874,10 +2909,13 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                     continue
                 team_abbr = parts[-1]
                 game_part = parts[1]
+                # Extract ticker date (e.g. '26FEB01') and team portion (e.g. 'ORLSAS')
+                ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
+                ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
                 date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
 
                 game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
-                                             require_final=True)
+                                             require_final=True, ticker_date_str=ticker_date_str)
                 if not game:
                     continue
 
@@ -2932,9 +2970,12 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 floor_strike = float(floor_strike)
 
                 game_part = parts[1]
+                ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
+                ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
                 date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
 
-                game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs)
+                game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
+                                             ticker_date_str=ticker_date_str)
                 if not game:
                     continue
 
@@ -3005,10 +3046,12 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 floor_strike = float(floor_strike)
 
                 game_part = parts[1]
+                ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
+                ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
                 date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
 
                 game = _find_game_for_ticker(date_stripped, abbrev_to_game, team_abbrs,
-                                             require_final=True)
+                                             require_final=True, ticker_date_str=ticker_date_str)
                 if not game:
                     continue
 
