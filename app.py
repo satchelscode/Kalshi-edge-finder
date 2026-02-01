@@ -3163,14 +3163,14 @@ def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
 
         print(f"   Scanning {series}: {len(kalshi_markets)} markets")
 
-        # Debug: show first market's fields to identify close_time key
+        # Debug: show first market's structure to identify fields and market types
         if kalshi_markets:
             m0 = kalshi_markets[0]
             time_fields = {k: v for k, v in m0.items()
                           if 'time' in k.lower() or 'date' in k.lower() or 'expir' in k.lower() or 'close' in k.lower()}
-            print(f"   DEBUG {series} first market time fields: {time_fields}")
-            if 'floor_strike' in m0 or 'cap_strike' in m0:
-                print(f"   DEBUG {series} strikes: floor={m0.get('floor_strike')}, cap={m0.get('cap_strike')}")
+            print(f"   DEBUG {series} time fields: {time_fields}")
+            print(f"   DEBUG {series} first: ticker={m0.get('ticker','')}, title={m0.get('title','')}")
+            print(f"   DEBUG {series} strikes: floor={m0.get('floor_strike')}, cap={m0.get('cap_strike')}")
 
         skipped_no_time = 0
         skipped_too_far = 0
@@ -3222,64 +3222,120 @@ def find_resolved_crypto_markets(kalshi_api) -> List[Dict]:
                         required_buffer = buf
                         break
 
-            # Parse the threshold from floor_strike or title
+            # Determine market type from title and strikes
+            # Three types: "above X", "below X / X or below", "X to Y" (range)
             floor_strike = m.get('floor_strike')
-            if floor_strike is not None:
-                threshold = float(floor_strike)
-            else:
-                # Try to parse from title: "Bitcoin above $80,000" or "$78,750 or above"
-                price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', title)
-                if price_match:
-                    try:
-                        threshold = float(price_match.group(1).replace(',', ''))
-                    except ValueError:
-                        skipped_no_threshold += 1
-                        continue
-                else:
+            cap_strike = m.get('cap_strike')
+            title_lower = title.lower()
+
+            # Detect market type
+            is_above = 'above' in title_lower or 'or more' in title_lower or 'or higher' in title_lower
+            is_below = 'below' in title_lower or 'or less' in title_lower or 'or lower' in title_lower
+            is_range = (' to ' in title_lower or ' - ' in title_lower) and not is_above and not is_below
+
+            # For range markets: need BOTH floor and cap strikes
+            if is_range or (cap_strike is not None and floor_strike is not None
+                           and float(cap_strike) != float(floor_strike) and not is_above and not is_below):
+                # Range market: YES = price is in [floor, cap]
+                if floor_strike is None or cap_strike is None:
+                    skipped_no_threshold += 1
+                    continue
+                range_low = float(floor_strike)
+                range_high = float(cap_strike)
+                if range_low <= 0 or range_high <= 0:
                     skipped_no_threshold += 1
                     continue
 
-            # Skip if threshold is 0 or nonsensical
-            if threshold <= 0:
-                skipped_no_threshold += 1
-                continue
+                # Check buffer from BOTH edges of the range
+                if current_price > range_high:
+                    # Price above range — NO wins (not in range)
+                    buffer_pct = (current_price - range_high) / current_price
+                    if buffer_pct < required_buffer:
+                        skipped_buffer += 1
+                        continue
+                    side = 'no'
+                    reason_detail = f"${current_price:,.0f} above range ${range_low:,.0f}-${range_high:,.0f}"
+                elif current_price < range_low:
+                    # Price below range — NO wins (not in range)
+                    buffer_pct = (range_low - current_price) / current_price
+                    if buffer_pct < required_buffer:
+                        skipped_buffer += 1
+                        continue
+                    side = 'no'
+                    reason_detail = f"${current_price:,.0f} below range ${range_low:,.0f}-${range_high:,.0f}"
+                else:
+                    # Price IN range — YES might win, but too risky (can exit range)
+                    # Only bet YES on range if expired (outcome known for certain)
+                    if not is_expired:
+                        skipped_buffer += 1
+                        continue
+                    side = 'yes'
+                    buffer_pct = min(
+                        (current_price - range_low) / current_price,
+                        (range_high - current_price) / current_price
+                    )
+                    reason_detail = f"${current_price:,.0f} IN range ${range_low:,.0f}-${range_high:,.0f}"
+            else:
+                # Single-threshold market: above or below
+                if floor_strike is not None:
+                    threshold = float(floor_strike)
+                else:
+                    price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', title)
+                    if price_match:
+                        try:
+                            threshold = float(price_match.group(1).replace(',', ''))
+                        except ValueError:
+                            skipped_no_threshold += 1
+                            continue
+                    else:
+                        skipped_no_threshold += 1
+                        continue
 
-            # Calculate buffer between current price and threshold
-            buffer_pct = abs(current_price - threshold) / current_price
+                if threshold <= 0:
+                    skipped_no_threshold += 1
+                    continue
 
-            # Is the buffer large enough given time remaining?
-            if buffer_pct < required_buffer:
-                skipped_buffer += 1
-                continue  # Too close to call
+                buffer_pct = abs(current_price - threshold) / current_price
+                if buffer_pct < required_buffer:
+                    skipped_buffer += 1
+                    continue
+
+                if is_below:
+                    # "Below X" market: YES = price < X, NO = price >= X
+                    if current_price < threshold:
+                        side = 'yes'
+                        reason_detail = f"${current_price:,.0f} < ${threshold:,.0f} (below market)"
+                    else:
+                        side = 'no'
+                        reason_detail = f"${current_price:,.0f} > ${threshold:,.0f} (below market, NO wins)"
+                else:
+                    # "Above X" market (default): YES = price >= X, NO = price < X
+                    if current_price > threshold:
+                        side = 'yes'
+                        reason_detail = f"${current_price:,.0f} > ${threshold:,.0f}"
+                    else:
+                        side = 'no'
+                        reason_detail = f"${current_price:,.0f} < ${threshold:,.0f}"
 
             checked += 1
+            time_str = f"{minutes_to_close:.0f}min left" if minutes_to_close and not is_expired else "EXPIRED"
 
-            # Determine which side wins
             ob = kalshi_api.get_orderbook(ticker)
             if not ob:
                 continue
             time.sleep(0.15)
 
-            time_str = f"{minutes_to_close:.0f}min left" if minutes_to_close and not is_expired else "EXPIRED"
+            if side == 'yes':
+                ask_price = get_best_yes_price(ob)
+            else:
+                ask_price = get_best_no_price(ob)
 
-            if current_price > threshold:
-                # Price above threshold — YES wins
-                yes_price = get_best_yes_price(ob)
-                if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
-                    reason = f"${current_price:,.0f} > ${threshold:,.0f} ({time_str}, buffer {buffer_pct:.1%})"
-                    result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
-                                                   'Crypto', f"Above ${threshold:,.0f}", kalshi_api, ob)
-                    if result:
-                        edges.append(result)
-            elif current_price < threshold:
-                # Price below threshold — NO wins
-                no_price = get_best_no_price(ob)
-                if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
-                    reason = f"${current_price:,.0f} < ${threshold:,.0f} ({time_str}, buffer {buffer_pct:.1%})"
-                    result = _buy_resolved_market(ticker, 'no', no_price, reason,
-                                                   'Crypto', f"Below ${threshold:,.0f}", kalshi_api, ob)
-                    if result:
-                        edges.append(result)
+            if ask_price and ask_price < COMPLETED_PROP_MAX_PRICE:
+                reason = f"{reason_detail} ({time_str}, buffer {buffer_pct:.1%})"
+                result = _buy_resolved_market(ticker, side, ask_price, reason,
+                                               'Crypto', reason_detail, kalshi_api, ob)
+                if result:
+                    edges.append(result)
 
         print(f"   {series} filter: {skipped_no_time} no-time, {skipped_too_far} too-far, "
               f"{skipped_buffer} buffer, {skipped_no_threshold} no-threshold, {checked} checked")
