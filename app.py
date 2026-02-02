@@ -157,10 +157,12 @@ TARGET_PROFIT = 5.00  # Target $5 profit per trade (was $1)
 MAX_RISK = 250.00     # Max total cost per single order ($250)
 MIN_EDGE_PERCENT = 0.5  # Skip edges below this % (fees/slippage eat tiny edges)
 
-# Crypto-specific overrides: crypto resolved markets have 91% win rate and
+# Crypto & Index overrides: these resolved markets have high win rates and
 # expired markets are zero-risk, so we size more aggressively.
 CRYPTO_TARGET_PROFIT = 10.00  # Target $10 profit per crypto trade
 CRYPTO_MAX_RISK = 500.00      # Max $500 cost per crypto order
+INDEX_TARGET_PROFIT = 10.00   # Target $10 profit per index trade (S&P/Nasdaq)
+INDEX_MAX_RISK = 500.00       # Max $500 cost per index order
 
 # Track which edges we've already notified about
 _notified_edges = set()
@@ -4123,7 +4125,9 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
                 if ask_price and ask_price < COMPLETED_PROP_MAX_PRICE:
                     reason = f"{reason_detail} ({time_str}, buffer {buffer_pct:.1%})"
                     result = _buy_resolved_market(ticker, side, ask_price, reason,
-                                                   display, reason_detail, kalshi_api, ob)
+                                                   display, reason_detail, kalshi_api, ob,
+                                                   target_profit=INDEX_TARGET_PROFIT,
+                                                   max_risk=INDEX_MAX_RISK)
                     if result:
                         edges.append(result)
 
