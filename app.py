@@ -1876,11 +1876,7 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
             }
             edges.append(edge)
             send_telegram_notification(edge)
-            # NOTE: Regular player prop edges are NOT auto-traded.
-            # These are speculative (player hasn't hit threshold yet) and
-            # historically lose money. Only completed props (guaranteed wins
-            # where the player already hit the target) are auto-traded via
-            # auto_trade_completed_prop() in find_completed_props().
+            auto_trade_edge(edge, kalshi_api)
 
     return edges
 
@@ -3221,7 +3217,13 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
     - LIVE games: if current total already exceeds the over line, Over is guaranteed
     """
     edges = []
+    # Include yesterday's dates too — European soccer games played in afternoon
+    # UK time may have Kalshi tickers dated the prior US day.
     date_strs = _get_today_date_strs()
+    yesterday_utc = datetime.now(timezone.utc) - timedelta(days=1)
+    yesterday_et = _get_eastern_now() - timedelta(days=1)
+    date_strs.add(yesterday_utc.strftime('%y%b%d').upper())
+    date_strs.add(yesterday_et.strftime('%y%b%d').upper())
 
     for sport_key, config in RESOLVED_GAME_SPORTS.items():
         espn_path = config['espn_path']
@@ -3262,10 +3264,13 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
             kalshi_markets = kalshi_api.get_markets(ml_series)
             today_markets = [m for m in kalshi_markets
                              if any(ds in m.get('ticker', '') for ds in date_strs)]
-            print(f"   {ml_series}: {len(kalshi_markets)} total, {len(today_markets)} today")
+            print(f"   {ml_series}: {len(kalshi_markets)} total, {len(today_markets)} today (dates: {date_strs})")
             if today_markets:
                 for _tm in today_markets[:3]:
                     print(f"      ticker: {_tm.get('ticker','')}")
+            elif kalshi_markets and final_games:
+                # Debug: show sample tickers when finals exist but 0 matched today
+                print(f"      DEBUG no match — sample tickers: {[m.get('ticker','')[:40] for m in kalshi_markets[:3]]}")
             time.sleep(0.5)
 
             _ml_matched = 0
@@ -3573,8 +3578,8 @@ def _classify_kalshi_market(m: dict) -> Optional[Dict]:
         m.get('no_sub_title', '') or '',
     ]).lower()
 
-    is_above = 'above' in all_text or 'or more' in all_text or 'or higher' in all_text
-    is_below = 'below' in all_text or 'or less' in all_text or 'or lower' in all_text
+    is_above = 'above' in all_text or 'or more' in all_text or 'or higher' in all_text or 'at least' in all_text
+    is_below = 'below' in all_text or 'or less' in all_text or 'or lower' in all_text or 'under $' in all_text or 'under ¢' in all_text
     is_range_kw = (' to ' in all_text or ' - ' in all_text) and not is_above and not is_below
 
     # Structural range detection: both strikes exist and differ
@@ -3629,7 +3634,15 @@ def _classify_kalshi_market(m: dict) -> Optional[Dict]:
     if has_both_strikes:
         f, c = float(floor_strike), float(cap_strike)
         if f == c and f > 0:
-            # Same strike = single threshold but unknown direction — skip
+            # Same strike = single threshold but unknown direction.
+            # For known directional crypto series (KXDOGED, KXSHIBD, etc.),
+            # these are always "above" markets (ticker has -T prefix).
+            # Check the ticker to confirm.
+            ticker = m.get('ticker', '')
+            if '-T' in ticker and any(ticker.startswith(s) for s in
+                    ('KXDOGED', 'KXSHIBD', 'KXBTCD', 'KXETHD', 'KXSOLD',
+                     'KXINXU', 'KXNASDAQ')):
+                return {'type': 'above', 'threshold': f}
             return None
         # Different strikes but no keywords — likely range, already handled above
         return None
