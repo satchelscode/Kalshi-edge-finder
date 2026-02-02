@@ -164,6 +164,11 @@ CRYPTO_MAX_RISK = 500.00      # Max $500 cost per crypto order
 INDEX_TARGET_PROFIT = 10.00   # Target $10 profit per index trade (S&P/Nasdaq)
 INDEX_MAX_RISK = 500.00       # Max $500 cost per index order
 
+# Completed props are GUARANTEED wins (player already hit threshold).
+# No reason to cap — buy as much as the orderbook and balance allow.
+COMPLETED_PROP_TARGET_PROFIT = 999.00  # Effectively uncapped
+COMPLETED_PROP_MAX_RISK = 5000.00      # Use up to $5000 (balance is real cap)
+
 # Track which edges we've already notified about
 _notified_edges = set()
 
@@ -2700,10 +2705,10 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
     # Sort no bids descending by price (highest no bid = cheapest YES ask)
     no_bids_sorted = sorted(no_bids, key=lambda x: x[0], reverse=True)
 
-    # Calculate how many contracts we can buy at each price level
-    # Capped by TARGET_PROFIT (max win) and MAX_RISK (max cost)
-    remaining_balance = min(avail, MAX_RISK)  # Cap spending at MAX_RISK
-    remaining_profit_target = TARGET_PROFIT
+    # Completed props are GUARANTEED — player already hit the threshold.
+    # Use aggressive limits: buy as much as orderbook + balance allow.
+    remaining_balance = min(avail, COMPLETED_PROP_MAX_RISK)
+    remaining_profit_target = COMPLETED_PROP_TARGET_PROFIT
     total_contracts = 0
     total_cost = 0
     best_price = None
@@ -2754,8 +2759,8 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
         return None
 
     # Final safety check
-    if total_cost > MAX_RISK:
-        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds MAX_RISK ${MAX_RISK:.2f}")
+    if total_cost > COMPLETED_PROP_MAX_RISK:
+        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds COMPLETED_PROP_MAX_RISK ${COMPLETED_PROP_MAX_RISK:.2f}")
         return None
 
     # Place the order at the best ask price for the total contracts
