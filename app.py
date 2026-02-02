@@ -159,10 +159,22 @@ MIN_EDGE_PERCENT = 0.5  # Skip edges below this % (fees/slippage eat tiny edges)
 
 # Crypto & Index overrides: these resolved markets have high win rates and
 # expired markets are zero-risk, so we size more aggressively.
-CRYPTO_TARGET_PROFIT = 10.00  # Target $10 profit per crypto trade
-CRYPTO_MAX_RISK = 500.00      # Max $500 cost per crypto order
-INDEX_TARGET_PROFIT = 10.00   # Target $10 profit per index trade (S&P/Nasdaq)
-INDEX_MAX_RISK = 500.00       # Max $500 cost per index order
+CRYPTO_TARGET_PROFIT = 10.00  # Default target (used as fallback)
+CRYPTO_MAX_RISK = 500.00      # Default max risk (used as fallback)
+INDEX_TARGET_PROFIT = 10.00   # Default target (used as fallback)
+INDEX_MAX_RISK = 500.00       # Default max risk (used as fallback)
+
+# Tiered position sizing for crypto & index sniper.
+# Bigger buffer = more confident = larger position.
+# Format: (min_buffer_pct, target_profit, max_risk)
+# Checked top-down: first match wins.
+CRYPTO_SIZING_TIERS = [
+    (0.02,  20.00, 1000.00),  # 2%+ buffer:    very confident → $20 target, $1000 risk
+    (0.01,  15.00,  750.00),  # 1-2% buffer:   confident      → $15 target, $750 risk
+    (0.005, 10.00,  500.00),  # 0.5-1% buffer: moderate        → $10 target, $500 risk
+    (0.001,  5.00,  250.00),  # 0.1-0.5%:      small edge      → $5 target, $250 risk
+    (0.0,    3.00,  150.00),  # <0.1%:         minimal edge    → $3 target, $150 risk
+]
 
 # Completed props are GUARANTEED wins (player already hit threshold).
 # No reason to cap — buy as much as the orderbook and balance allow.
@@ -3844,11 +3856,19 @@ def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> L
                 ask_price = get_best_no_price(ob)
 
             if ask_price and ask_price < COMPLETED_PROP_MAX_PRICE:
+                # Tiered sizing: bigger buffer = more confident = larger position
+                tier_target, tier_risk = CRYPTO_TARGET_PROFIT, CRYPTO_MAX_RISK
+                for min_buf, t_profit, t_risk in CRYPTO_SIZING_TIERS:
+                    if buffer_pct >= min_buf:
+                        tier_target, tier_risk = t_profit, t_risk
+                        break
+
                 reason = f"{reason_detail} ({time_str}, buffer {buffer_pct:.1%})"
+                print(f"      {ticker}: buffer={buffer_pct:.2%} → sizing ${tier_target:.0f} target / ${tier_risk:.0f} max")
                 result = _buy_resolved_market(ticker, side, ask_price, reason,
                                                'Crypto', reason_detail, kalshi_api, ob,
-                                               target_profit=CRYPTO_TARGET_PROFIT,
-                                               max_risk=CRYPTO_MAX_RISK)
+                                               target_profit=tier_target,
+                                               max_risk=tier_risk)
                 if result:
                     edges.append(result)
 
@@ -4184,11 +4204,19 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
                     ask_price = get_best_no_price(ob)
 
                 if ask_price and ask_price < COMPLETED_PROP_MAX_PRICE:
+                    # Tiered sizing: bigger buffer = more confident = larger position
+                    tier_target, tier_risk = INDEX_TARGET_PROFIT, INDEX_MAX_RISK
+                    for min_buf, t_profit, t_risk in CRYPTO_SIZING_TIERS:
+                        if buffer_pct >= min_buf:
+                            tier_target, tier_risk = t_profit, t_risk
+                            break
+
                     reason = f"{reason_detail} ({time_str}, buffer {buffer_pct:.1%})"
+                    print(f"      {ticker}: buffer={buffer_pct:.2%} → sizing ${tier_target:.0f} target / ${tier_risk:.0f} max")
                     result = _buy_resolved_market(ticker, side, ask_price, reason,
                                                    display, reason_detail, kalshi_api, ob,
-                                                   target_profit=INDEX_TARGET_PROFIT,
-                                                   max_risk=INDEX_MAX_RISK)
+                                                   target_profit=tier_target,
+                                                   max_risk=tier_risk)
                     if result:
                         edges.append(result)
 
