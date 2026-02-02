@@ -2085,12 +2085,11 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
     """Find edges on tennis match-winner markets."""
     converter = OddsConverter()
     edges = []
-    date_strs = _get_today_date_strs()
-
     # Step 1: Fetch Kalshi markets
+    # NOTE: No date filter for tennis — tennis tickers don't embed dates like
+    # team sports (KXNBAGAME-26FEB02...). All open markets are current/relevant.
     kalshi_markets = kalshi_api.get_markets(series_ticker)
-    today_markets = [m for m in kalshi_markets
-                     if any(ds in m.get('ticker', '') for ds in date_strs)]
+    today_markets = kalshi_markets  # Use all open markets
     if not today_markets:
         return edges
 
@@ -2132,7 +2131,11 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
             matches[event] = []
         matches[event].append(m)
 
+    print(f"   Kalshi {sport_name}: {len(matches)} matches from {len(today_markets)} markets")
+
     # Step 4: For each match, find FD odds and check for edges
+    _matched_fd = 0
+    _no_fd_match = 0
     for event_ticker, match_markets in matches.items():
         if len(match_markets) != 2:
             continue
@@ -2162,8 +2165,12 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
                 fd_p2_odds = fd_data
 
         if not fd_p1_odds or not fd_p2_odds:
+            _no_fd_match += 1
+            if _no_fd_match <= 3:
+                print(f"   No FD match: {p1['name']} vs {p2['name']} (Kalshi names)")
             continue
 
+        _matched_fd += 1
         # Staleness check
         game_id = fd_p1_odds.get('game_id', '')
         commence_str = all_fd_games.get(game_id, {}).get('commence_time', '')
@@ -2248,6 +2255,8 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
             send_telegram_notification(best_edge)
             auto_trade_edge(best_edge, kalshi_api)
 
+    if _matched_fd > 0 or _no_fd_match > 0:
+        print(f"   {sport_name}: {_matched_fd} FD-matched, {_no_fd_match} unmatched, {len(edges)} edges")
     return edges
 
 
