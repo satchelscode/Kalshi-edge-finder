@@ -157,6 +157,13 @@ TARGET_PROFIT = 5.00  # Target $5 profit per trade (was $1)
 MAX_RISK = 250.00     # Max total cost per single order ($250)
 MIN_EDGE_PERCENT = 0.5  # Skip edges below this % (fees/slippage eat tiny edges)
 
+# Crypto & Index overrides: these resolved markets have high win rates and
+# expired markets are zero-risk, so we size more aggressively.
+CRYPTO_TARGET_PROFIT = 10.00  # Target $10 profit per crypto trade
+CRYPTO_MAX_RISK = 500.00      # Max $500 cost per crypto order
+INDEX_TARGET_PROFIT = 10.00   # Target $10 profit per index trade (S&P/Nasdaq)
+INDEX_MAX_RISK = 500.00       # Max $500 cost per index order
+
 # Track which edges we've already notified about
 _notified_edges = set()
 
@@ -3003,9 +3010,14 @@ def _get_game_scores(espn_path: str, is_soccer: bool = False) -> List[Dict]:
 RESOLVED_MAX_WIN = TARGET_PROFIT  # Max profit per resolved market (matches global TARGET_PROFIT)
 
 def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
-                         sport: str, game_name: str, kalshi_api, ob: dict = None) -> Optional[Dict]:
-    """Buy a resolved market capped at RESOLVED_MAX_WIN profit. side = 'yes' or 'no'."""
+                         sport: str, game_name: str, kalshi_api, ob: dict = None,
+                         target_profit: float = None, max_risk: float = None) -> Optional[Dict]:
+    """Buy a resolved market capped at target profit. side = 'yes' or 'no'.
+    target_profit/max_risk override the globals when passed (e.g. for crypto)."""
     global _order_tracker
+
+    effective_target = target_profit if target_profit is not None else RESOLVED_MAX_WIN
+    effective_max_risk = max_risk if max_risk is not None else MAX_RISK
 
     if not AUTO_TRADE_ENABLED:
         return None
@@ -3028,16 +3040,16 @@ def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
     if avail <= 0:
         return None
 
-    # Calculate max contracts we can afford, capped by MAX_RISK
+    # Calculate max contracts we can afford, capped by effective_max_risk
     cost_per = price + fee
-    max_spend = min(avail, MAX_RISK)
+    max_spend = min(avail, effective_max_risk)
     contracts = int(max_spend / cost_per) if cost_per > 0 else 0
     if contracts <= 0:
         return None
 
-    # Cap contracts so max profit doesn't exceed RESOLVED_MAX_WIN
+    # Cap contracts so max profit doesn't exceed effective_target
     if profit_per > 0:
-        max_contracts_for_cap = int(RESOLVED_MAX_WIN / profit_per)
+        max_contracts_for_cap = int(effective_target / profit_per)
         contracts = min(contracts, max(1, max_contracts_for_cap))
 
     # If we have the orderbook, limit to available liquidity
@@ -3061,8 +3073,8 @@ def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
         return None
 
     # SAFETY GUARDRAIL: Hard cap on total cost
-    if total_cost > MAX_RISK:
-        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds MAX_RISK ${MAX_RISK:.2f} — blocking order")
+    if total_cost > effective_max_risk:
+        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds MAX_RISK ${effective_max_risk:.2f} — blocking order")
         return None
 
     price_cents = int(round(price * 100))
@@ -3773,7 +3785,9 @@ def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> L
             if ask_price and ask_price < COMPLETED_PROP_MAX_PRICE:
                 reason = f"{reason_detail} ({time_str}, buffer {buffer_pct:.1%})"
                 result = _buy_resolved_market(ticker, side, ask_price, reason,
-                                               'Crypto', reason_detail, kalshi_api, ob)
+                                               'Crypto', reason_detail, kalshi_api, ob,
+                                               target_profit=CRYPTO_TARGET_PROFIT,
+                                               max_risk=CRYPTO_MAX_RISK)
                 if result:
                     edges.append(result)
 
@@ -4111,7 +4125,9 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
                 if ask_price and ask_price < COMPLETED_PROP_MAX_PRICE:
                     reason = f"{reason_detail} ({time_str}, buffer {buffer_pct:.1%})"
                     result = _buy_resolved_market(ticker, side, ask_price, reason,
-                                                   display, reason_detail, kalshi_api, ob)
+                                                   display, reason_detail, kalshi_api, ob,
+                                                   target_profit=INDEX_TARGET_PROFIT,
+                                                   max_risk=INDEX_MAX_RISK)
                     if result:
                         edges.append(result)
 
