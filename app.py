@@ -2085,12 +2085,11 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
     """Find edges on tennis match-winner markets."""
     converter = OddsConverter()
     edges = []
-    date_strs = _get_today_date_strs()
-
     # Step 1: Fetch Kalshi markets
+    # NOTE: No date filter for tennis — tennis tickers don't embed dates like
+    # team sports (KXNBAGAME-26FEB02...). All open markets are current/relevant.
     kalshi_markets = kalshi_api.get_markets(series_ticker)
-    today_markets = [m for m in kalshi_markets
-                     if any(ds in m.get('ticker', '') for ds in date_strs)]
+    today_markets = kalshi_markets  # Use all open markets
     if not today_markets:
         return edges
 
@@ -2132,7 +2131,11 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
             matches[event] = []
         matches[event].append(m)
 
+    print(f"   Kalshi {sport_name}: {len(matches)} matches from {len(today_markets)} markets")
+
     # Step 4: For each match, find FD odds and check for edges
+    _matched_fd = 0
+    _no_fd_match = 0
     for event_ticker, match_markets in matches.items():
         if len(match_markets) != 2:
             continue
@@ -2162,8 +2165,12 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
                 fd_p2_odds = fd_data
 
         if not fd_p1_odds or not fd_p2_odds:
+            _no_fd_match += 1
+            if _no_fd_match <= 3:
+                print(f"   No FD match: {p1['name']} vs {p2['name']} (Kalshi names)")
             continue
 
+        _matched_fd += 1
         # Staleness check
         game_id = fd_p1_odds.get('game_id', '')
         commence_str = all_fd_games.get(game_id, {}).get('commence_time', '')
@@ -2248,6 +2255,8 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
             send_telegram_notification(best_edge)
             auto_trade_edge(best_edge, kalshi_api)
 
+    if _matched_fd > 0 or _no_fd_match > 0:
+        print(f"   {sport_name}: {_matched_fd} FD-matched, {_no_fd_match} unmatched, {len(edges)} edges")
     return edges
 
 
@@ -3217,7 +3226,13 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
     - LIVE games: if current total already exceeds the over line, Over is guaranteed
     """
     edges = []
+    # Include yesterday's dates too — European soccer games played in afternoon
+    # UK time may have Kalshi tickers dated the prior US day.
     date_strs = _get_today_date_strs()
+    yesterday_utc = datetime.now(timezone.utc) - timedelta(days=1)
+    yesterday_et = _get_eastern_now() - timedelta(days=1)
+    date_strs.add(yesterday_utc.strftime('%y%b%d').upper())
+    date_strs.add(yesterday_et.strftime('%y%b%d').upper())
 
     for sport_key, config in RESOLVED_GAME_SPORTS.items():
         espn_path = config['espn_path']
@@ -3258,14 +3273,23 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
             kalshi_markets = kalshi_api.get_markets(ml_series)
             today_markets = [m for m in kalshi_markets
                              if any(ds in m.get('ticker', '') for ds in date_strs)]
-            print(f"   {ml_series}: {len(kalshi_markets)} total, {len(today_markets)} today")
+            print(f"   {ml_series}: {len(kalshi_markets)} total, {len(today_markets)} today (dates: {date_strs})")
             if today_markets:
                 for _tm in today_markets[:3]:
                     print(f"      ticker: {_tm.get('ticker','')}")
+            elif kalshi_markets and final_games:
+                # Debug: show sample tickers when finals exist but 0 matched today
+                print(f"      DEBUG no match — sample tickers: {[m.get('ticker','')[:40] for m in kalshi_markets[:3]]}")
             time.sleep(0.5)
 
             _ml_matched = 0
             _ml_price_high = 0
+            # Collect ALL candidates per game, then pick the best one per game.
+            # This structurally prevents betting both sides (e.g. YES winner + NO loser)
+            # even if has_game_position fails after a worker restart.
+            # Key: game_prefix (e.g. KXNBAGAME-26FEB01SACWAS), Value: list of candidates
+            game_candidates = {}
+
             for m in today_markets:
                 ticker = m.get('ticker', '')
                 parts = ticker.split('-')
@@ -3273,6 +3297,7 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                     continue
                 team_abbr = parts[-1]
                 game_part = parts[1]
+                game_prefix = '-'.join(parts[:-1])  # e.g. KXNBAGAME-26FEB01SACWAS
                 # Extract ticker date (e.g. '26FEB01') and team portion (e.g. 'ORLSAS')
                 ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
                 ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
@@ -3300,56 +3325,79 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 time.sleep(0.2)
 
                 if is_draw_ticker:
-                    # DRAW ticker: buy YES if game ended in draw, NO if it didn't
                     if is_draw_game:
-                        yes_price = get_best_yes_price(ob)
-                        print(f"      {ticker}: DRAW game, YES ask={yes_price}")
-                        if yes_price and yes_price >= COMPLETED_PROP_MAX_PRICE:
+                        price = get_best_yes_price(ob)
+                        side = 'yes'
+                        print(f"      {ticker}: DRAW game, YES ask={price}")
+                        if price and price >= COMPLETED_PROP_MAX_PRICE:
                             _ml_price_high += 1
-                        if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
+                            continue
+                        if price and price < COMPLETED_PROP_MAX_PRICE:
                             reason = f"Draw {game['home_score']}-{game['away_score']} (FINAL)"
-                            result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
-                                                           display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
-                            if result:
-                                edges.append(result)
+                            fee = kalshi_fee(price)
+                            profit_per = 1.0 - price - fee
+                            if profit_per > 0:
+                                game_candidates.setdefault(game_prefix, []).append(
+                                    (ticker, side, price, reason, game, ob, profit_per))
                     else:
-                        no_price = get_best_no_price(ob)
-                        print(f"      {ticker}: NOT draw, NO ask={no_price}")
-                        if no_price and no_price >= COMPLETED_PROP_MAX_PRICE:
+                        price = get_best_no_price(ob)
+                        side = 'no'
+                        print(f"      {ticker}: NOT draw, NO ask={price}")
+                        if price and price >= COMPLETED_PROP_MAX_PRICE:
                             _ml_price_high += 1
-                        if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
+                            continue
+                        if price and price < COMPLETED_PROP_MAX_PRICE:
                             reason = f"No draw — {game['winner']} won (FINAL)"
-                            result = _buy_resolved_market(ticker, 'no', no_price, reason,
-                                                           display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
-                            if result:
-                                edges.append(result)
+                            fee = kalshi_fee(price)
+                            profit_per = 1.0 - price - fee
+                            if profit_per > 0:
+                                game_candidates.setdefault(game_prefix, []).append(
+                                    (ticker, side, price, reason, game, ob, profit_per))
                 elif is_winner:
-                    # Buy YES on the winner
-                    yes_price = get_best_yes_price(ob)
-                    print(f"      {ticker}: WINNER, YES ask={yes_price}")
-                    if yes_price and yes_price >= COMPLETED_PROP_MAX_PRICE:
+                    price = get_best_yes_price(ob)
+                    side = 'yes'
+                    print(f"      {ticker}: WINNER, YES ask={price}")
+                    if price and price >= COMPLETED_PROP_MAX_PRICE:
                         _ml_price_high += 1
-                    if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
+                        continue
+                    if price and price < COMPLETED_PROP_MAX_PRICE:
                         reason = f"{game['winner']} beat {game['loser']} {game['home_score'] if game['winner'] == game['home'] else game['away_score']}-{game['away_score'] if game['winner'] == game['home'] else game['home_score']} (FINAL)"
-                        result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
-                                                       display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
-                        if result:
-                            edges.append(result)
+                        fee = kalshi_fee(price)
+                        profit_per = 1.0 - price - fee
+                        if profit_per > 0:
+                            game_candidates.setdefault(game_prefix, []).append(
+                                (ticker, side, price, reason, game, ob, profit_per))
                 else:
-                    # Buy NO on the loser (they lost or drew, so NO pays out)
-                    no_price = get_best_no_price(ob)
-                    print(f"      {ticker}: LOSER, NO ask={no_price}")
-                    if no_price and no_price >= COMPLETED_PROP_MAX_PRICE:
+                    price = get_best_no_price(ob)
+                    side = 'no'
+                    print(f"      {ticker}: LOSER, NO ask={price}")
+                    if price and price >= COMPLETED_PROP_MAX_PRICE:
                         _ml_price_high += 1
-                    if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
+                        continue
+                    if price and price < COMPLETED_PROP_MAX_PRICE:
                         if is_draw_game:
                             reason = f"{team_abbr} drew {game['home_score']}-{game['away_score']} (FINAL)"
                         else:
                             reason = f"{team_abbr} lost to {game['winner']} (FINAL)"
-                        result = _buy_resolved_market(ticker, 'no', no_price, reason,
-                                                       display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
-                        if result:
-                            edges.append(result)
+                        fee = kalshi_fee(price)
+                        profit_per = 1.0 - price - fee
+                        if profit_per > 0:
+                            game_candidates.setdefault(game_prefix, []).append(
+                                (ticker, side, price, reason, game, ob, profit_per))
+
+            # For each game, trade only the BEST candidate (highest profit margin).
+            # This prevents betting both YES on winner AND NO on loser for the same game.
+            for game_prefix, candidates in game_candidates.items():
+                candidates.sort(key=lambda c: c[6], reverse=True)  # sort by profit_per
+                best = candidates[0]
+                ticker, side, price, reason, game, ob, profit_per = best
+                if len(candidates) > 1:
+                    print(f"      {game_prefix}: {len(candidates)} options, picking best: {ticker} {side} (profit/contract ${profit_per:.3f})")
+                result = _buy_resolved_market(ticker, side, price, reason,
+                                               display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                if result:
+                    edges.append(result)
+
             if _ml_matched > 0 or _ml_price_high > 0:
                 print(f"   {ml_series} resolved: {_ml_matched} matched, {_ml_price_high} price>=99c")
 
@@ -3539,8 +3587,8 @@ def _classify_kalshi_market(m: dict) -> Optional[Dict]:
         m.get('no_sub_title', '') or '',
     ]).lower()
 
-    is_above = 'above' in all_text or 'or more' in all_text or 'or higher' in all_text
-    is_below = 'below' in all_text or 'or less' in all_text or 'or lower' in all_text
+    is_above = 'above' in all_text or 'or more' in all_text or 'or higher' in all_text or 'at least' in all_text
+    is_below = 'below' in all_text or 'or less' in all_text or 'or lower' in all_text or 'under $' in all_text or 'under ¢' in all_text
     is_range_kw = (' to ' in all_text or ' - ' in all_text) and not is_above and not is_below
 
     # Structural range detection: both strikes exist and differ
@@ -3595,7 +3643,15 @@ def _classify_kalshi_market(m: dict) -> Optional[Dict]:
     if has_both_strikes:
         f, c = float(floor_strike), float(cap_strike)
         if f == c and f > 0:
-            # Same strike = single threshold but unknown direction — skip
+            # Same strike = single threshold but unknown direction.
+            # For known directional crypto series (KXDOGED, KXSHIBD, etc.),
+            # these are always "above" markets (ticker has -T prefix).
+            # Check the ticker to confirm.
+            ticker = m.get('ticker', '')
+            if '-T' in ticker and any(ticker.startswith(s) for s in
+                    ('KXDOGED', 'KXSHIBD', 'KXBTCD', 'KXETHD', 'KXSOLD',
+                     'KXINXU', 'KXNASDAQ')):
+                return {'type': 'above', 'threshold': f}
             return None
         # Different strikes but no keywords — likely range, already handled above
         return None
