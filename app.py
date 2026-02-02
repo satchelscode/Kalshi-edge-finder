@@ -2943,11 +2943,11 @@ CRYPTO_PRICE_IDS = {
 # Based on time remaining. BTC moves ~0.5% per hour on average, tail risk ~2%
 # Format: (max_minutes_to_close, required_buffer_pct)
 CRYPTO_BUFFER_TIERS = [
-    (2, 0.002),     # < 2 min:  0.2% buffer (tiny move possible)
-    (5, 0.005),     # < 5 min:  0.5% buffer
-    (15, 0.01),     # < 15 min: 1% buffer
-    (30, 0.015),    # < 30 min: 1.5% buffer
-    (60, 0.02),     # < 60 min: 2% buffer
+    (2, 0.0015),    # < 2 min:  0.15% buffer (was 0.2%)
+    (5, 0.0035),    # < 5 min:  0.35% buffer (was 0.5%)
+    (15, 0.007),    # < 15 min: 0.7% buffer  (was 1.0%)
+    (30, 0.011),    # < 30 min: 1.1% buffer  (was 1.5%)
+    (60, 0.015),    # < 60 min: 1.5% buffer  (was 2.0%)
     (0, 0),         # Expired:  0% buffer (outcome is known)
 ]
 
@@ -4091,20 +4091,20 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
                 if buffer_override is not None:
                     required_buffer = 0 if is_expired else buffer_override
                 else:
-                    required_buffer = 0.02  # default 2%
+                    required_buffer = 0.015  # default 1.5% (was 2%)
                     if is_expired:
                         required_buffer = 0
                     elif minutes_to_close is not None:
                         if minutes_to_close <= 2:
-                            required_buffer = 0.001  # 0.1%
+                            required_buffer = 0.0008  # 0.08% (was 0.1%)
                         elif minutes_to_close <= 5:
-                            required_buffer = 0.003  # 0.3%
+                            required_buffer = 0.002   # 0.2%  (was 0.3%)
                         elif minutes_to_close <= 15:
-                            required_buffer = 0.005  # 0.5%
+                            required_buffer = 0.0035  # 0.35% (was 0.5%)
                         elif minutes_to_close <= 30:
-                            required_buffer = 0.008  # 0.8%
+                            required_buffer = 0.006   # 0.6%  (was 0.8%)
                         elif minutes_to_close <= 60:
-                            required_buffer = 0.012  # 1.2%
+                            required_buffer = 0.009   # 0.9%  (was 1.2%)
 
                 # Classify market type using shared function
                 mtype = _classify_kalshi_market(m)
@@ -4245,9 +4245,9 @@ def _index_sniper_loop():
 
             # S&P moves ~0.1% in 90 seconds. Use tight buffers.
             scan_schedule = [
-                (90, 0.0008),   # 90s out: 0.08% buffer
-                (60, 0.0005),   # 60s out: 0.05% buffer
-                (15, 0.0001),   # 15s out: 0.01% buffer
+                (90, 0.0006),   # 90s out: 0.06% buffer (was 0.08%)
+                (60, 0.0003),   # 60s out: 0.03% buffer (was 0.05%)
+                (15, 0.00007),  # 15s out: 0.007% buffer (was 0.01%)
             ]
 
             for i, (target_secs, sniper_buffer) in enumerate(scan_schedule):
@@ -4525,14 +4525,14 @@ def _crypto_sniper_loop():
             # Run 3 scans with progressively tighter buffers as close approaches.
             # BTC moves ~0.5%/hr, so in 90s it moves ~0.08%. We use buffers
             # slightly above the expected move to be safe but aggressive.
-            # At 90s: 0.10% buffer (~$77 for BTC at $77K — won't move $77 in 90s)
-            # At 60s: 0.06% buffer (~$46 for BTC)
-            # At 15s: 0.015% buffer (~$12 for BTC — virtually no movement)
+            # At 90s: 0.07% buffer (~$54 for BTC at $77K — won't move $54 in 90s)
+            # At 60s: 0.04% buffer (~$31 for BTC)
+            # At 15s: 0.01% buffer (~$8 for BTC — virtually no movement)
             kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
             scan_schedule = [
-                (90, 0.0010),   # 90s out: 0.10% buffer
-                (60, 0.0006),   # 60s out: 0.06% buffer
-                (15, 0.00015),  # 15s out: 0.015% buffer
+                (90, 0.0007),   # 90s out: 0.07% buffer (was 0.10%)
+                (60, 0.0004),   # 60s out: 0.04% buffer (was 0.06%)
+                (15, 0.00010),  # 15s out: 0.01% buffer (was 0.015%)
             ]
 
             for i, (target_secs, sniper_buffer) in enumerate(scan_schedule):
