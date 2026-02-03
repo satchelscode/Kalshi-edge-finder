@@ -158,10 +158,10 @@ MAX_RISK = 250.00     # Max total cost per FD arb order
 MIN_EDGE_PERCENT = 0.5  # Skip edges below this % (fees/slippage eat tiny edges)
 
 # Crypto & Index: higher conviction (near-expiry / known outcomes), size more aggressively
-CRYPTO_TARGET_PROFIT = 25.00  # Target $25 profit per crypto trade
-CRYPTO_MAX_RISK = 1000.00     # Max $1000 cost per crypto order
-INDEX_TARGET_PROFIT = 25.00   # Target $25 profit per index trade (S&P/Nasdaq)
-INDEX_MAX_RISK = 1000.00      # Max $1000 cost per index order
+CRYPTO_TARGET_PROFIT = 250.00  # Target $250 profit per crypto trade
+CRYPTO_MAX_RISK = 1000.00      # Max $1000 cost per crypto order
+INDEX_TARGET_PROFIT = 250.00   # Target $250 profit per index trade (S&P/Nasdaq)
+INDEX_MAX_RISK = 1000.00       # Max $1000 cost per index order
 
 # Track which edges we've already notified about
 _notified_edges = set()
@@ -2682,8 +2682,10 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
     if not ticker:
         return None
 
-    if _order_tracker.has_position(ticker):
-        return None
+    # NOTE: Intentionally NOT checking has_position for completed props.
+    # These are GUARANTEED wins (player already hit the threshold), so we
+    # should keep buying as long as there's liquidity below $0.99.
+    # The orderbook sweep logic handles position sizing naturally.
 
     if not _order_tracker.can_trade():
         return None
