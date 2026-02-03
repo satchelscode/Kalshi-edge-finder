@@ -1309,13 +1309,13 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                 entries.append((t1_name, t1_yes, f"YES on {t1_name}", fd_t2,
                                team_markets[team_abbrevs_list[0]]['ticker'], 'yes'))
             else:
-                entries.append((t1_name, t2_no, f"NO on {t2_name}", fd_t2,
+                entries.append((t1_name, t2_no, f"NO on {t2_name}", fd_t1,
                                team_markets[team_abbrevs_list[1]]['ticker'], 'no'))
             if t2_yes <= t1_no:
                 entries.append((t2_name, t2_yes, f"YES on {t2_name}", fd_t1,
                                team_markets[team_abbrevs_list[1]]['ticker'], 'yes'))
             else:
-                entries.append((t2_name, t1_no, f"NO on {t1_name}", fd_t1,
+                entries.append((t2_name, t1_no, f"NO on {t1_name}", fd_t2,
                                team_markets[team_abbrevs_list[0]]['ticker'], 'no'))
 
             # Evaluate both entries, pick only the best edge per game
