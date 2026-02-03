@@ -164,11 +164,6 @@ CRYPTO_MAX_RISK = 500.00      # Max $500 cost per crypto order
 INDEX_TARGET_PROFIT = 10.00   # Target $10 profit per index trade (S&P/Nasdaq)
 INDEX_MAX_RISK = 500.00       # Max $500 cost per index order
 
-# Completed props are GUARANTEED wins (player already hit threshold).
-# No reason to cap — buy as much as the orderbook and balance allow.
-COMPLETED_PROP_TARGET_PROFIT = 999.00  # Effectively uncapped
-COMPLETED_PROP_MAX_RISK = 5000.00      # Use up to $5000 (balance is real cap)
-
 # Track which edges we've already notified about
 _notified_edges = set()
 
@@ -321,10 +316,8 @@ def match_kalshi_to_fanduel_game(team1_name, team2_name, fd_games, kalshi_date_s
             if kalshi_date and game_info.get('commence_time'):
                 try:
                     ct = datetime.fromisoformat(game_info['commence_time'].replace('Z', '+00:00'))
+                    # Game should be on the Kalshi date (allow same day or next day early AM)
                     day_diff = abs((ct.date() - kalshi_date.date()).days)
-                    # Reject if more than 1 day apart — different game entirely
-                    if day_diff > 1:
-                        continue
                     candidates.append((day_diff, matched))
                 except Exception:
                     candidates.append((0, matched))
@@ -1188,11 +1181,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         t1_name = team_map.get(team_abbrevs_list[0], team_abbrevs_list[0])
         t2_name = team_map.get(team_abbrevs_list[1], team_abbrevs_list[1])
 
-        # Extract date from game_code (e.g. 'KXNHLGAME-26FEB02BUFFLA' → '26FEB02')
-        date_match = re.search(r'(\d{2}[A-Z]{3}\d{2})', game_code)
-        kalshi_date = date_match.group(1) if date_match else None
-
-        fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games, kalshi_date)
+        fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games)
         if not fd_t1 or fd_t1 not in fanduel_odds or fd_t2 not in fanduel_odds:
             continue
         commence_str = fanduel_games.get(matched_gid, {}).get('commence_time', '')
@@ -1438,12 +1427,8 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
         t1_name = team_map.get(team_abbrevs[0], team_abbrevs[0])
         t2_name = team_map.get(team_abbrevs[1], team_abbrevs[1])
 
-        # Extract date from game_code for date-aware matching
-        date_match = re.search(r'(\d{2}[A-Z]{3}\d{2})', game_code)
-        kalshi_date = date_match.group(1) if date_match else None
-
         # Require BOTH teams match the SAME FanDuel game
-        fd_t1, fd_t2, matched_game_id = match_kalshi_to_fanduel_game(t1_name, t2_name, fd_games, kalshi_date)
+        fd_t1, fd_t2, matched_game_id = match_kalshi_to_fanduel_game(t1_name, t2_name, fd_games)
         if not fd_t1 or not matched_game_id or matched_game_id not in fd_spreads:
             continue
 
@@ -2095,11 +2080,12 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
     """Find edges on tennis match-winner markets."""
     converter = OddsConverter()
     edges = []
+    date_strs = _get_today_date_strs()
+
     # Step 1: Fetch Kalshi markets
-    # NOTE: No date filter for tennis — tennis tickers don't embed dates like
-    # team sports (KXNBAGAME-26FEB02...). All open markets are current/relevant.
     kalshi_markets = kalshi_api.get_markets(series_ticker)
-    today_markets = kalshi_markets  # Use all open markets
+    today_markets = [m for m in kalshi_markets
+                     if any(ds in m.get('ticker', '') for ds in date_strs)]
     if not today_markets:
         return edges
 
@@ -2141,11 +2127,7 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
             matches[event] = []
         matches[event].append(m)
 
-    print(f"   Kalshi {sport_name}: {len(matches)} matches from {len(today_markets)} markets")
-
     # Step 4: For each match, find FD odds and check for edges
-    _matched_fd = 0
-    _no_fd_match = 0
     for event_ticker, match_markets in matches.items():
         if len(match_markets) != 2:
             continue
@@ -2175,12 +2157,8 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
                 fd_p2_odds = fd_data
 
         if not fd_p1_odds or not fd_p2_odds:
-            _no_fd_match += 1
-            if _no_fd_match <= 3:
-                print(f"   No FD match: {p1['name']} vs {p2['name']} (Kalshi names)")
             continue
 
-        _matched_fd += 1
         # Staleness check
         game_id = fd_p1_odds.get('game_id', '')
         commence_str = all_fd_games.get(game_id, {}).get('commence_time', '')
@@ -2265,8 +2243,6 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
             send_telegram_notification(best_edge)
             auto_trade_edge(best_edge, kalshi_api)
 
-    if _matched_fd > 0 or _no_fd_match > 0:
-        print(f"   {sport_name}: {_matched_fd} FD-matched, {_no_fd_match} unmatched, {len(edges)} edges")
     return edges
 
 
@@ -2724,10 +2700,10 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
     # Sort no bids descending by price (highest no bid = cheapest YES ask)
     no_bids_sorted = sorted(no_bids, key=lambda x: x[0], reverse=True)
 
-    # Completed props are GUARANTEED — player already hit the threshold.
-    # Use aggressive limits: buy as much as orderbook + balance allow.
-    remaining_balance = min(avail, COMPLETED_PROP_MAX_RISK)
-    remaining_profit_target = COMPLETED_PROP_TARGET_PROFIT
+    # Calculate how many contracts we can buy at each price level
+    # Capped by TARGET_PROFIT (max win) and MAX_RISK (max cost)
+    remaining_balance = min(avail, MAX_RISK)  # Cap spending at MAX_RISK
+    remaining_profit_target = TARGET_PROFIT
     total_contracts = 0
     total_cost = 0
     best_price = None
@@ -2778,8 +2754,8 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
         return None
 
     # Final safety check
-    if total_cost > COMPLETED_PROP_MAX_RISK:
-        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds COMPLETED_PROP_MAX_RISK ${COMPLETED_PROP_MAX_RISK:.2f}")
+    if total_cost > MAX_RISK:
+        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds MAX_RISK ${MAX_RISK:.2f}")
         return None
 
     # Place the order at the best ask price for the total contracts
@@ -2953,11 +2929,11 @@ CRYPTO_PRICE_IDS = {
 # Based on time remaining. BTC moves ~0.5% per hour on average, tail risk ~2%
 # Format: (max_minutes_to_close, required_buffer_pct)
 CRYPTO_BUFFER_TIERS = [
-    (2, 0.0015),    # < 2 min:  0.15% buffer (was 0.2%)
-    (5, 0.0035),    # < 5 min:  0.35% buffer (was 0.5%)
-    (15, 0.007),    # < 15 min: 0.7% buffer  (was 1.0%)
-    (30, 0.011),    # < 30 min: 1.1% buffer  (was 1.5%)
-    (60, 0.015),    # < 60 min: 1.5% buffer  (was 2.0%)
+    (2, 0.002),     # < 2 min:  0.2% buffer (tiny move possible)
+    (5, 0.005),     # < 5 min:  0.5% buffer
+    (15, 0.01),     # < 15 min: 1% buffer
+    (30, 0.015),    # < 30 min: 1.5% buffer
+    (60, 0.02),     # < 60 min: 2% buffer
     (0, 0),         # Expired:  0% buffer (outcome is known)
 ]
 
@@ -3236,13 +3212,7 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
     - LIVE games: if current total already exceeds the over line, Over is guaranteed
     """
     edges = []
-    # Include yesterday's dates too — European soccer games played in afternoon
-    # UK time may have Kalshi tickers dated the prior US day.
     date_strs = _get_today_date_strs()
-    yesterday_utc = datetime.now(timezone.utc) - timedelta(days=1)
-    yesterday_et = _get_eastern_now() - timedelta(days=1)
-    date_strs.add(yesterday_utc.strftime('%y%b%d').upper())
-    date_strs.add(yesterday_et.strftime('%y%b%d').upper())
 
     for sport_key, config in RESOLVED_GAME_SPORTS.items():
         espn_path = config['espn_path']
@@ -3283,23 +3253,14 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
             kalshi_markets = kalshi_api.get_markets(ml_series)
             today_markets = [m for m in kalshi_markets
                              if any(ds in m.get('ticker', '') for ds in date_strs)]
-            print(f"   {ml_series}: {len(kalshi_markets)} total, {len(today_markets)} today (dates: {date_strs})")
+            print(f"   {ml_series}: {len(kalshi_markets)} total, {len(today_markets)} today")
             if today_markets:
                 for _tm in today_markets[:3]:
                     print(f"      ticker: {_tm.get('ticker','')}")
-            elif kalshi_markets and final_games:
-                # Debug: show sample tickers when finals exist but 0 matched today
-                print(f"      DEBUG no match — sample tickers: {[m.get('ticker','')[:40] for m in kalshi_markets[:3]]}")
             time.sleep(0.5)
 
             _ml_matched = 0
             _ml_price_high = 0
-            # Collect ALL candidates per game, then pick the best one per game.
-            # This structurally prevents betting both sides (e.g. YES winner + NO loser)
-            # even if has_game_position fails after a worker restart.
-            # Key: game_prefix (e.g. KXNBAGAME-26FEB01SACWAS), Value: list of candidates
-            game_candidates = {}
-
             for m in today_markets:
                 ticker = m.get('ticker', '')
                 parts = ticker.split('-')
@@ -3307,7 +3268,6 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                     continue
                 team_abbr = parts[-1]
                 game_part = parts[1]
-                game_prefix = '-'.join(parts[:-1])  # e.g. KXNBAGAME-26FEB01SACWAS
                 # Extract ticker date (e.g. '26FEB01') and team portion (e.g. 'ORLSAS')
                 ticker_date_match = re.match(r'^(\d{2}[A-Z]{3}\d{2})', game_part)
                 ticker_date_str = ticker_date_match.group(1) if ticker_date_match else ''
@@ -3335,79 +3295,56 @@ def find_resolved_game_markets(kalshi_api) -> List[Dict]:
                 time.sleep(0.2)
 
                 if is_draw_ticker:
+                    # DRAW ticker: buy YES if game ended in draw, NO if it didn't
                     if is_draw_game:
-                        price = get_best_yes_price(ob)
-                        side = 'yes'
-                        print(f"      {ticker}: DRAW game, YES ask={price}")
-                        if price and price >= COMPLETED_PROP_MAX_PRICE:
+                        yes_price = get_best_yes_price(ob)
+                        print(f"      {ticker}: DRAW game, YES ask={yes_price}")
+                        if yes_price and yes_price >= COMPLETED_PROP_MAX_PRICE:
                             _ml_price_high += 1
-                            continue
-                        if price and price < COMPLETED_PROP_MAX_PRICE:
+                        if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
                             reason = f"Draw {game['home_score']}-{game['away_score']} (FINAL)"
-                            fee = kalshi_fee(price)
-                            profit_per = 1.0 - price - fee
-                            if profit_per > 0:
-                                game_candidates.setdefault(game_prefix, []).append(
-                                    (ticker, side, price, reason, game, ob, profit_per))
+                            result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
+                                                           display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                            if result:
+                                edges.append(result)
                     else:
-                        price = get_best_no_price(ob)
-                        side = 'no'
-                        print(f"      {ticker}: NOT draw, NO ask={price}")
-                        if price and price >= COMPLETED_PROP_MAX_PRICE:
+                        no_price = get_best_no_price(ob)
+                        print(f"      {ticker}: NOT draw, NO ask={no_price}")
+                        if no_price and no_price >= COMPLETED_PROP_MAX_PRICE:
                             _ml_price_high += 1
-                            continue
-                        if price and price < COMPLETED_PROP_MAX_PRICE:
+                        if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
                             reason = f"No draw — {game['winner']} won (FINAL)"
-                            fee = kalshi_fee(price)
-                            profit_per = 1.0 - price - fee
-                            if profit_per > 0:
-                                game_candidates.setdefault(game_prefix, []).append(
-                                    (ticker, side, price, reason, game, ob, profit_per))
+                            result = _buy_resolved_market(ticker, 'no', no_price, reason,
+                                                           display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                            if result:
+                                edges.append(result)
                 elif is_winner:
-                    price = get_best_yes_price(ob)
-                    side = 'yes'
-                    print(f"      {ticker}: WINNER, YES ask={price}")
-                    if price and price >= COMPLETED_PROP_MAX_PRICE:
+                    # Buy YES on the winner
+                    yes_price = get_best_yes_price(ob)
+                    print(f"      {ticker}: WINNER, YES ask={yes_price}")
+                    if yes_price and yes_price >= COMPLETED_PROP_MAX_PRICE:
                         _ml_price_high += 1
-                        continue
-                    if price and price < COMPLETED_PROP_MAX_PRICE:
+                    if yes_price and yes_price < COMPLETED_PROP_MAX_PRICE:
                         reason = f"{game['winner']} beat {game['loser']} {game['home_score'] if game['winner'] == game['home'] else game['away_score']}-{game['away_score'] if game['winner'] == game['home'] else game['home_score']} (FINAL)"
-                        fee = kalshi_fee(price)
-                        profit_per = 1.0 - price - fee
-                        if profit_per > 0:
-                            game_candidates.setdefault(game_prefix, []).append(
-                                (ticker, side, price, reason, game, ob, profit_per))
+                        result = _buy_resolved_market(ticker, 'yes', yes_price, reason,
+                                                       display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                        if result:
+                            edges.append(result)
                 else:
-                    price = get_best_no_price(ob)
-                    side = 'no'
-                    print(f"      {ticker}: LOSER, NO ask={price}")
-                    if price and price >= COMPLETED_PROP_MAX_PRICE:
+                    # Buy NO on the loser (they lost or drew, so NO pays out)
+                    no_price = get_best_no_price(ob)
+                    print(f"      {ticker}: LOSER, NO ask={no_price}")
+                    if no_price and no_price >= COMPLETED_PROP_MAX_PRICE:
                         _ml_price_high += 1
-                        continue
-                    if price and price < COMPLETED_PROP_MAX_PRICE:
+                    if no_price and no_price < COMPLETED_PROP_MAX_PRICE:
                         if is_draw_game:
                             reason = f"{team_abbr} drew {game['home_score']}-{game['away_score']} (FINAL)"
                         else:
                             reason = f"{team_abbr} lost to {game['winner']} (FINAL)"
-                        fee = kalshi_fee(price)
-                        profit_per = 1.0 - price - fee
-                        if profit_per > 0:
-                            game_candidates.setdefault(game_prefix, []).append(
-                                (ticker, side, price, reason, game, ob, profit_per))
-
-            # For each game, trade only the BEST candidate (highest profit margin).
-            # This prevents betting both YES on winner AND NO on loser for the same game.
-            for game_prefix, candidates in game_candidates.items():
-                candidates.sort(key=lambda c: c[6], reverse=True)  # sort by profit_per
-                best = candidates[0]
-                ticker, side, price, reason, game, ob, profit_per = best
-                if len(candidates) > 1:
-                    print(f"      {game_prefix}: {len(candidates)} options, picking best: {ticker} {side} (profit/contract ${profit_per:.3f})")
-                result = _buy_resolved_market(ticker, side, price, reason,
-                                               display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
-                if result:
-                    edges.append(result)
-
+                        result = _buy_resolved_market(ticker, 'no', no_price, reason,
+                                                       display, f"{game['away']} @ {game['home']}", kalshi_api, ob)
+                        if result:
+                            edges.append(result)
             if _ml_matched > 0 or _ml_price_high > 0:
                 print(f"   {ml_series} resolved: {_ml_matched} matched, {_ml_price_high} price>=99c")
 
@@ -3597,8 +3534,8 @@ def _classify_kalshi_market(m: dict) -> Optional[Dict]:
         m.get('no_sub_title', '') or '',
     ]).lower()
 
-    is_above = 'above' in all_text or 'or more' in all_text or 'or higher' in all_text or 'at least' in all_text
-    is_below = 'below' in all_text or 'or less' in all_text or 'or lower' in all_text or 'under $' in all_text or 'under ¢' in all_text
+    is_above = 'above' in all_text or 'or more' in all_text or 'or higher' in all_text
+    is_below = 'below' in all_text or 'or less' in all_text or 'or lower' in all_text
     is_range_kw = (' to ' in all_text or ' - ' in all_text) and not is_above and not is_below
 
     # Structural range detection: both strikes exist and differ
@@ -3653,15 +3590,7 @@ def _classify_kalshi_market(m: dict) -> Optional[Dict]:
     if has_both_strikes:
         f, c = float(floor_strike), float(cap_strike)
         if f == c and f > 0:
-            # Same strike = single threshold but unknown direction.
-            # For known directional crypto series (KXDOGED, KXSHIBD, etc.),
-            # these are always "above" markets (ticker has -T prefix).
-            # Check the ticker to confirm.
-            ticker = m.get('ticker', '')
-            if '-T' in ticker and any(ticker.startswith(s) for s in
-                    ('KXDOGED', 'KXSHIBD', 'KXBTCD', 'KXETHD', 'KXSOLD',
-                     'KXINXU', 'KXNASDAQ')):
-                return {'type': 'above', 'threshold': f}
+            # Same strike = single threshold but unknown direction — skip
             return None
         # Different strikes but no keywords — likely range, already handled above
         return None
@@ -4101,20 +4030,20 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
                 if buffer_override is not None:
                     required_buffer = 0 if is_expired else buffer_override
                 else:
-                    required_buffer = 0.015  # default 1.5% (was 2%)
+                    required_buffer = 0.02  # default 2%
                     if is_expired:
                         required_buffer = 0
                     elif minutes_to_close is not None:
                         if minutes_to_close <= 2:
-                            required_buffer = 0.0008  # 0.08% (was 0.1%)
+                            required_buffer = 0.001  # 0.1%
                         elif minutes_to_close <= 5:
-                            required_buffer = 0.002   # 0.2%  (was 0.3%)
+                            required_buffer = 0.003  # 0.3%
                         elif minutes_to_close <= 15:
-                            required_buffer = 0.0035  # 0.35% (was 0.5%)
+                            required_buffer = 0.005  # 0.5%
                         elif minutes_to_close <= 30:
-                            required_buffer = 0.006   # 0.6%  (was 0.8%)
+                            required_buffer = 0.008  # 0.8%
                         elif minutes_to_close <= 60:
-                            required_buffer = 0.009   # 0.9%  (was 1.2%)
+                            required_buffer = 0.012  # 1.2%
 
                 # Classify market type using shared function
                 mtype = _classify_kalshi_market(m)
@@ -4255,9 +4184,9 @@ def _index_sniper_loop():
 
             # S&P moves ~0.1% in 90 seconds. Use tight buffers.
             scan_schedule = [
-                (90, 0.0006),   # 90s out: 0.06% buffer (was 0.08%)
-                (60, 0.0003),   # 60s out: 0.03% buffer (was 0.05%)
-                (15, 0.00007),  # 15s out: 0.007% buffer (was 0.01%)
+                (90, 0.0008),   # 90s out: 0.08% buffer
+                (60, 0.0005),   # 60s out: 0.05% buffer
+                (15, 0.0001),   # 15s out: 0.01% buffer
             ]
 
             for i, (target_secs, sniper_buffer) in enumerate(scan_schedule):
@@ -4535,14 +4464,14 @@ def _crypto_sniper_loop():
             # Run 3 scans with progressively tighter buffers as close approaches.
             # BTC moves ~0.5%/hr, so in 90s it moves ~0.08%. We use buffers
             # slightly above the expected move to be safe but aggressive.
-            # At 90s: 0.07% buffer (~$54 for BTC at $77K — won't move $54 in 90s)
-            # At 60s: 0.04% buffer (~$31 for BTC)
-            # At 15s: 0.01% buffer (~$8 for BTC — virtually no movement)
+            # At 90s: 0.10% buffer (~$77 for BTC at $77K — won't move $77 in 90s)
+            # At 60s: 0.06% buffer (~$46 for BTC)
+            # At 15s: 0.015% buffer (~$12 for BTC — virtually no movement)
             kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
             scan_schedule = [
-                (90, 0.0007),   # 90s out: 0.07% buffer (was 0.10%)
-                (60, 0.0004),   # 60s out: 0.04% buffer (was 0.06%)
-                (15, 0.00010),  # 15s out: 0.01% buffer (was 0.015%)
+                (90, 0.0010),   # 90s out: 0.10% buffer
+                (60, 0.0006),   # 60s out: 0.06% buffer
+                (15, 0.00015),  # 15s out: 0.015% buffer
             ]
 
             for i, (target_secs, sniper_buffer) in enumerate(scan_schedule):
