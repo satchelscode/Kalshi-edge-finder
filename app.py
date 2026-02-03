@@ -60,7 +60,7 @@ MONEYLINE_SPORTS = {
     # Currently in-season
     'KXNBAGAME': ('basketball_nba', 'NBA', NBA_TEAMS),
     'KXNCAAMBGAME': ('basketball_ncaab', 'NCAAB', {}),
-    'KXNHLGAME': ('icehockey_nhl', 'NHL', NHL_TEAMS),
+    # 'KXNHLGAME': ('icehockey_nhl', 'NHL', NHL_TEAMS),  # Paused — NHL arb not working properly
     'KXUFCFIGHT': ('mma_mixed_martial_arts', 'UFC/MMA', {}),
     'KXEPLGAME': ('soccer_epl', 'EPL', {}),
     'KXLALIGAGAME': ('soccer_spain_la_liga', 'La Liga', {}),
@@ -78,7 +78,7 @@ MONEYLINE_SPORTS = {
 # Spread markets: kalshi_series -> (odds_api_sport, display_name, team_map)
 SPREAD_SPORTS = {
     'KXNBASPREAD': ('basketball_nba', 'NBA Spread', NBA_TEAMS),
-    'KXNHLSPREAD': ('icehockey_nhl', 'NHL Spread', NHL_TEAMS),
+    # 'KXNHLSPREAD': ('icehockey_nhl', 'NHL Spread', NHL_TEAMS),  # Paused — NHL arb not working properly
     'KXNCAAMBSPREAD': ('basketball_ncaab', 'NCAAB Spread', {}),
     'KXEPLSPREAD': ('soccer_epl', 'EPL Spread', {}),
     'KXLALIGASPREAD': ('soccer_spain_la_liga', 'La Liga Spread', {}),
@@ -92,7 +92,7 @@ SPREAD_SPORTS = {
 # Total (over/under) markets: kalshi_series -> (odds_api_sport, display_name)
 TOTAL_SPORTS = {
     'KXNBATOTAL': ('basketball_nba', 'NBA Total'),
-    'KXNHLTOTAL': ('icehockey_nhl', 'NHL Total'),
+    # 'KXNHLTOTAL': ('icehockey_nhl', 'NHL Total'),  # Paused — NHL arb not working properly
     'KXNCAAMBTOTAL': ('basketball_ncaab', 'NCAAB Total'),
     'KXEPLTOTAL': ('soccer_epl', 'EPL Total'),
     'KXLALIGATOTAL': ('soccer_spain_la_liga', 'La Liga Total'),
@@ -2322,8 +2322,13 @@ PROP_STAT_MAP = {
     'KXNBAREB':   {'sport': 'nba', 'stat_name': 'rebounds',  'group': 'skater', 'display': 'NBA'},
     'KXNBAAST':   {'sport': 'nba', 'stat_name': 'assists',   'group': 'skater', 'display': 'NBA'},
     'KXNBA3PT':   {'sport': 'nba', 'stat_name': 'threes',    'group': 'skater', 'display': 'NBA'},
+    'KXNBASTL':   {'sport': 'nba', 'stat_name': 'steals',    'group': 'skater', 'display': 'NBA'},
+    'KXNBABLK':   {'sport': 'nba', 'stat_name': 'blocks',    'group': 'skater', 'display': 'NBA'},
+    'KXNBADD':    {'sport': 'nba', 'stat_name': 'double_double', 'group': 'skater', 'display': 'NBA'},
+    'KXNBATD':    {'sport': 'nba', 'stat_name': 'triple_double', 'group': 'skater', 'display': 'NBA'},
     # NHL
     'KXNHLPTS':   {'sport': 'nhl', 'stat_name': 'points',  'group': 'skater', 'display': 'NHL'},
+    'KXNHLGOALS': {'sport': 'nhl', 'stat_name': 'goals',   'group': 'skater', 'display': 'NHL'},
     'KXNHLAST':   {'sport': 'nhl', 'stat_name': 'assists', 'group': 'skater', 'display': 'NHL'},
     'KXNHLSAVES': {'sport': 'nhl', 'stat_name': 'saves',   'group': 'goalie', 'display': 'NHL'},
 }
@@ -2458,6 +2463,16 @@ def _get_box_score(game_id: str, espn_path: str, sport_config: dict,
                             if isinstance(idx, int) and idx < len(stats):
                                 player_data[stat_name] = _parse_espn_stat(stats[idx], parse)
                     player_stats[name] = player_data
+
+        # Compute double-double and triple-double for NBA players
+        if 'basketball' in espn_path:
+            for name, pdata in player_stats.items():
+                cats_with_10 = 0
+                for cat in ('points', 'rebounds', 'assists', 'steals', 'blocks'):
+                    if pdata.get(cat, 0) >= 10:
+                        cats_with_10 += 1
+                pdata['double_double'] = 1 if cats_with_10 >= 2 else 0
+                pdata['triple_double'] = 1 if cats_with_10 >= 3 else 0
 
         return player_stats
     except Exception as e:
@@ -4459,6 +4474,58 @@ def start_index_sniper():
     print("Index sniper thread launched")
 
 
+# ============================================================
+# COMPLETED PROPS SNIPER — dedicated fast-scan thread
+# ============================================================
+
+COMPLETED_PROPS_SCAN_INTERVAL = 60  # Scan every 60 seconds (vs 30s+ full scan)
+
+def _completed_props_sniper_loop():
+    """Dedicated thread that scans completed player props more frequently.
+
+    The main scan loop takes minutes due to moneyline/spread/total checks.
+    Completed props are free money — a player has ALREADY hit the stat threshold
+    but cheap YES contracts are still available. We need to find and buy these
+    as fast as possible before the market catches up.
+
+    This thread runs independently every 60 seconds, checking only prop markets
+    against live ESPN box scores.
+    """
+    # Wait for initial startup
+    time.sleep(30)
+    print("Completed props sniper thread started")
+
+    while True:
+        try:
+            kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+            print(f"\n--- Completed Props Sniper Scan ---")
+            completed = find_completed_props(kalshi)
+            if completed:
+                with _scan_lock:
+                    # Merge into cached edges (avoid duplicates by ticker)
+                    existing_tickers = {e.get('kalshi_ticker') for e in _scan_cache['edges']}
+                    for edge in completed:
+                        if edge.get('kalshi_ticker') not in existing_tickers:
+                            _scan_cache['edges'].append(edge)
+                print(f"   Props sniper: {len(completed)} completed props found")
+            else:
+                print(f"   Props sniper: no completed props")
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Completed props sniper error: {e}")
+
+        time.sleep(COMPLETED_PROPS_SCAN_INTERVAL)
+
+
+def start_completed_props_sniper():
+    """Start the completed props sniper thread (called once on app boot)."""
+    t = threading.Thread(target=_completed_props_sniper_loop, daemon=True)
+    t.start()
+    print("Completed props sniper thread launched")
+
+
 def find_all_resolved_markets(kalshi_api) -> List[Dict]:
     """Master function: find ALL Kalshi markets with known outcomes."""
     all_resolved = []
@@ -4751,6 +4818,7 @@ def start_crypto_sniper():
 start_background_scanner()
 start_crypto_sniper()
 start_index_sniper()
+start_completed_props_sniper()
 
 
 # ============================================================
