@@ -158,9 +158,9 @@ MAX_RISK = 250.00     # Max total cost per FD arb order
 MIN_EDGE_PERCENT = 0.5  # Skip edges below this % (fees/slippage eat tiny edges)
 
 # Crypto & Index: higher conviction (near-expiry / known outcomes), size more aggressively
-CRYPTO_TARGET_PROFIT = 250.00  # Target $250 profit per crypto trade
+CRYPTO_TARGET_PROFIT = 15.00   # Target $15 profit per crypto trade
 CRYPTO_MAX_RISK = 1000.00      # Max $1000 cost per crypto order
-INDEX_TARGET_PROFIT = 250.00   # Target $250 profit per index trade (S&P/Nasdaq)
+INDEX_TARGET_PROFIT = 15.00    # Target $15 profit per index trade (S&P/Nasdaq)
 INDEX_MAX_RISK = 1000.00       # Max $1000 cost per index order
 
 # Track which edges we've already notified about
@@ -3115,10 +3115,10 @@ CRYPTO_PRICE_IDS = {
 # Format: (max_minutes_to_close, required_buffer_pct)
 CRYPTO_BUFFER_TIERS = [
     (2, 0.002),     # < 2 min:  0.2% buffer
-    (5, 0.003),     # < 5 min:  0.3% buffer
-    (15, 0.008),    # < 15 min: 0.8% buffer
-    (30, 0.012),    # < 30 min: 1.2% buffer
-    (60, 0.014),    # < 60 min: 1.4% buffer
+    (5, 0.005),     # < 5 min:  0.5% buffer
+    (15, 0.01),     # < 15 min: 1.0% buffer
+    (30, 0.015),    # < 30 min: 1.5% buffer
+    (60, 0.02),     # < 60 min: 2.0% buffer
     (0, 0),         # Expired:  0% buffer (outcome is known)
 ]
 
@@ -4221,11 +4221,11 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
                         elif minutes_to_close <= 5:
                             required_buffer = 0.003  # 0.3%
                         elif minutes_to_close <= 15:
-                            required_buffer = 0.004  # 0.4%
-                        elif minutes_to_close <= 30:
                             required_buffer = 0.005  # 0.5%
-                        elif minutes_to_close <= 60:
+                        elif minutes_to_close <= 30:
                             required_buffer = 0.008  # 0.8%
+                        elif minutes_to_close <= 60:
+                            required_buffer = 0.012  # 1.2%
 
                 # Classify market type using shared function
                 mtype = _classify_kalshi_market(m)
@@ -4438,11 +4438,11 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
                         elif minutes_to_close <= 5:
                             required_buffer = 0.003  # 0.3%
                         elif minutes_to_close <= 15:
-                            required_buffer = 0.004  # 0.4%
-                        elif minutes_to_close <= 30:
                             required_buffer = 0.005  # 0.5%
-                        elif minutes_to_close <= 60:
+                        elif minutes_to_close <= 30:
                             required_buffer = 0.008  # 0.8%
+                        elif minutes_to_close <= 60:
+                            required_buffer = 0.012  # 1.2%
 
                 # Detect market type (same approach as crypto scanner)
                 is_above = 'above' in title_lower or 'or more' in title_lower or 'or higher' in title_lower
