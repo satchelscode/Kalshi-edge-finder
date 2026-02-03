@@ -321,8 +321,10 @@ def match_kalshi_to_fanduel_game(team1_name, team2_name, fd_games, kalshi_date_s
             if kalshi_date and game_info.get('commence_time'):
                 try:
                     ct = datetime.fromisoformat(game_info['commence_time'].replace('Z', '+00:00'))
-                    # Game should be on the Kalshi date (allow same day or next day early AM)
                     day_diff = abs((ct.date() - kalshi_date.date()).days)
+                    # Reject if more than 1 day apart — different game entirely
+                    if day_diff > 1:
+                        continue
                     candidates.append((day_diff, matched))
                 except Exception:
                     candidates.append((0, matched))
@@ -1186,7 +1188,11 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         t1_name = team_map.get(team_abbrevs_list[0], team_abbrevs_list[0])
         t2_name = team_map.get(team_abbrevs_list[1], team_abbrevs_list[1])
 
-        fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games)
+        # Extract date from game_code (e.g. 'KXNHLGAME-26FEB02BUFFLA' → '26FEB02')
+        date_match = re.search(r'(\d{2}[A-Z]{3}\d{2})', game_code)
+        kalshi_date = date_match.group(1) if date_match else None
+
+        fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games, kalshi_date)
         if not fd_t1 or fd_t1 not in fanduel_odds or fd_t2 not in fanduel_odds:
             continue
         commence_str = fanduel_games.get(matched_gid, {}).get('commence_time', '')
@@ -1309,13 +1315,13 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                 entries.append((t1_name, t1_yes, f"YES on {t1_name}", fd_t2,
                                team_markets[team_abbrevs_list[0]]['ticker'], 'yes'))
             else:
-                entries.append((t1_name, t2_no, f"NO on {t2_name}", fd_t2,
+                entries.append((t1_name, t2_no, f"NO on {t2_name}", fd_t1,
                                team_markets[team_abbrevs_list[1]]['ticker'], 'no'))
             if t2_yes <= t1_no:
                 entries.append((t2_name, t2_yes, f"YES on {t2_name}", fd_t1,
                                team_markets[team_abbrevs_list[1]]['ticker'], 'yes'))
             else:
-                entries.append((t2_name, t1_no, f"NO on {t1_name}", fd_t1,
+                entries.append((t2_name, t1_no, f"NO on {t1_name}", fd_t2,
                                team_markets[team_abbrevs_list[0]]['ticker'], 'no'))
 
             # Evaluate both entries, pick only the best edge per game
@@ -1432,8 +1438,12 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
         t1_name = team_map.get(team_abbrevs[0], team_abbrevs[0])
         t2_name = team_map.get(team_abbrevs[1], team_abbrevs[1])
 
+        # Extract date from game_code for date-aware matching
+        date_match = re.search(r'(\d{2}[A-Z]{3}\d{2})', game_code)
+        kalshi_date = date_match.group(1) if date_match else None
+
         # Require BOTH teams match the SAME FanDuel game
-        fd_t1, fd_t2, matched_game_id = match_kalshi_to_fanduel_game(t1_name, t2_name, fd_games)
+        fd_t1, fd_t2, matched_game_id = match_kalshi_to_fanduel_game(t1_name, t2_name, fd_games, kalshi_date)
         if not fd_t1 or not matched_game_id or matched_game_id not in fd_spreads:
             continue
 
