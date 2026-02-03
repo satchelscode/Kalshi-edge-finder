@@ -2333,8 +2333,9 @@ PROP_STAT_MAP = {
     'KXNHLSAVES': {'sport': 'nhl', 'stat_name': 'saves',   'group': 'goalie', 'display': 'NHL'},
 }
 
-# Max price to pay for a completed prop (99 cents = $0.01 profit per contract minimum)
-COMPLETED_PROP_MAX_PRICE = 0.99
+# Max price to pay for a completed prop — buy anything below $1.00
+# Even at $0.99, profit is ~$0.0093/contract after fees (free money is free money)
+COMPLETED_PROP_MAX_PRICE = 1.00
 
 
 def _parse_espn_stat(stat_str: str, parse_type: str, stat_config=None) -> int:
