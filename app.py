@@ -159,10 +159,10 @@ MIN_EDGE_PERCENT = 0.5  # Skip edges below this % (fees/slippage eat tiny edges)
 
 # Crypto & Index overrides: these resolved markets have high win rates and
 # expired markets are zero-risk, so we size more aggressively.
-CRYPTO_TARGET_PROFIT = 10.00  # Target $10 profit per crypto trade
-CRYPTO_MAX_RISK = 500.00      # Max $500 cost per crypto order
-INDEX_TARGET_PROFIT = 10.00   # Target $10 profit per index trade (S&P/Nasdaq)
-INDEX_MAX_RISK = 500.00       # Max $500 cost per index order
+CRYPTO_TARGET_PROFIT = 15.00  # Target $15 profit per crypto trade
+CRYPTO_MAX_RISK = 1000.00     # Max $1000 cost per crypto order
+INDEX_TARGET_PROFIT = 15.00   # Target $15 profit per index trade (S&P/Nasdaq)
+INDEX_MAX_RISK = 1000.00      # Max $1000 cost per index order
 
 # Track which edges we've already notified about
 _notified_edges = set()
@@ -479,6 +479,9 @@ https://kalshi-edge-finder.onrender.com/orders"""
 def auto_trade_edge(edge: Dict, kalshi_api) -> Optional[Dict]:
     """Automatically place a limit order on Kalshi for a detected edge.
     Returns order info dict if placed, None otherwise."""
+    # FanDuel arb auto-trading disabled — notifications still sent.
+    return None
+
     global _order_tracker
 
     if not AUTO_TRADE_ENABLED:
@@ -2700,10 +2703,10 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
     # Sort no bids descending by price (highest no bid = cheapest YES ask)
     no_bids_sorted = sorted(no_bids, key=lambda x: x[0], reverse=True)
 
-    # Calculate how many contracts we can buy at each price level
-    # Capped by TARGET_PROFIT (max win) and MAX_RISK (max cost)
-    remaining_balance = min(avail, MAX_RISK)  # Cap spending at MAX_RISK
-    remaining_profit_target = TARGET_PROFIT
+    # Completed props are GUARANTEED — player already hit the threshold.
+    # Buy as much as the orderbook and balance allow (no artificial caps).
+    remaining_balance = min(avail, 5000.00)  # Up to $5000 (balance is real cap)
+    remaining_profit_target = 999.00  # Effectively uncapped
     total_contracts = 0
     total_cost = 0
     best_price = None
@@ -2753,9 +2756,9 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
     if total_profit <= 0:
         return None
 
-    # Final safety check
-    if total_cost > MAX_RISK:
-        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds MAX_RISK ${MAX_RISK:.2f}")
+    # Final safety check (generous for guaranteed props)
+    if total_cost > 5000.00:
+        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds $5000 limit")
         return None
 
     # Place the order at the best ask price for the total contracts
@@ -3007,7 +3010,7 @@ def _get_game_scores(espn_path: str, is_soccer: bool = False) -> List[Dict]:
         return []
 
 
-RESOLVED_MAX_WIN = TARGET_PROFIT  # Max profit per resolved market (matches global TARGET_PROFIT)
+RESOLVED_MAX_WIN = 999.00  # Resolved game markets are guaranteed — max bet
 
 def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
                          sport: str, game_name: str, kalshi_api, ob: dict = None,
@@ -3017,7 +3020,7 @@ def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
     global _order_tracker
 
     effective_target = target_profit if target_profit is not None else RESOLVED_MAX_WIN
-    effective_max_risk = max_risk if max_risk is not None else MAX_RISK
+    effective_max_risk = max_risk if max_risk is not None else 5000.00  # Resolved = guaranteed, use balance
 
     if not AUTO_TRADE_ENABLED:
         return None
