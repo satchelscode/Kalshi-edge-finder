@@ -158,10 +158,10 @@ MAX_RISK = 250.00     # Max total cost per FD arb order
 MIN_EDGE_PERCENT = 0.5  # Skip edges below this % (fees/slippage eat tiny edges)
 
 # Crypto & Index: higher conviction (near-expiry / known outcomes), size more aggressively
-CRYPTO_TARGET_PROFIT = 25.00  # Target $25 profit per crypto trade
-CRYPTO_MAX_RISK = 1000.00     # Max $1000 cost per crypto order
-INDEX_TARGET_PROFIT = 25.00   # Target $25 profit per index trade (S&P/Nasdaq)
-INDEX_MAX_RISK = 1000.00      # Max $1000 cost per index order
+CRYPTO_TARGET_PROFIT = 250.00  # Target $250 profit per crypto trade
+CRYPTO_MAX_RISK = 1000.00      # Max $1000 cost per crypto order
+INDEX_TARGET_PROFIT = 250.00   # Target $250 profit per index trade (S&P/Nasdaq)
+INDEX_MAX_RISK = 1000.00       # Max $1000 cost per index order
 
 # Track which edges we've already notified about
 _notified_edges = set()
@@ -2333,8 +2333,9 @@ PROP_STAT_MAP = {
     'KXNHLSAVES': {'sport': 'nhl', 'stat_name': 'saves',   'group': 'goalie', 'display': 'NHL'},
 }
 
-# Max price to pay for a completed prop (99 cents = $0.01 profit per contract minimum)
-COMPLETED_PROP_MAX_PRICE = 0.99
+# Max price to pay for a completed prop — buy anything below $1.00
+# Even at $0.99, profit is ~$0.0093/contract after fees (free money is free money)
+COMPLETED_PROP_MAX_PRICE = 1.00
 
 
 def _parse_espn_stat(stat_str: str, parse_type: str, stat_config=None) -> int:
@@ -2670,6 +2671,172 @@ def find_completed_props(kalshi_api) -> List[Dict]:
     return edges
 
 
+def find_nhl_tied_game_totals(kalshi_api) -> List[Dict]:
+    """Find NHL totals markets that are GUARANTEED due to tied games.
+
+    In NHL, games cannot end in ties (OT/shootout decides winner).
+    So if a game is tied X-X, the minimum final total is 2X+1 goals.
+
+    Examples:
+    - Tied 1-1 → minimum 3 goals → Over 2.5 GUARANTEED
+    - Tied 2-2 → minimum 5 goals → Over 4.5 GUARANTEED
+    - Tied 3-3 → minimum 7 goals → Over 6.5 GUARANTEED
+
+    Buy YES on any Over market below the guaranteed threshold at any price < $1.00.
+    """
+    edges = []
+
+    try:
+        # Get live NHL games with scores from ESPN
+        resp = requests.get(
+            'https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard',
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        tied_games = []  # [(home_abbr, away_abbr, score, guaranteed_total, game_date_str), ...]
+
+        for event in data.get('events', []):
+            status = event.get('status', {}).get('type', {}).get('name', '')
+            # Only look at games in progress (not finished)
+            if status not in ('STATUS_IN_PROGRESS', 'STATUS_END_PERIOD', 'STATUS_HALFTIME'):
+                continue
+
+            # Extract game date for ticker matching
+            game_date_str = ''
+            event_date = event.get('date', '') or ''
+            if event_date and len(event_date) >= 10:
+                try:
+                    gd = datetime.fromisoformat(event_date.replace('Z', '+00:00'))
+                    gd_eastern = gd.astimezone(ZoneInfo('America/New_York'))
+                    game_date_str = gd_eastern.strftime('%y%b%d').upper()
+                except Exception:
+                    pass
+
+            competitors = event.get('competitions', [{}])[0].get('competitors', [])
+            home_score = away_score = 0
+            home_abbr = away_abbr = ''
+
+            for c in competitors:
+                espn_abbr = c.get('team', {}).get('abbreviation', '')
+                abbr = ESPN_TO_KALSHI.get(espn_abbr, espn_abbr)
+                score = int(c.get('score', 0) or 0)
+                if c.get('homeAway') == 'home':
+                    home_score = score
+                    home_abbr = abbr
+                else:
+                    away_score = score
+                    away_abbr = abbr
+
+            # Check if tied
+            if home_score == away_score and home_score > 0:
+                # Minimum final total = 2 * tie_score + 1 (someone must win)
+                guaranteed_total = 2 * home_score + 1
+                tied_games.append((home_abbr, away_abbr, home_score, guaranteed_total, game_date_str))
+                print(f"   NHL tied game: {away_abbr}@{home_abbr} {home_score}-{away_score} → Over {guaranteed_total - 0.5} guaranteed")
+
+        if not tied_games:
+            return edges
+
+        # Fetch NHL total markets from Kalshi
+        markets = kalshi_api.get_markets('KXNHLTOTAL')
+        if not markets:
+            return edges
+
+        for mkt in markets:
+            ticker = mkt.get('ticker', '')
+            title = mkt.get('title', '')
+            status = mkt.get('status', '')
+
+            if status != 'active':
+                continue
+
+            # Ticker format: KXNHLTOTAL-26FEB03DETBOS-55 (Over 5.5)
+            # Extract teams and line from ticker
+            parts = ticker.split('-')
+            if len(parts) < 3:
+                continue
+
+            game_part = parts[1]  # e.g., 26FEB03DETBOS
+            line_part = parts[2]  # e.g., 55 (means 5.5)
+
+            # Extract date and teams from game_part
+            ticker_date = game_part[:7] if len(game_part) >= 7 else ''  # 26FEB03
+            teams_part = game_part[7:] if len(game_part) > 7 else ''  # DETBOS
+
+            # Parse the line (55 -> 5.5, 65 -> 6.5, etc.)
+            try:
+                line_int = int(line_part)
+                line = line_int / 10.0  # 55 -> 5.5
+            except ValueError:
+                continue
+
+            # Check if this market matches any tied game
+            for home_abbr, away_abbr, tie_score, guaranteed_total, game_date_str in tied_games:
+                # Match teams (either order since it's a total)
+                if not (home_abbr in teams_part and away_abbr in teams_part):
+                    continue
+
+                # Match date
+                if ticker_date and game_date_str and ticker_date != game_date_str:
+                    continue
+
+                # Check if this Over line is guaranteed
+                # Over X.5 is guaranteed if X.5 < guaranteed_total
+                # e.g., Over 2.5 guaranteed when guaranteed_total = 3 (tied 1-1)
+                if line < guaranteed_total:
+                    # This is a guaranteed win! Get the orderbook
+                    time.sleep(0.2)
+                    ob = kalshi_api.get_orderbook(ticker)
+                    if not ob:
+                        continue
+
+                    ob_data = ob.get('orderbook', {})
+                    no_bids = ob_data.get('no', [])  # YES ask = 100 - no_bid
+
+                    # Find best YES ask price
+                    yes_price = None
+                    if no_bids:
+                        best_no_bid = max(no_bids, key=lambda x: x[0])
+                        yes_price = (100 - best_no_bid[0]) / 100.0
+
+                    if yes_price is None or yes_price >= COMPLETED_PROP_MAX_PRICE:
+                        continue
+
+                    edge = {
+                        'market_type': 'NHL Total (Tied)',
+                        'sport': 'NHL',
+                        'game': f"{away_abbr} @ {home_abbr}",
+                        'team': f"Over {line}",
+                        'kalshi_price': yes_price,
+                        'kalshi_price_after_fees': yes_price + kalshi_fee(yes_price),
+                        'kalshi_prob_after_fees': (yes_price + kalshi_fee(yes_price)) * 100,
+                        'kalshi_ticker': ticker,
+                        'kalshi_side': 'yes',
+                        'fanduel_opposite_team': f"Game tied {tie_score}-{tie_score}",
+                        'fanduel_opposite_odds': 0,
+                        'fanduel_opposite_prob': 100.0,  # 100% certain
+                        'total_implied_prob': yes_price * 100,
+                        'arbitrage_profit': ((1.0 / yes_price) - 1) * 100,
+                        'is_live': True,
+                        'recommendation': f"BUY YES on Over {line} — game tied {tie_score}-{tie_score}, minimum {guaranteed_total} goals",
+                        'orderbook': ob,
+                    }
+                    edges.append(edge)
+                    print(f"   GUARANTEED NHL TOTAL: {away_abbr}@{home_abbr} Over {line} @ ${yes_price:.2f} (tied {tie_score}-{tie_score})")
+                    send_telegram_notification(edge)
+                    auto_trade_completed_prop(edge, kalshi_api)
+                    break  # Only one match per market
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"   NHL tied game totals error: {e}")
+
+    return edges
+
+
 def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
     """Auto-trade a completed prop. Buy MAX contracts since it's guaranteed money.
     Sweeps the entire ask side of the orderbook up to account balance."""
@@ -2682,8 +2849,10 @@ def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
     if not ticker:
         return None
 
-    if _order_tracker.has_position(ticker):
-        return None
+    # NOTE: Intentionally NOT checking has_position for completed props.
+    # These are GUARANTEED wins (player already hit the threshold), so we
+    # should keep buying as long as there's liquidity below $0.99.
+    # The orderbook sweep logic handles position sizing naturally.
 
     if not _order_tracker.can_trade():
         return None
@@ -4499,17 +4668,27 @@ def _completed_props_sniper_loop():
         try:
             kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
             print(f"\n--- Completed Props Sniper Scan ---")
+
+            all_guaranteed = []
+
+            # 1. Completed player props (stat already hit)
             completed = find_completed_props(kalshi)
-            if completed:
+            all_guaranteed.extend(completed)
+
+            # 2. NHL tied game totals (guaranteed by no-tie rule)
+            nhl_tied = find_nhl_tied_game_totals(kalshi)
+            all_guaranteed.extend(nhl_tied)
+
+            if all_guaranteed:
                 with _scan_lock:
                     # Merge into cached edges (avoid duplicates by ticker)
                     existing_tickers = {e.get('kalshi_ticker') for e in _scan_cache['edges']}
-                    for edge in completed:
+                    for edge in all_guaranteed:
                         if edge.get('kalshi_ticker') not in existing_tickers:
                             _scan_cache['edges'].append(edge)
-                print(f"   Props sniper: {len(completed)} completed props found")
+                print(f"   Props sniper: {len(completed)} completed props, {len(nhl_tied)} NHL tied totals")
             else:
-                print(f"   Props sniper: no completed props")
+                print(f"   Props sniper: no guaranteed opportunities")
 
         except Exception as e:
             import traceback
@@ -4663,10 +4842,17 @@ def scan_all_sports(kalshi_api, fanduel_api):
     print(f"\n--- Completed Props (Live Stat Arb) ---")
     sports_scanned.append('Live Props')
     completed = find_completed_props(kalshi_api)
-    if completed:
-        sports_with_games.append('Live Props')
     all_edges.extend(completed)
     print(f"   Completed props: {len(completed)} opportunities")
+
+    # 7b. NHL tied game totals — guaranteed by no-tie rule
+    print(f"\n--- NHL Tied Game Totals (Guaranteed) ---")
+    nhl_tied = find_nhl_tied_game_totals(kalshi_api)
+    all_edges.extend(nhl_tied)
+    print(f"   NHL tied totals: {len(nhl_tied)} opportunities")
+
+    if completed or nhl_tied:
+        sports_with_games.append('Live Props')
 
     # 8. Resolved markets — game results, crypto prices, economic data
     print(f"\n--- Resolved Markets (Known Outcomes) ---")
