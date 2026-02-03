@@ -153,8 +153,15 @@ TENNIS_SPORTS = {
 # Auto-trade configuration
 AUTO_TRADE_ENABLED = True
 MAX_POSITIONS = 999  # No practical limit
-TARGET_PROFIT = 1.00  # Target $1 profit per trade
+TARGET_PROFIT = 5.00  # Target $5 profit per FD arb trade
+MAX_RISK = 250.00     # Max total cost per FD arb order
 MIN_EDGE_PERCENT = 0.5  # Skip edges below this % (fees/slippage eat tiny edges)
+
+# Crypto & Index: higher conviction (near-expiry / known outcomes), size more aggressively
+CRYPTO_TARGET_PROFIT = 15.00  # Target $15 profit per crypto trade
+CRYPTO_MAX_RISK = 1000.00     # Max $1000 cost per crypto order
+INDEX_TARGET_PROFIT = 15.00   # Target $15 profit per index trade (S&P/Nasdaq)
+INDEX_MAX_RISK = 1000.00      # Max $1000 cost per index order
 
 # Track which edges we've already notified about
 _notified_edges = set()
@@ -499,8 +506,7 @@ def auto_trade_edge(edge: Dict, kalshi_api) -> Optional[Dict]:
 
     price = edge['kalshi_price']
 
-    # Calculate contracts to win ~$1 profit
-    # First estimate with approximate per-contract fee, then recalculate with exact fee
+    # Calculate contracts to hit TARGET_PROFIT, capped by MAX_RISK
     approx_fee = kalshi_fee(price)
     approx_profit_per = 1.0 - price - approx_fee
     if approx_profit_per <= 0:
@@ -508,12 +514,24 @@ def auto_trade_edge(edge: Dict, kalshi_api) -> Optional[Dict]:
         return None
     contracts = math.ceil(TARGET_PROFIT / approx_profit_per)
 
+    # Cap by MAX_RISK: total cost cannot exceed MAX_RISK
+    cost_per = price + approx_fee
+    if cost_per > 0:
+        max_by_risk = int(MAX_RISK / cost_per)
+        contracts = min(contracts, max(1, max_by_risk))
+
     # Recalculate with exact fee for this contract count
     fee_total = math.ceil(0.07 * contracts * price * (1 - price) * 100) / 100
     total_cost = (price * contracts) + fee_total
-    total_profit = (1.0 * contracts) - total_cost  # win $1/contract minus cost
+    total_profit = (1.0 * contracts) - total_cost
+
+    if total_cost > MAX_RISK:
+        print(f"   >>> SAFETY BLOCK: {ticker} cost ${total_cost:.2f} exceeds MAX_RISK ${MAX_RISK:.2f}")
+        return None
 
     price_cents = int(round(price * 100))
+
+    print(f"   >>> ARB TRADE: {ticker} {side.upper()} {contracts}x @ ${price:.2f} = ${total_cost:.2f} (profit ${total_profit:.2f})")
 
     # Place the limit order
     result = kalshi_api.place_order(
@@ -2973,8 +2991,12 @@ def _get_game_scores(espn_path: str, is_soccer: bool = False) -> List[Dict]:
 
 
 def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
-                         sport: str, game_name: str, kalshi_api, ob: dict = None) -> Optional[Dict]:
-    """Buy a resolved market at max size. side = 'yes' or 'no'."""
+                         sport: str, game_name: str, kalshi_api, ob: dict = None,
+                         target_profit: float = None, max_risk: float = None) -> Optional[Dict]:
+    """Buy a resolved market. side = 'yes' or 'no'.
+
+    By default (no target_profit/max_risk), bets max size (full balance).
+    Pass target_profit/max_risk to cap sizing (used for crypto/index)."""
     global _order_tracker
 
     if not AUTO_TRADE_ENABLED:
@@ -2998,11 +3020,17 @@ def _buy_resolved_market(ticker: str, side: str, price: float, reason: str,
     if avail <= 0:
         return None
 
-    # Calculate max contracts we can afford
+    # Calculate max contracts we can afford, optionally capped by max_risk
     cost_per = price + fee
-    contracts = int(avail / cost_per) if cost_per > 0 else 0
+    max_spend = min(avail, max_risk) if max_risk is not None else avail
+    contracts = int(max_spend / cost_per) if cost_per > 0 else 0
     if contracts <= 0:
         return None
+
+    # If target_profit is set, cap contracts so profit doesn't exceed it
+    if target_profit is not None and profit_per > 0:
+        max_contracts_for_cap = int(target_profit / profit_per)
+        contracts = min(contracts, max(1, max_contracts_for_cap))
 
     # If we have the orderbook, limit to available liquidity
     if ob:
@@ -3671,7 +3699,9 @@ def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> L
             if ask_price and ask_price < COMPLETED_PROP_MAX_PRICE:
                 reason = f"{reason_detail} ({time_str}, buffer {buffer_pct:.1%})"
                 result = _buy_resolved_market(ticker, side, ask_price, reason,
-                                               'Crypto', reason_detail, kalshi_api, ob)
+                                               'Crypto', reason_detail, kalshi_api, ob,
+                                               target_profit=CRYPTO_TARGET_PROFIT,
+                                               max_risk=CRYPTO_MAX_RISK)
                 if result:
                     edges.append(result)
 
@@ -3780,6 +3810,330 @@ def find_resolved_econ_markets(kalshi_api) -> List[Dict]:
     return edges
 
 
+# ============================================================
+# S&P 500 / NASDAQ SNIPER
+# ============================================================
+
+# Index price configs: Yahoo Finance symbol -> Kalshi series list
+INDEX_SNIPER_CONFIG = {
+    '^GSPC': {  # S&P 500
+        'series': ['KXINX', 'KXINXU'],
+        'display': 'S&P 500',
+    },
+    '^NDX': {   # Nasdaq-100
+        'series': ['KXNASDAQ100', 'KXNASDAQ100U'],
+        'display': 'Nasdaq-100',
+    },
+}
+
+
+def _get_stock_price(symbol: str) -> Optional[float]:
+    """Get current stock/index price from Yahoo Finance."""
+    try:
+        resp = requests.get(
+            f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}',
+            params={'interval': '1m', 'range': '1d'},
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        result = data.get('chart', {}).get('result', [])
+        if result:
+            meta = result[0].get('meta', {})
+            price = meta.get('regularMarketPrice')
+            if price and price > 0:
+                return float(price)
+    except Exception as e:
+        print(f"   Yahoo Finance {symbol} error: {e}")
+    return None
+
+
+def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> List[Dict]:
+    """Find stock index markets where the outcome is already determined or nearly certain.
+    Same logic as crypto scanner but for S&P 500 and Nasdaq-100.
+
+    buffer_override: if set, use this fixed buffer % instead of time-based.
+                     Used by the index sniper for tighter buffers near close.
+    """
+    edges = []
+    now_utc = datetime.now(timezone.utc)
+    now_et = _get_eastern_now()
+
+    # Stock market hours: 9:30 AM - 4:00 PM ET
+    market_open = now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)
+    market_close_time = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    minutes_to_market_close = (market_close_time - now_et).total_seconds() / 60.0
+
+    if not market_open or minutes_to_market_close < -30:
+        return edges  # Market not open or already closed long ago
+
+    for symbol, config in INDEX_SNIPER_CONFIG.items():
+        price = _get_stock_price(symbol)
+        if not price:
+            continue
+        display = config['display']
+        print(f"   {display}: ${price:,.2f}")
+
+        for series in config['series']:
+            kalshi_markets = kalshi_api.get_markets(series)
+            if not kalshi_markets:
+                continue
+
+            print(f"   Scanning {series}: {len(kalshi_markets)} markets")
+
+            skipped_buffer = 0
+            skipped_no_threshold = 0
+            checked = 0
+
+            for m in kalshi_markets:
+                ticker = m.get('ticker', '')
+                title = (m.get('title', '') or '')
+                title_lower = title.lower()
+                floor_strike = m.get('floor_strike')
+                cap_strike = m.get('cap_strike')
+
+                # Parse close time from market
+                close_time = (m.get('close_time', '') or m.get('expiration_time', '') or
+                             m.get('expected_expiration_time', '') or '')
+                minutes_to_close = None
+                is_expired = False
+                if close_time:
+                    try:
+                        ct = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
+                        remaining = (ct - now_utc).total_seconds() / 60.0
+                        if remaining <= 0:
+                            is_expired = True
+                            minutes_to_close = 0
+                        else:
+                            minutes_to_close = remaining
+                    except Exception:
+                        pass
+
+                # Skip markets closing > 60 min from now (too much can change)
+                if minutes_to_close is not None and minutes_to_close > 60 and not is_expired:
+                    continue
+                if minutes_to_close is None and not is_expired:
+                    continue
+
+                # Buffer: S&P moves ~0.3% per hour normally, tail risk ~1%
+                if buffer_override is not None:
+                    required_buffer = 0 if is_expired else buffer_override
+                else:
+                    required_buffer = 0.02  # default 2%
+                    if is_expired:
+                        required_buffer = 0
+                    elif minutes_to_close is not None:
+                        if minutes_to_close <= 2:
+                            required_buffer = 0.001  # 0.1%
+                        elif minutes_to_close <= 5:
+                            required_buffer = 0.003  # 0.3%
+                        elif minutes_to_close <= 15:
+                            required_buffer = 0.005  # 0.5%
+                        elif minutes_to_close <= 30:
+                            required_buffer = 0.008  # 0.8%
+                        elif minutes_to_close <= 60:
+                            required_buffer = 0.012  # 1.2%
+
+                # Detect market type (same approach as crypto scanner)
+                is_above = 'above' in title_lower or 'or more' in title_lower or 'or higher' in title_lower
+                is_below = 'below' in title_lower or 'or less' in title_lower or 'or lower' in title_lower
+                is_range = (' to ' in title_lower or ' - ' in title_lower) and not is_above and not is_below
+
+                if is_range or (cap_strike is not None and floor_strike is not None
+                               and float(cap_strike) != float(floor_strike) and not is_above and not is_below):
+                    # Range market
+                    if floor_strike is None or cap_strike is None:
+                        skipped_no_threshold += 1
+                        continue
+                    range_low = float(floor_strike)
+                    range_high = float(cap_strike)
+                    if range_low <= 0 or range_high <= 0:
+                        skipped_no_threshold += 1
+                        continue
+
+                    if price > range_high:
+                        buffer_pct = (price - range_high) / price
+                        if buffer_pct < required_buffer:
+                            skipped_buffer += 1
+                            continue
+                        side = 'no'
+                        reason_detail = f"${price:,.0f} above range ${range_low:,.0f}-${range_high:,.0f}"
+                    elif price < range_low:
+                        buffer_pct = (range_low - price) / price
+                        if buffer_pct < required_buffer:
+                            skipped_buffer += 1
+                            continue
+                        side = 'no'
+                        reason_detail = f"${price:,.0f} below range ${range_low:,.0f}-${range_high:,.0f}"
+                    else:
+                        if not is_expired:
+                            skipped_buffer += 1
+                            continue
+                        side = 'yes'
+                        buffer_pct = min(
+                            (price - range_low) / price,
+                            (range_high - price) / price
+                        )
+                        reason_detail = f"${price:,.0f} IN range ${range_low:,.0f}-${range_high:,.0f}"
+                else:
+                    # Single-threshold market: above or below
+                    if floor_strike is not None:
+                        threshold = float(floor_strike)
+                    else:
+                        price_match = re.search(r'\$?([\d,]+(?:\.\d+)?)', title)
+                        if price_match:
+                            try:
+                                threshold = float(price_match.group(1).replace(',', ''))
+                            except ValueError:
+                                skipped_no_threshold += 1
+                                continue
+                        else:
+                            skipped_no_threshold += 1
+                            continue
+
+                    if threshold <= 0:
+                        skipped_no_threshold += 1
+                        continue
+
+                    buffer_pct = abs(price - threshold) / price
+                    if buffer_pct < required_buffer:
+                        skipped_buffer += 1
+                        continue
+
+                    if is_below:
+                        if price < threshold:
+                            side = 'yes'
+                            reason_detail = f"${price:,.0f} < ${threshold:,.0f} (below market)"
+                        else:
+                            side = 'no'
+                            reason_detail = f"${price:,.0f} > ${threshold:,.0f} (below market, NO wins)"
+                    else:
+                        # "Above X" market (default)
+                        if price > threshold:
+                            side = 'yes'
+                            reason_detail = f"${price:,.0f} > ${threshold:,.0f}"
+                        else:
+                            side = 'no'
+                            reason_detail = f"${price:,.0f} < ${threshold:,.0f}"
+
+                checked += 1
+                time_str = f"{minutes_to_close:.0f}min left" if minutes_to_close and not is_expired else "EXPIRED"
+
+                ob = kalshi_api.get_orderbook(ticker)
+                if not ob:
+                    continue
+                time.sleep(0.15)
+
+                if side == 'yes':
+                    ask_price = get_best_yes_price(ob)
+                else:
+                    ask_price = get_best_no_price(ob)
+
+                if ask_price and ask_price < COMPLETED_PROP_MAX_PRICE:
+                    reason = f"{reason_detail} ({time_str}, buffer {buffer_pct:.1%})"
+                    result = _buy_resolved_market(ticker, side, ask_price, reason,
+                                                   display, reason_detail, kalshi_api, ob,
+                                                   target_profit=INDEX_TARGET_PROFIT,
+                                                   max_risk=INDEX_MAX_RISK)
+                    if result:
+                        edges.append(result)
+
+            print(f"   {series} filter: {skipped_buffer} buffer, {skipped_no_threshold} no-threshold, {checked} checked")
+            time.sleep(0.5)
+
+    return edges
+
+
+def _index_sniper_loop():
+    """Dedicated thread that scans S&P 500 / Nasdaq markets at precise times before market close (4 PM ET).
+    Same concept as crypto sniper but for stock indices."""
+    time.sleep(60)
+    print("Index sniper thread started")
+
+    while True:
+        try:
+            now_et = _get_eastern_now()
+
+            # Calculate next market close (4:00 PM ET today or tomorrow)
+            today_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+            if now_et >= today_close + timedelta(minutes=5):
+                # Already past today's close, wait for tomorrow
+                tomorrow = now_et + timedelta(days=1)
+                # Skip weekends
+                while tomorrow.weekday() >= 5:  # 5=Saturday, 6=Sunday
+                    tomorrow += timedelta(days=1)
+                next_close = tomorrow.replace(hour=16, minute=0, second=0, microsecond=0)
+            else:
+                next_close = today_close
+                # If it's a weekend, skip
+                if now_et.weekday() >= 5:
+                    tomorrow = now_et + timedelta(days=1)
+                    while tomorrow.weekday() >= 5:
+                        tomorrow += timedelta(days=1)
+                    next_close = tomorrow.replace(hour=16, minute=0, second=0, microsecond=0)
+
+            seconds_until_close = (next_close - now_et).total_seconds()
+
+            # Sleep until 90 seconds before close
+            sleep_time = max(0, seconds_until_close - 90)
+            if sleep_time > 0:
+                print(f"   Index sniper: next close {next_close.strftime('%I:%M %p ET %a')}, "
+                      f"sleeping {sleep_time/60:.1f}min")
+                time.sleep(sleep_time)
+
+            # Only run during market hours on weekdays
+            now_et = _get_eastern_now()
+            if now_et.weekday() >= 5:
+                time.sleep(60)
+                continue
+
+            kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+
+            # S&P moves ~0.1% in 90 seconds. Use tight buffers.
+            scan_schedule = [
+                (90, 0.0008),   # 90s out: 0.08% buffer
+                (60, 0.0005),   # 60s out: 0.05% buffer
+                (15, 0.0001),   # 15s out: 0.01% buffer
+            ]
+
+            for i, (target_secs, sniper_buffer) in enumerate(scan_schedule):
+                now_et = _get_eastern_now()
+                secs_left = (next_close - now_et).total_seconds()
+
+                if secs_left < -30:
+                    break
+
+                scan_label = f"{secs_left:.0f}s before close" if secs_left > 0 else "EXPIRED"
+                print(f"   Index sniper scan {i+1}/3 ({scan_label}, buffer={sniper_buffer:.3%}):")
+
+                results = find_resolved_index_markets(kalshi, buffer_override=sniper_buffer)
+                if results:
+                    print(f"   Index sniper: {len(results)} edges found!")
+
+                if i < len(scan_schedule) - 1:
+                    now_et = _get_eastern_now()
+                    secs_left = (next_close - now_et).total_seconds()
+                    next_target = scan_schedule[i + 1][0]
+                    wait = max(1, secs_left - next_target)
+                    time.sleep(wait)
+
+            time.sleep(30)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Index sniper error: {e}")
+            time.sleep(60)
+
+
+def start_index_sniper():
+    """Start the index sniper thread (called once on app boot)."""
+    t = threading.Thread(target=_index_sniper_loop, daemon=True)
+    t.start()
+    print("Index sniper thread launched")
+
+
 def find_all_resolved_markets(kalshi_api) -> List[Dict]:
     """Master function: find ALL Kalshi markets with known outcomes."""
     all_resolved = []
@@ -3806,6 +4160,15 @@ def find_all_resolved_markets(kalshi_api) -> List[Dict]:
     econ_resolved = find_resolved_econ_markets(kalshi_api)
     all_resolved.extend(econ_resolved)
     print(f"   Econ markets: {len(econ_resolved)} resolved")
+    time.sleep(1.0)
+
+    # 5. Stock index markets (S&P 500, Nasdaq-100) — also scanned by sniper thread near close
+    now_et = _get_eastern_now()
+    if now_et.weekday() < 5 and 9 <= now_et.hour < 17:
+        print(f"   Scanning resolved index markets...")
+        index_resolved = find_resolved_index_markets(kalshi_api)
+        all_resolved.extend(index_resolved)
+        print(f"   Index markets: {len(index_resolved)} resolved")
 
     return all_resolved
 
@@ -4062,6 +4425,7 @@ def start_crypto_sniper():
 # Start scanner when module loads (gunicorn will call this)
 start_background_scanner()
 start_crypto_sniper()
+start_index_sniper()
 
 
 # ============================================================
