@@ -2837,6 +2837,245 @@ def find_nhl_tied_game_totals(kalshi_api) -> List[Dict]:
     return edges
 
 
+def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
+    """Find basketball moneyline markets that are GUARANTEED using Haslametrics formula.
+
+    The #AnalyticallyFinal formula: Lead Safe = (Current Lead - 5)²
+
+    This gives seconds remaining when a lead becomes statistically insurmountable.
+    Examples:
+    - Lead of 10 → safe at 25 seconds left ((10-5)² = 25)
+    - Lead of 15 → safe at 100 seconds left (1:40)
+    - Lead of 20 → safe at 225 seconds left (3:45)
+    - Lead of 25 → safe at 400 seconds left (6:40)
+
+    If seconds_remaining < (lead - 5)², the game is analytically final.
+    Buy YES on the leading team's moneyline at any price < $1.00.
+    """
+    edges = []
+
+    # Check both NBA and NCAAB
+    basketball_configs = [
+        {
+            'espn_path': 'basketball/nba',
+            'kalshi_series': 'KXNBAGAME',
+            'sport_name': 'NBA',
+            'quarters': 4,
+            'period_minutes': 12,  # 4x12 = 48 min total
+        },
+        {
+            'espn_path': 'basketball/mens-college-basketball',
+            'kalshi_series': 'KXNCAAMBGAME',
+            'sport_name': 'NCAAB',
+            'quarters': 2,  # 2 halves
+            'period_minutes': 20,  # 2x20 = 40 min total
+        },
+    ]
+
+    for config in basketball_configs:
+        try:
+            # Get live games with scores and time from ESPN
+            resp = requests.get(
+                f"https://site.api.espn.com/apis/site/v2/sports/{config['espn_path']}/scoreboard",
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            analytically_final_games = []
+
+            for event in data.get('events', []):
+                status_obj = event.get('status', {})
+                status = status_obj.get('type', {}).get('name', '')
+
+                # Only look at games in progress
+                if status not in ('STATUS_IN_PROGRESS', 'STATUS_END_PERIOD', 'STATUS_HALFTIME'):
+                    continue
+
+                # Get current period and clock
+                period = status_obj.get('period', 0)
+                clock_str = status_obj.get('displayClock', '0:00')
+
+                # Parse clock (MM:SS or M:SS)
+                try:
+                    parts = clock_str.split(':')
+                    if len(parts) == 2:
+                        clock_minutes = int(parts[0])
+                        clock_seconds = int(parts[1])
+                    else:
+                        clock_minutes = 0
+                        clock_seconds = int(parts[0]) if parts[0].isdigit() else 0
+                except:
+                    clock_minutes = 0
+                    clock_seconds = 0
+
+                # Calculate total seconds remaining in game
+                seconds_in_period = clock_minutes * 60 + clock_seconds
+                periods_remaining = config['quarters'] - period
+                seconds_remaining = seconds_in_period + (periods_remaining * config['period_minutes'] * 60)
+
+                # Extract game date for ticker matching
+                game_date_str = ''
+                event_date = event.get('date', '') or ''
+                if event_date and len(event_date) >= 10:
+                    try:
+                        gd = datetime.fromisoformat(event_date.replace('Z', '+00:00'))
+                        gd_eastern = gd.astimezone(ZoneInfo('America/New_York'))
+                        game_date_str = gd_eastern.strftime('%y%b%d').upper()
+                    except:
+                        pass
+
+                # Get scores and teams
+                competitors = event.get('competitions', [{}])[0].get('competitors', [])
+                home_score = away_score = 0
+                home_abbr = away_abbr = ''
+                home_name = away_name = ''
+
+                for c in competitors:
+                    espn_abbr = c.get('team', {}).get('abbreviation', '')
+                    abbr = ESPN_TO_KALSHI.get(espn_abbr, espn_abbr)
+                    score = int(c.get('score', 0) or 0)
+                    name = c.get('team', {}).get('shortDisplayName', espn_abbr)
+                    if c.get('homeAway') == 'home':
+                        home_score = score
+                        home_abbr = abbr
+                        home_name = name
+                    else:
+                        away_score = score
+                        away_abbr = abbr
+                        away_name = name
+
+                # Calculate lead
+                lead = abs(home_score - away_score)
+                if lead <= 5:
+                    continue  # Formula only works for leads > 5
+
+                # Haslametrics formula: safe_seconds = (lead - 5)²
+                safe_seconds = (lead - 5) ** 2
+
+                # Check if game is analytically final
+                if seconds_remaining < safe_seconds:
+                    # Determine leading team
+                    if home_score > away_score:
+                        leading_abbr = home_abbr
+                        leading_name = home_name
+                        trailing_abbr = away_abbr
+                    else:
+                        leading_abbr = away_abbr
+                        leading_name = away_name
+                        trailing_abbr = home_abbr
+
+                    analytically_final_games.append({
+                        'home_abbr': home_abbr,
+                        'away_abbr': away_abbr,
+                        'leading_abbr': leading_abbr,
+                        'leading_name': leading_name,
+                        'lead': lead,
+                        'score': f"{away_score}-{home_score}",
+                        'seconds_remaining': seconds_remaining,
+                        'safe_seconds': safe_seconds,
+                        'game_date_str': game_date_str,
+                    })
+                    mins_left = seconds_remaining // 60
+                    secs_left = seconds_remaining % 60
+                    print(f"   {config['sport_name']} analytically final: {away_abbr}@{home_abbr} {away_score}-{home_score}, "
+                          f"lead {lead}, {mins_left}:{secs_left:02d} left (safe at {safe_seconds}s)")
+
+            if not analytically_final_games:
+                continue
+
+            # Fetch moneyline markets from Kalshi
+            markets = kalshi_api.get_markets(config['kalshi_series'])
+            if not markets:
+                continue
+
+            for mkt in markets:
+                ticker = mkt.get('ticker', '')
+                title = mkt.get('title', '')
+                mkt_status = mkt.get('status', '')
+
+                if mkt_status != 'active':
+                    continue
+
+                # Ticker format: KXNBAGAME-26FEB03BOSLAL-BOS
+                parts = ticker.split('-')
+                if len(parts) < 3:
+                    continue
+
+                game_part = parts[1]  # e.g., 26FEB03BOSLAL
+                team_part = parts[2]  # e.g., BOS (the team this contract is for)
+
+                ticker_date = game_part[:7] if len(game_part) >= 7 else ''
+                teams_part = game_part[7:] if len(game_part) > 7 else ''
+
+                # Check if this market matches any analytically final game
+                for game in analytically_final_games:
+                    # Match teams
+                    if not (game['home_abbr'] in teams_part and game['away_abbr'] in teams_part):
+                        continue
+
+                    # Match date
+                    if ticker_date and game['game_date_str'] and ticker_date != game['game_date_str']:
+                        continue
+
+                    # Check if this contract is for the LEADING team
+                    if team_part != game['leading_abbr']:
+                        continue
+
+                    # This is a guaranteed win! Get the orderbook
+                    time.sleep(0.2)
+                    ob = kalshi_api.get_orderbook(ticker)
+                    if not ob:
+                        continue
+
+                    ob_data = ob.get('orderbook', {})
+                    no_bids = ob_data.get('no', [])
+
+                    # Find best YES ask price
+                    yes_price = None
+                    if no_bids:
+                        best_no_bid = max(no_bids, key=lambda x: x[0])
+                        yes_price = (100 - best_no_bid[0]) / 100.0
+
+                    if yes_price is None or yes_price >= COMPLETED_PROP_MAX_PRICE:
+                        continue
+
+                    mins_left = game['seconds_remaining'] // 60
+                    secs_left = game['seconds_remaining'] % 60
+
+                    edge = {
+                        'market_type': f"{config['sport_name']} ML (Final)",
+                        'sport': config['sport_name'],
+                        'game': f"{game['away_abbr']} @ {game['home_abbr']}",
+                        'team': game['leading_name'],
+                        'kalshi_price': yes_price,
+                        'kalshi_price_after_fees': yes_price + kalshi_fee(yes_price),
+                        'kalshi_prob_after_fees': (yes_price + kalshi_fee(yes_price)) * 100,
+                        'kalshi_ticker': ticker,
+                        'kalshi_side': 'yes',
+                        'fanduel_opposite_team': f"Lead {game['lead']}, {mins_left}:{secs_left:02d} left",
+                        'fanduel_opposite_odds': 0,
+                        'fanduel_opposite_prob': 100.0,
+                        'total_implied_prob': yes_price * 100,
+                        'arbitrage_profit': ((1.0 / yes_price) - 1) * 100,
+                        'is_live': True,
+                        'recommendation': f"BUY YES {game['leading_name']} — up {game['lead']} with {mins_left}:{secs_left:02d} left (analytically final)",
+                        'orderbook': ob,
+                    }
+                    edges.append(edge)
+                    print(f"   ANALYTICALLY FINAL: {game['away_abbr']}@{game['home_abbr']} {game['leading_name']} @ ${yes_price:.2f}")
+                    send_telegram_notification(edge)
+                    auto_trade_completed_prop(edge, kalshi_api)
+                    break
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"   Basketball analytically final error ({config['sport_name']}): {e}")
+
+    return edges
+
+
 def auto_trade_completed_prop(edge: Dict, kalshi_api) -> Optional[Dict]:
     """Auto-trade a completed prop. Buy MAX contracts since it's guaranteed money.
     Sweeps the entire ask side of the orderbook up to account balance."""
@@ -4679,6 +4918,10 @@ def _completed_props_sniper_loop():
             nhl_tied = find_nhl_tied_game_totals(kalshi)
             all_guaranteed.extend(nhl_tied)
 
+            # 3. Basketball analytically final (Haslametrics formula)
+            bball_final = find_basketball_analytically_final(kalshi)
+            all_guaranteed.extend(bball_final)
+
             if all_guaranteed:
                 with _scan_lock:
                     # Merge into cached edges (avoid duplicates by ticker)
@@ -4686,7 +4929,7 @@ def _completed_props_sniper_loop():
                     for edge in all_guaranteed:
                         if edge.get('kalshi_ticker') not in existing_tickers:
                             _scan_cache['edges'].append(edge)
-                print(f"   Props sniper: {len(completed)} completed props, {len(nhl_tied)} NHL tied totals")
+                print(f"   Props sniper: {len(completed)} props, {len(nhl_tied)} NHL tied, {len(bball_final)} bball final")
             else:
                 print(f"   Props sniper: no guaranteed opportunities")
 
@@ -4851,7 +5094,13 @@ def scan_all_sports(kalshi_api, fanduel_api):
     all_edges.extend(nhl_tied)
     print(f"   NHL tied totals: {len(nhl_tied)} opportunities")
 
-    if completed or nhl_tied:
+    # 7c. Basketball analytically final — Haslametrics formula
+    print(f"\n--- Basketball Analytically Final (Haslametrics) ---")
+    bball_final = find_basketball_analytically_final(kalshi_api)
+    all_edges.extend(bball_final)
+    print(f"   Basketball final: {len(bball_final)} opportunities")
+
+    if completed or nhl_tied or bball_final:
         sports_with_games.append('Live Props')
 
     # 8. Resolved markets — game results, crypto prices, economic data
