@@ -2786,12 +2786,17 @@ def find_nhl_tied_game_totals(kalshi_api) -> List[Dict]:
                 if ticker_date and game_date_str and ticker_date != game_date_str:
                     continue
 
-                # Check if this Over line is guaranteed
-                # Over X.5 is guaranteed if X.5 < guaranteed_total
-                # e.g., Over 2.5 guaranteed when guaranteed_total = 3 (tied 1-1)
-                # IMPORTANT: Only Over 2.5 is guaranteed when tied 1-1, NOT Over 3.5+
-                print(f"      Checking {ticker}: line={line}, guaranteed_total={guaranteed_total}, tied={tie_score}-{tie_score}")
-                if line < guaranteed_total:
+                # Check if this is THE EXACT guaranteed line
+                # Tied X-X → guaranteed_total = 2X+1 → target_line = 2X+0.5
+                # 1-1 → 3 → Over 2.5 ONLY
+                # 2-2 → 5 → Over 4.5 ONLY
+                # 3-3 → 7 → Over 6.5 ONLY
+                # 4-4 → 9 → Over 8.5 ONLY
+                # 5-5 → 11 → Over 10.5 ONLY
+                # 6-6 → 13 → Over 12.5 ONLY
+                target_line = guaranteed_total - 0.5
+                print(f"      Checking {ticker}: line={line}, target_line={target_line}, tied={tie_score}-{tie_score}")
+                if abs(line - target_line) < 0.01:  # Only exact match
                     # This is a guaranteed win! Get the orderbook
                     time.sleep(0.2)
                     ob = kalshi_api.get_orderbook(ticker)
