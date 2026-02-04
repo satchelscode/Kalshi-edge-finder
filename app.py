@@ -2865,8 +2865,15 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
     """
     edges = []
 
-    # Check both NBA and NCAAB
+    # ALL basketball leagues from Kalshi with correct game formats
+    # Game format research:
+    # - NBA: 4 x 12 min quarters = 48 min
+    # - NCAAB Men: 2 x 20 min halves = 40 min
+    # - NCAAB Women: 4 x 10 min quarters = 40 min (changed in 2015)
+    # - WNBA: 4 x 10 min quarters = 40 min
+    # - All FIBA/International: 4 x 10 min quarters = 40 min
     basketball_configs = [
+        # === US Pro ===
         {
             'espn_path': 'basketball/nba',
             'kalshi_series': 'KXNBAGAME',
@@ -2875,21 +2882,114 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
             'period_minutes': 12,  # 4x12 = 48 min total
         },
         {
+            'espn_path': 'basketball/wnba',
+            'kalshi_series': 'KXWNBAGAME',
+            'sport_name': 'WNBA',
+            'quarters': 4,
+            'period_minutes': 10,  # 4x10 = 40 min total
+        },
+        # === US College ===
+        {
             'espn_path': 'basketball/mens-college-basketball',
             'kalshi_series': 'KXNCAAMBGAME',
-            'sport_name': 'NCAAB',
+            'sport_name': 'NCAAB (M)',
             'quarters': 2,  # 2 halves
             'period_minutes': 20,  # 2x20 = 40 min total
+        },
+        {
+            'espn_path': 'basketball/womens-college-basketball',
+            'kalshi_series': 'KXNCAAWBGAME',
+            'sport_name': 'NCAAB (W)',
+            'quarters': 4,
+            'period_minutes': 10,  # 4x10 = 40 min total
+        },
+        # === European Pro ===
+        {
+            'espn_path': 'basketball/euroleague',  # ESPN may not have this
+            'kalshi_series': 'KXEUROLEAGUEGAME',
+            'sport_name': 'Euroleague',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules: 4x10 = 40 min
+        },
+        {
+            'espn_path': 'basketball/eurocup',  # ESPN may not have this
+            'kalshi_series': 'KXEUROCUPGAME',
+            'sport_name': 'EuroCup',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules: 4x10 = 40 min
+        },
+        # === FIBA Competitions ===
+        {
+            'espn_path': 'basketball/fiba-champions-league',  # ESPN may not have this
+            'kalshi_series': 'KXFIBACHLGAME',
+            'sport_name': 'FIBA Champions League',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        {
+            'espn_path': 'basketball/fiba-europe-cup',  # ESPN may not have this
+            'kalshi_series': 'KXFIBAEUCGAME',
+            'sport_name': 'FIBA Europe Cup',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        # === International Leagues ===
+        {
+            'espn_path': 'basketball/nbl-australia',  # ESPN may not have this
+            'kalshi_series': 'KXNBLGAME',
+            'sport_name': 'NBL Australia',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        {
+            'espn_path': 'basketball/japan-b-league',  # ESPN may not have this
+            'kalshi_series': 'KXBLEAGUEGAME',
+            'sport_name': 'Japan B League',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        {
+            'espn_path': 'basketball/korea-kbl',  # ESPN may not have this
+            'kalshi_series': 'KXKBLGAME',
+            'sport_name': 'South Korea KBL',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        {
+            'espn_path': 'basketball/france-lnb',  # ESPN may not have this
+            'kalshi_series': 'KXLNBGAME',
+            'sport_name': 'LNB Elite (France)',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        {
+            'espn_path': 'basketball/argentina-liga-nacional',  # ESPN may not have this
+            'kalshi_series': 'KXLNBARGAME',
+            'sport_name': 'Liga Nacional (Argentina)',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        # === New Leagues ===
+        {
+            'espn_path': 'basketball/unrivaled',  # New women's league
+            'kalshi_series': 'KXUNRIVALEDGAME',
+            'sport_name': 'Unrivaled',
+            'quarters': 4,
+            'period_minutes': 10,  # Uses FIBA-style quarters
         },
     ]
 
     for config in basketball_configs:
         try:
             # Get live games with scores and time from ESPN
+            # Note: Many international leagues may not have ESPN coverage - that's OK, we silently skip them
             resp = requests.get(
                 f"https://site.api.espn.com/apis/site/v2/sports/{config['espn_path']}/scoreboard",
-                timeout=10
+                timeout=5
             )
+            if resp.status_code == 404:
+                # ESPN doesn't have this league - silently continue
+                continue
             resp.raise_for_status()
             data = resp.json()
 
@@ -3111,6 +3211,14 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
                     auto_trade_completed_prop(edge, kalshi_api)
                     break
 
+        except requests.exceptions.HTTPError as e:
+            # Silently skip leagues that ESPN doesn't support (404, etc.)
+            if e.response is not None and e.response.status_code in (404, 400):
+                continue
+            print(f"   Basketball analytically final HTTP error ({config['sport_name']}): {e}")
+        except requests.exceptions.RequestException:
+            # Network errors - silently continue to next league
+            continue
         except Exception as e:
             import traceback
             traceback.print_exc()

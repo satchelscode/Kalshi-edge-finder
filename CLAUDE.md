@@ -108,6 +108,26 @@ def kalshi_fee(price: float, contracts: int = 100) -> float:
 2. Keyword overlap (at least 2 common words)
 3. Date-aware validation to prevent cross-date mismatches
 
+### Basketball Game Formats (CRITICAL for Analytically Final)
+Different leagues have different game lengths - must use correct format to calculate time remaining:
+
+| League | Format | Total Time |
+|--------|--------|------------|
+| **NBA** | 4 x 12 min quarters | 48 min |
+| **WNBA** | 4 x 10 min quarters | 40 min |
+| **NCAAB Men** | 2 x 20 min halves | 40 min |
+| **NCAAB Women** | 4 x 10 min quarters | 40 min |
+| **Euroleague/EuroCup** | 4 x 10 min quarters | 40 min |
+| **FIBA (all)** | 4 x 10 min quarters | 40 min |
+| **NBL Australia** | 4 x 10 min quarters | 40 min |
+| **Japan B League** | 4 x 10 min quarters | 40 min |
+| **Korea KBL** | 4 x 10 min quarters | 40 min |
+| **France LNB** | 4 x 10 min quarters | 40 min |
+| **Argentina Liga** | 4 x 10 min quarters | 40 min |
+| **Unrivaled** | 4 x 10 min quarters | 40 min |
+
+**Note:** International leagues may not have ESPN coverage - scanner silently skips them if no data available.
+
 ---
 
 ## Configuration Constants
