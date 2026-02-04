@@ -26,7 +26,7 @@ The system now ONLY scans for these three types of guaranteed money:
 
 ### Active Thread (1 only)
 
-**Completed Props Sniper** (`_completed_props_sniper_loop`) - Runs every 30 seconds, scans ONLY guaranteed markets:
+**Completed Props Sniper** (`_completed_props_sniper_loop`) - Runs every 15 seconds, scans ONLY guaranteed markets:
 - Completed player props (NBA, NHL)
 - NHL tied game totals
 - Basketball analytically final
@@ -133,7 +133,7 @@ COMPLETED_PROP_MAX_PRICE = 1.00    # Buy any completed prop < $1.00
 ## Current Trading Status (as of Feb 2025)
 
 ### ACTIVE (Guaranteed Markets Only)
-- **Completed Props Scanner:** ACTIVE - scans every 30s
+- **Completed Props Scanner:** ACTIVE - scans every 15s
 - **NHL Tied Totals Scanner:** ACTIVE - runs within completed props loop
 - **Basketball Analytically Final:** ACTIVE - runs within completed props loop
 - **Auto-Trading for Guaranteed Props:** ACTIVE (`auto_trade_completed_prop`)
@@ -152,7 +152,7 @@ COMPLETED_PROP_MAX_PRICE = 1.00    # Buy any completed prop < $1.00
 - **Kalshi API:** No strict rate limit, but be reasonable
 - **ESPN API:** Used for live scores/box scores - no auth needed
 - **The Odds API:** NOT USED (FanDuel arb scanning disabled)
-- **Scan interval:** 30 seconds between guaranteed market scans
+- **Scan interval:** 15 seconds between guaranteed market scans
 
 ---
 
@@ -227,6 +227,6 @@ TELEGRAM_CHAT_ID          # Optional: notification target
 
 The codebase has evolved toward:
 1. **Guaranteed markets only** - disabled all FanDuel arb, crypto, index scanning
-2. Single focused scanner (completed props sniper) running every 30s
+2. Single focused scanner (completed props sniper) running every 15s
 3. Bug fixes around date matching and line parsing for guaranteed markets
 4. Careful position management for auto-trading guaranteed props

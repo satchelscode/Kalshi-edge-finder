@@ -2894,6 +2894,7 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
             data = resp.json()
 
             analytically_final_games = []
+            close_games = []  # Games that are CLOSE to analytically final (for logging)
 
             for event in data.get('events', []):
                 status_obj = event.get('status', {})
@@ -2958,7 +2959,21 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
 
                 # Calculate lead
                 lead = abs(home_score - away_score)
+
+                # Determine leading team for logging
+                if home_score > away_score:
+                    leading_abbr = home_abbr
+                    leading_name = home_name
+                else:
+                    leading_abbr = away_abbr
+                    leading_name = away_name
+
+                mins_left = seconds_remaining // 60
+                secs_left = seconds_remaining % 60
+
                 if lead <= 5:
+                    # Log close games even if not analytically final
+                    print(f"   {config['sport_name']} game: {away_abbr}@{home_abbr} {away_score}-{home_score}, lead {lead} (need >5)")
                     continue  # Formula only works for leads > 5
 
                 # Haslametrics formula: safe_seconds = (lead - 5)²
@@ -2966,16 +2981,6 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
 
                 # Check if game is analytically final
                 if seconds_remaining < safe_seconds:
-                    # Determine leading team
-                    if home_score > away_score:
-                        leading_abbr = home_abbr
-                        leading_name = home_name
-                        trailing_abbr = away_abbr
-                    else:
-                        leading_abbr = away_abbr
-                        leading_name = away_name
-                        trailing_abbr = home_abbr
-
                     analytically_final_games.append({
                         'home_abbr': home_abbr,
                         'away_abbr': away_abbr,
@@ -2987,10 +2992,27 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
                         'safe_seconds': safe_seconds,
                         'game_date_str': game_date_str,
                     })
-                    mins_left = seconds_remaining // 60
-                    secs_left = seconds_remaining % 60
-                    print(f"   {config['sport_name']} analytically final: {away_abbr}@{home_abbr} {away_score}-{home_score}, "
+                    print(f"   {config['sport_name']} ANALYTICALLY FINAL: {away_abbr}@{home_abbr} {away_score}-{home_score}, "
                           f"lead {lead}, {mins_left}:{secs_left:02d} left (safe at {safe_seconds}s)")
+                else:
+                    # Track games that are CLOSE to analytically final (within 3x safe time)
+                    if seconds_remaining < safe_seconds * 3:
+                        close_games.append({
+                            'game': f"{away_abbr}@{home_abbr}",
+                            'score': f"{away_score}-{home_score}",
+                            'lead': lead,
+                            'seconds_remaining': seconds_remaining,
+                            'safe_seconds': safe_seconds,
+                            'leading': leading_name,
+                        })
+                        print(f"   {config['sport_name']} CLOSE: {away_abbr}@{home_abbr} {away_score}-{home_score}, "
+                              f"lead {lead}, {mins_left}:{secs_left:02d} left (need <{safe_seconds}s)")
+                    else:
+                        print(f"   {config['sport_name']} game: {away_abbr}@{home_abbr} {away_score}-{home_score}, "
+                              f"lead {lead}, {mins_left}:{secs_left:02d} left (need <{safe_seconds}s, has {seconds_remaining}s)")
+
+            # Log summary for this sport
+            print(f"   {config['sport_name']} summary: {len(analytically_final_games)} final, {len(close_games)} close")
 
             if not analytically_final_games:
                 continue
@@ -2998,7 +3020,10 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
             # Fetch moneyline markets from Kalshi
             markets = kalshi_api.get_markets(config['kalshi_series'])
             if not markets:
+                print(f"   {config['sport_name']}: NO KALSHI MARKETS found for {config['kalshi_series']}")
                 continue
+
+            print(f"   {config['sport_name']}: Found {len(markets)} Kalshi markets, checking for matches...")
 
             for mkt in markets:
                 ticker = mkt.get('ticker', '')
@@ -3033,10 +3058,12 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
                     if team_part != game['leading_abbr']:
                         continue
 
-                    # This is a guaranteed win! Get the orderbook
+                    # Found a match! Get the orderbook
+                    print(f"   MATCH: {ticker} for {game['leading_name']} (up {game['lead']})")
                     time.sleep(0.2)
                     ob = kalshi_api.get_orderbook(ticker)
                     if not ob:
+                        print(f"   SKIP: {ticker} - no orderbook data")
                         continue
 
                     ob_data = ob.get('orderbook', {})
@@ -3048,7 +3075,12 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
                         best_no_bid = max(no_bids, key=lambda x: x[0])
                         yes_price = (100 - best_no_bid[0]) / 100.0
 
-                    if yes_price is None or yes_price >= COMPLETED_PROP_MAX_PRICE:
+                    if yes_price is None:
+                        print(f"   SKIP: {ticker} - no liquidity (no asks)")
+                        continue
+
+                    if yes_price >= COMPLETED_PROP_MAX_PRICE:
+                        print(f"   SKIP: {ticker} - price ${yes_price:.2f} >= ${COMPLETED_PROP_MAX_PRICE:.2f}")
                         continue
 
                     mins_left = game['seconds_remaining'] // 60
@@ -4906,7 +4938,7 @@ def start_index_sniper():
 # COMPLETED PROPS SNIPER — dedicated fast-scan thread
 # ============================================================
 
-COMPLETED_PROPS_SCAN_INTERVAL = 30  # Scan every 30 seconds — guaranteed markets only, no FD arb overhead
+COMPLETED_PROPS_SCAN_INTERVAL = 15  # Scan every 15 seconds — guaranteed markets only, faster for analytically final
 
 def _completed_props_sniper_loop():
     """Dedicated thread that scans completed player props more frequently.
