@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This is a sophisticated arbitrage opportunity finder that identifies +EV betting edges between FanDuel and Kalshi platforms. The app continuously scans for mispriced markets across multiple sports and automatically alerts (with optional auto-trading) when profitable opportunities are found.
+This scanner focuses **exclusively on guaranteed markets** on Kalshi — outcomes that are already determined but still have contracts available for purchase. No FanDuel arbitrage, no probability-based edges.
 
 **Tech Stack:** Python (Flask backend) + HTML/CSS/JS (frontend)
 **Main Entry Point:** `app.py` (contains ALL business logic - ~6000 lines)
@@ -10,14 +10,32 @@ This is a sophisticated arbitrage opportunity finder that identifies +EV betting
 
 ---
 
+## CURRENT FOCUS: Guaranteed Markets Only
+
+The system now ONLY scans for these three types of guaranteed money:
+
+1. **Completed Props** - Player has ALREADY hit their stat target (e.g., player has 25 pts, market is Over 22.5)
+2. **NHL Tied Totals** - Tied NHL games where the over is guaranteed (no ties in NHL = OT until winner)
+3. **Basketball Analytically Final** - Games where Haslametrics formula says outcome is locked
+
+**Everything else is DISABLED** — no FanDuel arb scanning, no crypto, no index, no probability edges.
+
+---
+
 ## Architecture
 
-### Thread-Based Scanning (4 background threads)
+### Active Thread (1 only)
 
-1. **Main Background Scanner** (`_background_scan_loop`) - Runs every 30 seconds, scans ALL market types
-2. **Crypto Sniper Thread** (`_crypto_sniper_loop`) - Wakes 90s before hourly close with tightening buffers
-3. **Index Sniper Thread** (`_index_sniper_loop`) - Similar to crypto, only during market hours (9AM-5PM ET)
-4. **Completed Props Sniper Thread** (`_completed_props_sniper_loop`) - Scans for live props where target already met
+**Completed Props Sniper** (`_completed_props_sniper_loop`) - Runs every 30 seconds, scans ONLY guaranteed markets:
+- Completed player props (NBA, NHL)
+- NHL tied game totals
+- Basketball analytically final
+
+### Disabled Threads
+
+- `_background_scan_loop` - DISABLED (was FanDuel arb scanning)
+- `_crypto_sniper_loop` - DISABLED
+- `_index_sniper_loop` - DISABLED
 
 ### Key Components
 
@@ -114,30 +132,38 @@ COMPLETED_PROP_MAX_PRICE = 1.00    # Buy any completed prop < $1.00
 
 ## Current Trading Status (as of Feb 2025)
 
-- **FanDuel Arb Auto-Trading:** PAUSED (returns None in `auto_trade_edge`)
-- **Crypto Trading:** PAUSED (early return in sniper)
-- **Index Trading:** PAUSED (early return in sniper)
-- **Completed Props:** ACTIVE
-- **NHL:** PAUSED (arbitrage broken)
+### ACTIVE (Guaranteed Markets Only)
+- **Completed Props Scanner:** ACTIVE - scans every 30s
+- **NHL Tied Totals Scanner:** ACTIVE - runs within completed props loop
+- **Basketball Analytically Final:** ACTIVE - runs within completed props loop
+- **Auto-Trading for Guaranteed Props:** ACTIVE (`auto_trade_completed_prop`)
+
+### DISABLED
+- **FanDuel Arb Scanning:** DISABLED (main background scanner stopped)
+- **FanDuel Arb Auto-Trading:** DISABLED (returns None in `auto_trade_edge`)
+- **Crypto Trading:** DISABLED (sniper thread not started)
+- **Index Trading:** DISABLED (sniper thread not started)
+- **NHL Moneyline/Spread/Total:** DISABLED (commented out in sport configs)
 
 ---
 
 ## API Rate Limits
 
-- **The Odds API:** 500 requests/month (free tier) - WATCH THIS
-- **Sleep between queries:** 0.2-1.0 seconds
-- **Main scan loop:** 30-second rest between iterations
+- **Kalshi API:** No strict rate limit, but be reasonable
+- **ESPN API:** Used for live scores/box scores - no auth needed
+- **The Odds API:** NOT USED (FanDuel arb scanning disabled)
+- **Scan interval:** 30 seconds between guaranteed market scans
 
 ---
 
 ## Environment Variables Required
 
 ```bash
-ODDS_API_KEY              # The Odds API key
 KALSHI_API_KEY_ID         # Kalshi username or API key ID
 KALSHI_PRIVATE_KEY        # RSA private key (PEM format, newlines = \n)
 TELEGRAM_BOT_TOKEN        # Optional: notifications
 TELEGRAM_CHAT_ID          # Optional: notification target
+# ODDS_API_KEY            # NOT NEEDED (FanDuel arb scanning disabled)
 ```
 
 ---
@@ -200,7 +226,7 @@ TELEGRAM_CHAT_ID          # Optional: notification target
 ## Recent Commit Patterns (for context)
 
 The codebase has evolved toward:
-1. Safer, more targeted strategies (crypto/index sniper precision timing)
-2. Away from broad FanDuel arbitrage (currently disabled)
-3. Careful position management (max limits, per-sport sizing)
-4. Bug fixes around date matching and line parsing
+1. **Guaranteed markets only** - disabled all FanDuel arb, crypto, index scanning
+2. Single focused scanner (completed props sniper) running every 30s
+3. Bug fixes around date matching and line parsing for guaranteed markets
+4. Careful position management for auto-trading guaranteed props

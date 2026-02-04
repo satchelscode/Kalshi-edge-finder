@@ -4906,7 +4906,7 @@ def start_index_sniper():
 # COMPLETED PROPS SNIPER — dedicated fast-scan thread
 # ============================================================
 
-COMPLETED_PROPS_SCAN_INTERVAL = 60  # Scan every 60 seconds (vs 30s+ full scan)
+COMPLETED_PROPS_SCAN_INTERVAL = 30  # Scan every 30 seconds — guaranteed markets only, no FD arb overhead
 
 def _completed_props_sniper_loop():
     """Dedicated thread that scans completed player props more frequently.
@@ -5270,10 +5270,10 @@ def start_crypto_sniper():
 
 
 # Start scanner when module loads (gunicorn will call this)
-start_background_scanner()
-start_crypto_sniper()
-start_index_sniper()
-start_completed_props_sniper()
+# start_background_scanner()  # DISABLED — only scanning guaranteed markets now
+# start_crypto_sniper()  # DISABLED — crypto trading paused
+# start_index_sniper()  # DISABLED — index trading paused
+start_completed_props_sniper()  # ONLY guaranteed markets: completed props, NHL tied totals, basketball analytically final
 
 
 # ============================================================
