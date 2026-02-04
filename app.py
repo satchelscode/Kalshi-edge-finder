@@ -2865,8 +2865,15 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
     """
     edges = []
 
-    # Check both NBA and NCAAB
+    # ALL basketball leagues from Kalshi with correct game formats
+    # Game format research:
+    # - NBA: 4 x 12 min quarters = 48 min
+    # - NCAAB Men: 2 x 20 min halves = 40 min
+    # - NCAAB Women: 4 x 10 min quarters = 40 min (changed in 2015)
+    # - WNBA: 4 x 10 min quarters = 40 min
+    # - All FIBA/International: 4 x 10 min quarters = 40 min
     basketball_configs = [
+        # === US Pro ===
         {
             'espn_path': 'basketball/nba',
             'kalshi_series': 'KXNBAGAME',
@@ -2875,25 +2882,119 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
             'period_minutes': 12,  # 4x12 = 48 min total
         },
         {
+            'espn_path': 'basketball/wnba',
+            'kalshi_series': 'KXWNBAGAME',
+            'sport_name': 'WNBA',
+            'quarters': 4,
+            'period_minutes': 10,  # 4x10 = 40 min total
+        },
+        # === US College ===
+        {
             'espn_path': 'basketball/mens-college-basketball',
             'kalshi_series': 'KXNCAAMBGAME',
-            'sport_name': 'NCAAB',
+            'sport_name': 'NCAAB (M)',
             'quarters': 2,  # 2 halves
             'period_minutes': 20,  # 2x20 = 40 min total
+        },
+        {
+            'espn_path': 'basketball/womens-college-basketball',
+            'kalshi_series': 'KXNCAAWBGAME',
+            'sport_name': 'NCAAB (W)',
+            'quarters': 4,
+            'period_minutes': 10,  # 4x10 = 40 min total
+        },
+        # === European Pro ===
+        {
+            'espn_path': 'basketball/euroleague',  # ESPN may not have this
+            'kalshi_series': 'KXEUROLEAGUEGAME',
+            'sport_name': 'Euroleague',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules: 4x10 = 40 min
+        },
+        {
+            'espn_path': 'basketball/eurocup',  # ESPN may not have this
+            'kalshi_series': 'KXEUROCUPGAME',
+            'sport_name': 'EuroCup',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules: 4x10 = 40 min
+        },
+        # === FIBA Competitions ===
+        {
+            'espn_path': 'basketball/fiba-champions-league',  # ESPN may not have this
+            'kalshi_series': 'KXFIBACHLGAME',
+            'sport_name': 'FIBA Champions League',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        {
+            'espn_path': 'basketball/fiba-europe-cup',  # ESPN may not have this
+            'kalshi_series': 'KXFIBAEUCGAME',
+            'sport_name': 'FIBA Europe Cup',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        # === International Leagues ===
+        {
+            'espn_path': 'basketball/nbl-australia',  # ESPN may not have this
+            'kalshi_series': 'KXNBLGAME',
+            'sport_name': 'NBL Australia',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        {
+            'espn_path': 'basketball/japan-b-league',  # ESPN may not have this
+            'kalshi_series': 'KXBLEAGUEGAME',
+            'sport_name': 'Japan B League',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        {
+            'espn_path': 'basketball/korea-kbl',  # ESPN may not have this
+            'kalshi_series': 'KXKBLGAME',
+            'sport_name': 'South Korea KBL',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        {
+            'espn_path': 'basketball/france-lnb',  # ESPN may not have this
+            'kalshi_series': 'KXLNBGAME',
+            'sport_name': 'LNB Elite (France)',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        {
+            'espn_path': 'basketball/argentina-liga-nacional',  # ESPN may not have this
+            'kalshi_series': 'KXLNBARGAME',
+            'sport_name': 'Liga Nacional (Argentina)',
+            'quarters': 4,
+            'period_minutes': 10,  # FIBA rules
+        },
+        # === New Leagues ===
+        {
+            'espn_path': 'basketball/unrivaled',  # New women's league
+            'kalshi_series': 'KXUNRIVALEDGAME',
+            'sport_name': 'Unrivaled',
+            'quarters': 4,
+            'period_minutes': 10,  # Uses FIBA-style quarters
         },
     ]
 
     for config in basketball_configs:
         try:
             # Get live games with scores and time from ESPN
+            # Note: Many international leagues may not have ESPN coverage - that's OK, we silently skip them
             resp = requests.get(
                 f"https://site.api.espn.com/apis/site/v2/sports/{config['espn_path']}/scoreboard",
-                timeout=10
+                timeout=5
             )
+            if resp.status_code == 404:
+                # ESPN doesn't have this league - silently continue
+                continue
             resp.raise_for_status()
             data = resp.json()
 
             analytically_final_games = []
+            close_games = []  # Games that are CLOSE to analytically final (for logging)
 
             for event in data.get('events', []):
                 status_obj = event.get('status', {})
@@ -2958,7 +3059,21 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
 
                 # Calculate lead
                 lead = abs(home_score - away_score)
+
+                # Determine leading team for logging
+                if home_score > away_score:
+                    leading_abbr = home_abbr
+                    leading_name = home_name
+                else:
+                    leading_abbr = away_abbr
+                    leading_name = away_name
+
+                mins_left = seconds_remaining // 60
+                secs_left = seconds_remaining % 60
+
                 if lead <= 5:
+                    # Log close games even if not analytically final
+                    print(f"   {config['sport_name']} game: {away_abbr}@{home_abbr} {away_score}-{home_score}, lead {lead} (need >5)")
                     continue  # Formula only works for leads > 5
 
                 # Haslametrics formula: safe_seconds = (lead - 5)²
@@ -2966,16 +3081,6 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
 
                 # Check if game is analytically final
                 if seconds_remaining < safe_seconds:
-                    # Determine leading team
-                    if home_score > away_score:
-                        leading_abbr = home_abbr
-                        leading_name = home_name
-                        trailing_abbr = away_abbr
-                    else:
-                        leading_abbr = away_abbr
-                        leading_name = away_name
-                        trailing_abbr = home_abbr
-
                     analytically_final_games.append({
                         'home_abbr': home_abbr,
                         'away_abbr': away_abbr,
@@ -2987,10 +3092,27 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
                         'safe_seconds': safe_seconds,
                         'game_date_str': game_date_str,
                     })
-                    mins_left = seconds_remaining // 60
-                    secs_left = seconds_remaining % 60
-                    print(f"   {config['sport_name']} analytically final: {away_abbr}@{home_abbr} {away_score}-{home_score}, "
+                    print(f"   {config['sport_name']} ANALYTICALLY FINAL: {away_abbr}@{home_abbr} {away_score}-{home_score}, "
                           f"lead {lead}, {mins_left}:{secs_left:02d} left (safe at {safe_seconds}s)")
+                else:
+                    # Track games that are CLOSE to analytically final (within 3x safe time)
+                    if seconds_remaining < safe_seconds * 3:
+                        close_games.append({
+                            'game': f"{away_abbr}@{home_abbr}",
+                            'score': f"{away_score}-{home_score}",
+                            'lead': lead,
+                            'seconds_remaining': seconds_remaining,
+                            'safe_seconds': safe_seconds,
+                            'leading': leading_name,
+                        })
+                        print(f"   {config['sport_name']} CLOSE: {away_abbr}@{home_abbr} {away_score}-{home_score}, "
+                              f"lead {lead}, {mins_left}:{secs_left:02d} left (need <{safe_seconds}s)")
+                    else:
+                        print(f"   {config['sport_name']} game: {away_abbr}@{home_abbr} {away_score}-{home_score}, "
+                              f"lead {lead}, {mins_left}:{secs_left:02d} left (need <{safe_seconds}s, has {seconds_remaining}s)")
+
+            # Log summary for this sport
+            print(f"   {config['sport_name']} summary: {len(analytically_final_games)} final, {len(close_games)} close")
 
             if not analytically_final_games:
                 continue
@@ -2998,7 +3120,10 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
             # Fetch moneyline markets from Kalshi
             markets = kalshi_api.get_markets(config['kalshi_series'])
             if not markets:
+                print(f"   {config['sport_name']}: NO KALSHI MARKETS found for {config['kalshi_series']}")
                 continue
+
+            print(f"   {config['sport_name']}: Found {len(markets)} Kalshi markets, checking for matches...")
 
             for mkt in markets:
                 ticker = mkt.get('ticker', '')
@@ -3033,10 +3158,12 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
                     if team_part != game['leading_abbr']:
                         continue
 
-                    # This is a guaranteed win! Get the orderbook
+                    # Found a match! Get the orderbook
+                    print(f"   MATCH: {ticker} for {game['leading_name']} (up {game['lead']})")
                     time.sleep(0.2)
                     ob = kalshi_api.get_orderbook(ticker)
                     if not ob:
+                        print(f"   SKIP: {ticker} - no orderbook data")
                         continue
 
                     ob_data = ob.get('orderbook', {})
@@ -3048,7 +3175,12 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
                         best_no_bid = max(no_bids, key=lambda x: x[0])
                         yes_price = (100 - best_no_bid[0]) / 100.0
 
-                    if yes_price is None or yes_price >= COMPLETED_PROP_MAX_PRICE:
+                    if yes_price is None:
+                        print(f"   SKIP: {ticker} - no liquidity (no asks)")
+                        continue
+
+                    if yes_price >= COMPLETED_PROP_MAX_PRICE:
+                        print(f"   SKIP: {ticker} - price ${yes_price:.2f} >= ${COMPLETED_PROP_MAX_PRICE:.2f}")
                         continue
 
                     mins_left = game['seconds_remaining'] // 60
@@ -3079,6 +3211,14 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
                     auto_trade_completed_prop(edge, kalshi_api)
                     break
 
+        except requests.exceptions.HTTPError as e:
+            # Silently skip leagues that ESPN doesn't support (404, etc.)
+            if e.response is not None and e.response.status_code in (404, 400):
+                continue
+            print(f"   Basketball analytically final HTTP error ({config['sport_name']}): {e}")
+        except requests.exceptions.RequestException:
+            # Network errors - silently continue to next league
+            continue
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -4906,7 +5046,7 @@ def start_index_sniper():
 # COMPLETED PROPS SNIPER — dedicated fast-scan thread
 # ============================================================
 
-COMPLETED_PROPS_SCAN_INTERVAL = 60  # Scan every 60 seconds (vs 30s+ full scan)
+COMPLETED_PROPS_SCAN_INTERVAL = 15  # Scan every 15 seconds — guaranteed markets only, faster for analytically final
 
 def _completed_props_sniper_loop():
     """Dedicated thread that scans completed player props more frequently.
@@ -5270,10 +5410,10 @@ def start_crypto_sniper():
 
 
 # Start scanner when module loads (gunicorn will call this)
-start_background_scanner()
-start_crypto_sniper()
-start_index_sniper()
-start_completed_props_sniper()
+# start_background_scanner()  # DISABLED — only scanning guaranteed markets now
+# start_crypto_sniper()  # DISABLED — crypto trading paused
+# start_index_sniper()  # DISABLED — index trading paused
+start_completed_props_sniper()  # ONLY guaranteed markets: completed props, NHL tied totals, basketball analytically final
 
 
 # ============================================================
