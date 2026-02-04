@@ -4044,6 +4044,9 @@ def find_resolved_crypto_markets(kalshi_api, buffer_override: float = None) -> L
     buffer_override: if set, use this fixed buffer % instead of time-based tiers.
                      Used by the crypto sniper for tighter buffers near close.
     """
+    # Crypto trading paused — return empty list to disable scanning.
+    return []
+
     edges = []
 
     # Get current prices for all cryptos we track
@@ -4399,6 +4402,9 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
     buffer_override: if set, use this fixed buffer % instead of time-based.
                      Used by the index sniper for tighter buffers near close.
     """
+    # Index trading paused — return empty list to disable scanning.
+    return []
+
     edges = []
     now_utc = datetime.now(timezone.utc)
     now_et = _get_eastern_now()
@@ -4615,6 +4621,9 @@ def find_resolved_index_markets(kalshi_api, buffer_override: float = None) -> Li
     buffer_override: if set, use this fixed buffer % instead of time-based.
                      Used by the index sniper for tighter buffers near close.
     """
+    # Index trading paused — return empty list to disable scanning.
+    return []
+
     edges = []
     now_utc = datetime.now(timezone.utc)
     now_et = _get_eastern_now()
