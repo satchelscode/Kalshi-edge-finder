@@ -3023,8 +3023,17 @@ def find_basketball_analytically_final(kalshi_api) -> List[Dict]:
 
                 # Calculate total seconds remaining in game
                 seconds_in_period = clock_minutes * 60 + clock_seconds
-                periods_remaining = config['quarters'] - period
-                seconds_remaining = seconds_in_period + (periods_remaining * config['period_minutes'] * 60)
+
+                # CRITICAL: Handle overtime correctly
+                # In OT, period > quarters, so periods_remaining would be negative
+                # OT periods are 5 minutes for ALL basketball leagues (NBA, NCAAB, FIBA)
+                # In OT we only know the current period's remaining time
+                if period > config['quarters']:
+                    # Overtime — only the current period clock matters
+                    seconds_remaining = seconds_in_period
+                else:
+                    periods_remaining = config['quarters'] - period
+                    seconds_remaining = seconds_in_period + (periods_remaining * config['period_minutes'] * 60)
 
                 # Extract game date for ticker matching
                 game_date_str = ''
