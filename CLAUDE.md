@@ -83,6 +83,12 @@ The system now ONLY scans for these three types of guaranteed money:
 **Rule:** Check for range structure (`cap_strike != floor_strike`), never default unknown to "above"
 **Status:** Fixed in commit 8c1d350
 
+### 6. Overtime Causes False Analytically Final (COST REAL MONEY)
+**Bug:** During overtime, `period > quarters` makes `periods_remaining` negative, which makes `seconds_remaining` negative. Negative time is ALWAYS less than `safe_seconds`, so EVERY overtime game was flagged "analytically final" regardless of lead or time.
+**Example:** 6-point lead in OT with 2 min left → seconds_remaining = -635 → triggered as "safe" → bought 1922 contracts at $0.80
+**Rule:** ALWAYS check `if period > config['quarters']` and handle OT separately — use only current period clock
+**Status:** Fixed in commit 6eb3c9f
+
 ---
 
 ## Important Conventions
