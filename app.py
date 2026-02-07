@@ -5087,9 +5087,9 @@ def _completed_props_sniper_loop():
             nhl_tied = find_nhl_tied_game_totals(kalshi)
             all_guaranteed.extend(nhl_tied)
 
-            # 3. Basketball analytically final (Haslametrics formula)
-            bball_final = find_basketball_analytically_final(kalshi)
-            all_guaranteed.extend(bball_final)
+            # 3. Basketball analytically final — DISABLED (not working reliably)
+            # bball_final = find_basketball_analytically_final(kalshi)
+            # all_guaranteed.extend(bball_final)
 
             if all_guaranteed:
                 with _scan_lock:
@@ -5263,13 +5263,13 @@ def scan_all_sports(kalshi_api, fanduel_api):
     all_edges.extend(nhl_tied)
     print(f"   NHL tied totals: {len(nhl_tied)} opportunities")
 
-    # 7c. Basketball analytically final — Haslametrics formula
-    print(f"\n--- Basketball Analytically Final (Haslametrics) ---")
-    bball_final = find_basketball_analytically_final(kalshi_api)
-    all_edges.extend(bball_final)
-    print(f"   Basketball final: {len(bball_final)} opportunities")
+    # 7c. Basketball analytically final — DISABLED (not working reliably)
+    # print(f"\n--- Basketball Analytically Final (Haslametrics) ---")
+    # bball_final = find_basketball_analytically_final(kalshi_api)
+    # all_edges.extend(bball_final)
+    # print(f"   Basketball final: {len(bball_final)} opportunities")
 
-    if completed or nhl_tied or bball_final:
+    if completed or nhl_tied:
         sports_with_games.append('Live Props')
 
     # 8. Resolved markets — game results, crypto prices, economic data
