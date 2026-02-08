@@ -2322,8 +2322,8 @@ PROP_STAT_MAP = {
     'KXNBAREB':   {'sport': 'nba', 'stat_name': 'rebounds',  'group': 'skater', 'display': 'NBA'},
     'KXNBAAST':   {'sport': 'nba', 'stat_name': 'assists',   'group': 'skater', 'display': 'NBA'},
     'KXNBA3PT':   {'sport': 'nba', 'stat_name': 'threes',    'group': 'skater', 'display': 'NBA'},
-    'KXNBASTL':   {'sport': 'nba', 'stat_name': 'steals',    'group': 'skater', 'display': 'NBA'},
-    'KXNBABLK':   {'sport': 'nba', 'stat_name': 'blocks',    'group': 'skater', 'display': 'NBA'},
+    # 'KXNBASTL':   {'sport': 'nba', 'stat_name': 'steals',    'group': 'skater', 'display': 'NBA'},  # DISABLED — paused
+    # 'KXNBABLK':   {'sport': 'nba', 'stat_name': 'blocks',    'group': 'skater', 'display': 'NBA'},  # DISABLED — paused
     'KXNBADD':    {'sport': 'nba', 'stat_name': 'double_double', 'group': 'skater', 'display': 'NBA'},
     'KXNBATD':    {'sport': 'nba', 'stat_name': 'triple_double', 'group': 'skater', 'display': 'NBA'},
     # NHL
