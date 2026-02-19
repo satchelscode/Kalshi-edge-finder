@@ -158,21 +158,11 @@ MAX_RISK = 250.00     # Max total cost per FD arb order
 MIN_EDGE_PERCENT = 2.0  # Only notify/display edges >= 2% over fair value
 
 # Multi-book fair value configuration
-# Books to pull from The Odds API — mix of sharp + major US retail
-FAIR_VALUE_BOOKS = [
-    'pinnacle',        # Sharpest book — gold standard
-    'fanduel',
-    'draftkings',
-    'betmgm',
-    'caesars',
-    'betrivers',
-    'espnbet',
-    'bet365',
-    'bovada',
-    'mybookieag',
-]
-# Minimum number of books required to compute a fair line (need consensus)
-MIN_BOOKS_FOR_FAIR = 3
+# Pre-game: FanDuel + Pinnacle combined devig (require both)
+# Live: Pinnacle only devig (sharpest book with live odds)
+PREGAME_BOOKS = ['fanduel', 'pinnacle']
+LIVE_BOOK = 'pinnacle'
+FAIR_VALUE_BOOKS = list(set(PREGAME_BOOKS + [LIVE_BOOK]))  # Combined for API fetch
 
 # Crypto & Index: higher conviction (near-expiry / known outcomes), size more aggressively
 CRYPTO_TARGET_PROFIT = 15.00   # Target $15 profit per crypto trade
@@ -438,16 +428,36 @@ def send_telegram_notification(edge: Dict):
     try:
         market_type = edge.get('market_type', 'Moneyline')
         sport = edge.get('sport', '')
-        live_tag = " 🔴 LIVE" if edge.get('is_live') else ""
+        live_tag = " LIVE" if edge.get('is_live') else " PRE-GAME"
+        mode = edge.get('fair_value_mode', 'pregame/fd+pin')
+        ticker = edge.get('kalshi_ticker', '')
+        side = edge.get('kalshi_side', 'yes').upper()
+        price = edge.get('kalshi_price', 0)
+
+        # Per-book devigged lines
+        per_book = edge.get('per_book_detail', {})
+        book_lines = ""
+        if per_book:
+            for book, prob in sorted(per_book.items()):
+                book_lines += f"\n  {book}: {prob*100:.1f}%"
+        else:
+            book_lines = f"\n  Consensus: {edge['fanduel_opposite_prob']:.1f}%"
+
+        # What the trade would be
+        kalshi_method = edge.get('kalshi_method', '')
+
         message = f"""+EV OPPORTUNITY ({sport} - {market_type}{live_tag})
 
 {edge['game']}
-{edge['recommendation']}
 
+Devigged Fair Lines ({mode}):
+  Consensus fair (opposite): {edge['fanduel_opposite_prob']:.1f}%{book_lines}
+
+Kalshi: {kalshi_method} @ ${price:.2f}
+Kalshi after fees: {edge['kalshi_prob_after_fees']:.1f}%
 Edge: {edge['arbitrage_profit']:.2f}%
-Total implied prob: {edge['total_implied_prob']:.2f}%
-Kalshi after fees: {edge['kalshi_prob_after_fees']:.2f}%
-Fair value (multi-book): {edge['fanduel_opposite_prob']:.2f}%
+
+Would bet: {side} {ticker} @ {int(price*100)}c
 
 https://kalshi-edge-finder.onrender.com"""
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -700,15 +710,13 @@ class FanDuelAPI:
             return []
 
     def get_moneyline(self, sport_key: str) -> Dict:
-        """Get h2h moneyline fair probabilities from multi-book consensus.
-        Returns odds_dict with 'odds' set to synthetic decimal odds derived from fair prob,
-        plus 'fair_prob' and 'num_books' fields."""
+        """Get h2h moneyline fair probabilities.
+        Pre-game: FanDuel + Pinnacle combined devig.
+        Live: Pinnacle only devig."""
         data = self._fetch(sport_key, 'h2h')
         games_dict = {}
-        # Collect per-game book snapshots: {game_id: [{outcome_name: price, ...}, ...]}
-        # Each entry in the list is one book's complete pricing for this game
+        # {game_id: [{'book': key, 'outcomes': {name: price}, 'last_update': str}]}
         game_book_snapshots = {}
-        latest_update = {}  # {game_id: latest_update_str}
 
         for game in data:
             game_id = game.get('id', '')
@@ -719,43 +727,72 @@ class FanDuelAPI:
             if game_id not in game_book_snapshots:
                 game_book_snapshots[game_id] = []
             for bm in game.get('bookmakers', []):
+                book_key = bm['key']
                 bm_last_update = bm.get('last_update', '')
                 for mkt in bm.get('markets', []):
                     if mkt['key'] == 'h2h':
                         mkt_last_update = mkt.get('last_update', '') or bm_last_update
-                        if game_id not in latest_update or mkt_last_update > latest_update.get(game_id, ''):
-                            latest_update[game_id] = mkt_last_update
                         book_outcomes = {}
                         for o in mkt.get('outcomes', []):
                             book_outcomes[o['name']] = o['price']
                         if len(book_outcomes) >= 2:
-                            game_book_snapshots[game_id].append(book_outcomes)
+                            game_book_snapshots[game_id].append({
+                                'book': book_key,
+                                'outcomes': book_outcomes,
+                                'last_update': mkt_last_update,
+                            })
 
-        # Compute consensus fair probs per game
         odds_dict = {}
-        total_books_used = 0
-        for game_id, book_snaps in game_book_snapshots.items():
-            if len(book_snaps) < MIN_BOOKS_FOR_FAIR:
-                continue
-            # Get all outcome names from the first complete snapshot
-            outcome_names = list(book_snaps[0].keys())
+        pregame_count = 0
+        live_count = 0
+        for game_id, all_snaps in game_book_snapshots.items():
+            commence = games_dict.get(game_id, {}).get('commence_time', '')
+            game_live = is_game_live(commence)
+
+            if game_live:
+                # Live: use Pinnacle only
+                pin_snaps = [s for s in all_snaps if s['book'] == LIVE_BOOK]
+                if not pin_snaps:
+                    continue
+                # Check Pinnacle freshness — skip if odds older than 15 min
+                pin_update = pin_snaps[0]['last_update']
+                if are_odds_stale(commence, pin_update):
+                    continue
+                snaps_to_use = pin_snaps
+                label = 'live/pinnacle'
+            else:
+                # Pre-game: require both FanDuel AND Pinnacle
+                pregame_snaps = [s for s in all_snaps if s['book'] in PREGAME_BOOKS]
+                books_present = {s['book'] for s in pregame_snaps}
+                if not all(b in books_present for b in PREGAME_BOOKS):
+                    continue
+                snaps_to_use = pregame_snaps
+                label = 'pregame/fd+pin'
+
+            outcome_names = list(snaps_to_use[0]['outcomes'].keys())
             if len(outcome_names) < 2:
                 continue
-            # Devig each book and collect fair probs per outcome
+
             fair_probs_per_outcome = {name: [] for name in outcome_names}
-            for snap in book_snaps:
-                if not all(name in snap for name in outcome_names):
+            # Track per-book devigged probs for telegram detail
+            per_book_fair = {name: {} for name in outcome_names}  # {outcome: {book_key: fair_prob}}
+            for snap in snaps_to_use:
+                outcomes = snap['outcomes']
+                if not all(name in outcomes for name in outcome_names):
                     continue
-                implied = {name: 1.0 / snap[name] for name in outcome_names}
+                implied = {name: 1.0 / outcomes[name] for name in outcome_names}
                 total_implied = sum(implied.values())
                 if total_implied <= 0:
                     continue
                 for name in outcome_names:
-                    fair_probs_per_outcome[name].append(implied[name] / total_implied)
+                    devigged = implied[name] / total_implied
+                    fair_probs_per_outcome[name].append(devigged)
+                    per_book_fair[name][snap['book']] = devigged
 
-            min_count = min(len(v) for v in fair_probs_per_outcome.values())
-            if min_count < MIN_BOOKS_FOR_FAIR:
+            if not all(len(v) > 0 for v in fair_probs_per_outcome.values()):
                 continue
+
+            best_update = max(s['last_update'] for s in snaps_to_use)
 
             all_valid = True
             game_odds = {}
@@ -765,30 +802,32 @@ class FanDuelAPI:
                 if fair_p <= 0.001:
                     all_valid = False
                     break
-                total_books_used = max(total_books_used, n_books)
                 game_odds[name] = {
                     'odds': 1.0 / fair_p,
                     'fair_prob': fair_p,
                     'num_books': n_books,
                     'game_id': game_id,
-                    'last_update': latest_update.get(game_id, ''),
+                    'last_update': best_update,
+                    'mode': label,
+                    'per_book': per_book_fair[name],  # {book_key: devigged_prob}
                 }
             if all_valid:
                 odds_dict.update(game_odds)
+                if game_live:
+                    live_count += 1
+                else:
+                    pregame_count += 1
 
-        print(f"   Fair value {sport_key} moneyline: {len(odds_dict)} outcomes in {len(games_dict)} games (up to {total_books_used} books)")
+        print(f"   Fair value {sport_key} moneyline: {len(odds_dict)} outcomes ({pregame_count} pregame, {live_count} live)")
         return {'odds': odds_dict, 'games': games_dict}
 
     def get_spreads(self, sport_key: str) -> Dict:
-        """Get spread lines with multi-book consensus fair probabilities.
-        Returns {game_id: {team_name: {point, odds (synthetic fair), fair_prob, num_books}}}."""
+        """Get spread lines with fair probabilities.
+        Pre-game: FanDuel + Pinnacle combined. Live: Pinnacle only."""
         data = self._fetch(sport_key, 'spreads')
         spreads = {}
         games_dict = {}
-        # Collect per-game spread odds from all books
-        # Structure: {game_id: {spread_point: [{team: {point, odds}}]}}  (list of book snapshots)
-        game_book_spreads = {}
-        latest_update = {}
+        game_book_spreads = {}  # {game_id: [{'book': key, 'outcomes': {...}, 'last_update': str}]}
 
         for game in data:
             game_id = game.get('id', '')
@@ -799,48 +838,65 @@ class FanDuelAPI:
             if game_id not in game_book_spreads:
                 game_book_spreads[game_id] = []
             for bm in game.get('bookmakers', []):
+                book_key = bm['key']
                 bm_last_update = bm.get('last_update', '')
                 for mkt in bm.get('markets', []):
                     if mkt['key'] == 'spreads':
                         mkt_last_update = mkt.get('last_update', '') or bm_last_update
-                        if game_id not in latest_update or mkt_last_update > latest_update.get(game_id, ''):
-                            latest_update[game_id] = mkt_last_update
                         book_snap = {}
                         for o in mkt.get('outcomes', []):
                             book_snap[o['name']] = {'point': o.get('point', 0), 'odds': o['price']}
                         if len(book_snap) >= 2:
-                            game_book_spreads[game_id].append(book_snap)
+                            game_book_spreads[game_id].append({
+                                'book': book_key,
+                                'outcomes': book_snap,
+                                'last_update': mkt_last_update,
+                            })
 
-        # Compute consensus fair probs for each game's spread
-        for game_id, book_snaps in game_book_spreads.items():
-            if len(book_snaps) < MIN_BOOKS_FOR_FAIR:
-                continue
-            # Use the most common spread line across books
+        for game_id, all_snaps in game_book_spreads.items():
+            commence = games_dict.get(game_id, {}).get('commence_time', '')
+            game_live = is_game_live(commence)
+
+            if game_live:
+                pin_snaps = [s for s in all_snaps if s['book'] == LIVE_BOOK]
+                if not pin_snaps:
+                    continue
+                if are_odds_stale(commence, pin_snaps[0]['last_update']):
+                    continue
+                snaps_to_use = pin_snaps
+            else:
+                pregame_snaps = [s for s in all_snaps if s['book'] in PREGAME_BOOKS]
+                books_present = {s['book'] for s in pregame_snaps}
+                if not all(b in books_present for b in PREGAME_BOOKS):
+                    continue
+                snaps_to_use = pregame_snaps
+
             team_names = set()
-            for snap in book_snaps:
-                team_names.update(snap.keys())
+            for s in snaps_to_use:
+                team_names.update(s['outcomes'].keys())
             if len(team_names) < 2:
                 continue
             team_list = sorted(team_names)
-            # Collect fair probs per team
+
             fair_probs = {t: [] for t in team_list}
             spread_points = {t: [] for t in team_list}
-            for snap in book_snaps:
-                if not all(t in snap for t in team_list):
+            for snap in snaps_to_use:
+                outcomes = snap['outcomes']
+                if not all(t in outcomes for t in team_list):
                     continue
-                implied = {t: 1.0 / snap[t]['odds'] for t in team_list}
+                implied = {t: 1.0 / outcomes[t]['odds'] for t in team_list}
                 total = sum(implied.values())
                 if total <= 0:
                     continue
                 for t in team_list:
                     fair_probs[t].append(implied[t] / total)
-                    spread_points[t].append(snap[t]['point'])
+                    spread_points[t].append(outcomes[t]['point'])
 
-            min_count = min(len(v) for v in fair_probs.values())
-            if min_count < MIN_BOOKS_FOR_FAIR:
+            if not all(len(v) > 0 for v in fair_probs.values()):
                 continue
 
-            game_spreads = {'_last_update': latest_update.get(game_id, '')}
+            best_update = max(s['last_update'] for s in snaps_to_use)
+            game_spreads = {'_last_update': best_update}
             skip_game = False
             for t in team_list:
                 fair_p = consensus_fair_prob(fair_probs[t])
@@ -862,14 +918,12 @@ class FanDuelAPI:
         return {'spreads': spreads, 'games': games_dict}
 
     def get_totals(self, sport_key: str) -> Dict:
-        """Get over/under lines with multi-book consensus fair probabilities.
-        Returns {game_id: {point, over_odds (synthetic fair), under_odds (synthetic fair),
-        over_fair_prob, under_fair_prob, num_books}}."""
+        """Get over/under lines with fair probabilities.
+        Pre-game: FanDuel + Pinnacle combined. Live: Pinnacle only."""
         data = self._fetch(sport_key, 'totals')
         totals = {}
         games_dict = {}
-        game_book_totals = {}  # {game_id: [{'point': X, 'over_odds': Y, 'under_odds': Z}]}
-        latest_update = {}
+        game_book_totals = {}  # {game_id: [{'book': key, 'data': {...}, 'last_update': str}]}
 
         for game in data:
             game_id = game.get('id', '')
@@ -880,12 +934,11 @@ class FanDuelAPI:
             if game_id not in game_book_totals:
                 game_book_totals[game_id] = []
             for bm in game.get('bookmakers', []):
+                book_key = bm['key']
                 bm_last_update = bm.get('last_update', '')
                 for mkt in bm.get('markets', []):
                     if mkt['key'] == 'totals':
                         mkt_last_update = mkt.get('last_update', '') or bm_last_update
-                        if game_id not in latest_update or mkt_last_update > latest_update.get(game_id, ''):
-                            latest_update[game_id] = mkt_last_update
                         book_total = {}
                         for o in mkt.get('outcomes', []):
                             if o['name'] == 'Over':
@@ -894,31 +947,53 @@ class FanDuelAPI:
                             elif o['name'] == 'Under':
                                 book_total['under_odds'] = o['price']
                         if 'over_odds' in book_total and 'under_odds' in book_total:
-                            game_book_totals[game_id].append(book_total)
+                            game_book_totals[game_id].append({
+                                'book': book_key,
+                                'data': book_total,
+                                'last_update': mkt_last_update,
+                            })
 
-        for game_id, book_snaps in game_book_totals.items():
-            if len(book_snaps) < MIN_BOOKS_FOR_FAIR:
-                continue
-            # Use most common total line
-            points = [s['point'] for s in book_snaps]
+        for game_id, all_snaps in game_book_totals.items():
+            commence = games_dict.get(game_id, {}).get('commence_time', '')
+            game_live = is_game_live(commence)
+
+            if game_live:
+                pin_snaps = [s for s in all_snaps if s['book'] == LIVE_BOOK]
+                if not pin_snaps:
+                    continue
+                if are_odds_stale(commence, pin_snaps[0]['last_update']):
+                    continue
+                snaps_to_use = pin_snaps
+            else:
+                pregame_snaps = [s for s in all_snaps if s['book'] in PREGAME_BOOKS]
+                books_present = {s['book'] for s in pregame_snaps}
+                if not all(b in books_present for b in PREGAME_BOOKS):
+                    continue
+                snaps_to_use = pregame_snaps
+
+            # Use most common total line among selected books
+            points = [s['data']['point'] for s in snaps_to_use]
             most_common_point = max(set(points), key=points.count)
-            # Filter to books with the same line for clean devig
-            matching = [s for s in book_snaps if abs(s['point'] - most_common_point) < 0.01]
-            if len(matching) < MIN_BOOKS_FOR_FAIR:
-                # Fall back to all books even with different lines
-                matching = book_snaps
+            matching = [s for s in snaps_to_use if abs(s['data']['point'] - most_common_point) < 0.01]
+            if not matching:
+                matching = snaps_to_use
+
             over_fair_list = []
             under_fair_list = []
             for snap in matching:
-                over_imp = 1.0 / snap['over_odds']
-                under_imp = 1.0 / snap['under_odds']
+                d = snap['data']
+                over_imp = 1.0 / d['over_odds']
+                under_imp = 1.0 / d['under_odds']
                 fair_over, fair_under = devig_two_way(over_imp, under_imp)
                 over_fair_list.append(fair_over)
                 under_fair_list.append(fair_under)
+
             over_fair = consensus_fair_prob(over_fair_list)
             under_fair = consensus_fair_prob(under_fair_list)
             if over_fair <= 0.001 or under_fair <= 0.001:
                 continue
+
+            best_update = max(s['last_update'] for s in snaps_to_use)
             totals[game_id] = {
                 'point': most_common_point,
                 'over_odds': 1.0 / over_fair,
@@ -926,7 +1001,7 @@ class FanDuelAPI:
                 'over_fair_prob': over_fair,
                 'under_fair_prob': under_fair,
                 'num_books': len(matching),
-                '_last_update': latest_update.get(game_id, ''),
+                '_last_update': best_update,
             }
 
         print(f"   Fair value {sport_key} totals: {len(totals)} games")
@@ -953,8 +1028,8 @@ class FanDuelAPI:
             return []
 
     def get_btts(self, sport_key: str) -> Dict:
-        """Get BTTS (Both Teams To Score) with multi-book consensus fair probabilities.
-        Returns {game_id: {yes_odds (synthetic fair), no_odds (synthetic fair), num_books}}."""
+        """Get BTTS with fair probabilities.
+        Pre-game: FanDuel + Pinnacle combined. Live: Pinnacle only."""
         btts = {}
         games_dict = {}
 
@@ -964,14 +1039,15 @@ class FanDuelAPI:
             return {'btts': btts, 'games': games_dict}
 
         bookmakers_str = ','.join(FAIR_VALUE_BOOKS)
-        print(f"   OddsAPI {sport_key}: {len(events)} events, fetching btts from multiple books...")
+        print(f"   OddsAPI {sport_key}: {len(events)} events, fetching btts...")
 
         for event in events:
             event_id = event.get('id', '')
             home = event.get('home_team', '')
             away = event.get('away_team', '')
+            commence = event.get('commence_time', '')
             if home and away:
-                games_dict[event_id] = {'home': home, 'away': away, 'commence_time': event.get('commence_time', '')}
+                games_dict[event_id] = {'home': home, 'away': away, 'commence_time': commence}
 
             try:
                 url = f"{self.base_url}/sports/{sport_key}/events/{event_id}/odds"
@@ -986,15 +1062,13 @@ class FanDuelAPI:
                 response.raise_for_status()
                 data = response.json()
 
-                book_snaps = []
-                latest_update = ''
+                all_snaps = []
                 for bm in data.get('bookmakers', []):
+                    book_key = bm['key']
                     bm_last_update = bm.get('last_update', '')
                     for mkt in bm.get('markets', []):
                         if mkt['key'] == 'btts':
                             mkt_last_update = mkt.get('last_update', '') or bm_last_update
-                            if mkt_last_update > latest_update:
-                                latest_update = mkt_last_update
                             snap = {}
                             for o in mkt.get('outcomes', []):
                                 if o['name'] == 'Yes':
@@ -1002,27 +1076,45 @@ class FanDuelAPI:
                                 elif o['name'] == 'No':
                                     snap['no_odds'] = o['price']
                             if 'yes_odds' in snap and 'no_odds' in snap:
-                                book_snaps.append(snap)
+                                all_snaps.append({'book': book_key, 'data': snap, 'last_update': mkt_last_update})
 
-                if len(book_snaps) >= MIN_BOOKS_FOR_FAIR:
-                    yes_fair_list = []
-                    no_fair_list = []
-                    for snap in book_snaps:
-                        yes_imp = 1.0 / snap['yes_odds']
-                        no_imp = 1.0 / snap['no_odds']
-                        fair_yes, fair_no = devig_two_way(yes_imp, no_imp)
-                        yes_fair_list.append(fair_yes)
-                        no_fair_list.append(fair_no)
-                    yes_fair = consensus_fair_prob(yes_fair_list)
-                    no_fair = consensus_fair_prob(no_fair_list)
-                    if yes_fair <= 0.001 or no_fair <= 0.001:
+                game_live = is_game_live(commence)
+                if game_live:
+                    pin_snaps = [s for s in all_snaps if s['book'] == LIVE_BOOK]
+                    if not pin_snaps:
                         continue
-                    btts[event_id] = {
-                        'yes_odds': 1.0 / yes_fair,
-                        'no_odds': 1.0 / no_fair,
-                        'num_books': len(book_snaps),
-                        '_last_update': latest_update,
-                    }
+                    if are_odds_stale(commence, pin_snaps[0]['last_update']):
+                        continue
+                    snaps_to_use = pin_snaps
+                else:
+                    pregame_snaps = [s for s in all_snaps if s['book'] in PREGAME_BOOKS]
+                    books_present = {s['book'] for s in pregame_snaps}
+                    if not all(b in books_present for b in PREGAME_BOOKS):
+                        continue
+                    snaps_to_use = pregame_snaps
+
+                yes_fair_list = []
+                no_fair_list = []
+                for snap in snaps_to_use:
+                    d = snap['data']
+                    yes_imp = 1.0 / d['yes_odds']
+                    no_imp = 1.0 / d['no_odds']
+                    fair_yes, fair_no = devig_two_way(yes_imp, no_imp)
+                    yes_fair_list.append(fair_yes)
+                    no_fair_list.append(fair_no)
+
+                yes_fair = consensus_fair_prob(yes_fair_list)
+                no_fair = consensus_fair_prob(no_fair_list)
+                if yes_fair <= 0.001 or no_fair <= 0.001:
+                    continue
+
+                best_update = max(s['last_update'] for s in snaps_to_use)
+                btts[event_id] = {
+                    'yes_odds': 1.0 / yes_fair,
+                    'no_odds': 1.0 / no_fair,
+                    'num_books': len(snaps_to_use),
+                    '_last_update': best_update,
+                }
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else 'unknown'
                 print(f"   OddsAPI {sport_key} event {event_id} btts: HTTP {status}")
@@ -1035,8 +1127,8 @@ class FanDuelAPI:
         return {'btts': btts, 'games': games_dict}
 
     def get_player_props(self, sport_key: str, market_key: str) -> Dict:
-        """Get player prop lines with multi-book consensus fair probabilities.
-        Returns {game_id: [{player, point, over_odds (fair), under_odds (fair), num_books}]}."""
+        """Get player prop lines with fair probabilities.
+        Pre-game: FanDuel + Pinnacle combined. Live: Pinnacle only."""
         props = {}
         games_dict = {}
 
@@ -1046,14 +1138,15 @@ class FanDuelAPI:
             return {'props': props, 'games': games_dict}
 
         bookmakers_str = ','.join(FAIR_VALUE_BOOKS)
-        print(f"   OddsAPI {sport_key}: {len(events)} events today, fetching {market_key} props from multiple books...")
+        print(f"   OddsAPI {sport_key}: {len(events)} events today, fetching {market_key} props...")
 
         for event in events:
             event_id = event.get('id', '')
             home = event.get('home_team', '')
             away = event.get('away_team', '')
+            commence = event.get('commence_time', '')
             if home and away:
-                games_dict[event_id] = {'home': home, 'away': away, 'commence_time': event.get('commence_time', '')}
+                games_dict[event_id] = {'home': home, 'away': away, 'commence_time': commence}
 
             try:
                 url = f"{self.base_url}/sports/{sport_key}/events/{event_id}/odds"
@@ -1068,17 +1161,19 @@ class FanDuelAPI:
                 response.raise_for_status()
                 data = response.json()
 
+                game_live = is_game_live(commence)
+
                 latest_update = ''
-                # Collect all books' props: {(player, point): [{over_odds, under_odds}]}
+                # Collect props per book: {(player, point): [{'book': key, 'data': {over/under_odds}, 'last_update': str}]}
                 all_book_props = {}
                 for bm in data.get('bookmakers', []):
+                    book_key = bm['key']
                     bm_last_update = bm.get('last_update', '')
                     for mkt in bm.get('markets', []):
                         if mkt['key'] == market_key:
                             mkt_last_update = mkt.get('last_update', '') or bm_last_update
                             if mkt_last_update > latest_update:
                                 latest_update = mkt_last_update
-                            # Pair Over/Under for this book
                             paired = {}
                             for o in mkt.get('outcomes', []):
                                 player = o.get('description', '')
@@ -1094,21 +1189,48 @@ class FanDuelAPI:
                                 if 'over_odds' in val and 'under_odds' in val:
                                     if key not in all_book_props:
                                         all_book_props[key] = []
-                                    all_book_props[key].append(val)
+                                    all_book_props[key].append({
+                                        'book': book_key,
+                                        'data': val,
+                                        'last_update': mkt_last_update,
+                                    })
 
                 if event_id in games_dict:
                     games_dict[event_id]['_last_update'] = latest_update
 
-                # Compute consensus fair probs for each player+point
-                game_props = []
-                for (player, point), book_snaps in all_book_props.items():
-                    if len(book_snaps) < MIN_BOOKS_FOR_FAIR:
+                # For live games, check Pinnacle staleness once
+                if game_live:
+                    # Find any Pinnacle snapshot to check freshness
+                    any_pin = None
+                    for snaps in all_book_props.values():
+                        for s in snaps:
+                            if s['book'] == LIVE_BOOK:
+                                any_pin = s
+                                break
+                        if any_pin:
+                            break
+                    if not any_pin or are_odds_stale(commence, any_pin['last_update']):
                         continue
+
+                game_props = []
+                for (player, point), all_snaps in all_book_props.items():
+                    if game_live:
+                        snaps_to_use = [s for s in all_snaps if s['book'] == LIVE_BOOK]
+                    else:
+                        snaps_to_use = [s for s in all_snaps if s['book'] in PREGAME_BOOKS]
+                        books_present = {s['book'] for s in snaps_to_use}
+                        if not all(b in books_present for b in PREGAME_BOOKS):
+                            continue
+
+                    if not snaps_to_use:
+                        continue
+
                     over_fair_list = []
                     under_fair_list = []
-                    for snap in book_snaps:
-                        over_imp = 1.0 / snap['over_odds']
-                        under_imp = 1.0 / snap['under_odds']
+                    for snap in snaps_to_use:
+                        d = snap['data']
+                        over_imp = 1.0 / d['over_odds']
+                        under_imp = 1.0 / d['under_odds']
                         fair_over, fair_under = devig_two_way(over_imp, under_imp)
                         over_fair_list.append(fair_over)
                         under_fair_list.append(fair_under)
@@ -1123,7 +1245,7 @@ class FanDuelAPI:
                         'under_odds': 1.0 / under_fair,
                         'over_fair_prob': over_fair,
                         'under_fair_prob': under_fair,
-                        'num_books': len(book_snaps),
+                        'num_books': len(snaps_to_use),
                     })
                 if game_props:
                     props[event_id] = game_props
@@ -1447,11 +1569,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         commence_str = fanduel_games.get(matched_gid, {}).get('commence_time', '')
         game_live = is_game_live(commence_str)
 
-        # Check if FD odds are stale (pre-game odds frozen during live play)
-        fd_last_update = fanduel_odds.get(fd_t1, {}).get('last_update', '') or fanduel_odds.get(fd_t2, {}).get('last_update', '')
-        if are_odds_stale(commence_str, fd_last_update):
-            print(f"   Skipping {t1_name} vs {t2_name}: FD odds stale (last update: {fd_last_update})")
-            continue
+        # Staleness already handled in get_moneyline (pre-game=FD+Pinnacle, live=Pinnacle)
 
         # Fetch orderbooks for team markets
         ob1 = kalshi_api.get_orderbook(team_markets[team_abbrevs_list[0]]['ticker'])
@@ -1600,6 +1718,8 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                         'total_implied_prob': total * 100,
                         'arbitrage_profit': profit,
                         'is_live': game_live,
+                        'fair_value_mode': fanduel_odds.get(fd_opp, {}).get('mode', ''),
+                        'per_book_detail': fanduel_odds.get(fd_opp, {}).get('per_book', {}),
                         'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (Fair value: {fd_opp} at {fanduel_odds[fd_opp]['odds']:.2f})",
                     }
                     game_edges.append(edge)
@@ -1695,9 +1815,7 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
         fd_game_spreads = fd_spreads[matched_game_id]
         commence_str = fd_games.get(matched_game_id, {}).get('commence_time', '')
         game_live = is_game_live(commence_str)
-        if are_odds_stale(commence_str, fd_game_spreads.get('_last_update', '')):
-            print(f"   Skipping spread {t1_name} vs {t2_name}: FD odds stale")
-            continue
+        # Staleness already handled in get_spreads
         print(f"   Spread match: {t1_name} vs {t2_name} -> {fd_t1} vs {fd_t2}{' [LIVE]' if game_live else ''}")
 
         # Step 3: For each market in this game, compare to FanDuel spread
@@ -1873,11 +1991,9 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
         game_name = f"{fd_games[matched_game_id]['away']} at {fd_games[matched_game_id]['home']}"
         commence_str = fd_games.get(matched_game_id, {}).get('commence_time', '')
         game_live = is_game_live(commence_str)
-        if are_odds_stale(commence_str, fd_total.get('_last_update', '')):
-            print(f"   Skipping total {game_name}: FD odds stale")
-            continue
+        # Staleness already handled in get_totals
 
-        # Step 3: For each total market in this game, compare to FanDuel
+        # Step 3: For each total market in this game, compare to fair value
         for mk in group['markets']:
             floor_strike = mk['floor_strike']
             ticker = mk['ticker']
@@ -2105,9 +2221,7 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
             game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
             commence_str = game_info.get('commence_time', '')
             game_live = is_game_live(commence_str)
-            if are_odds_stale(commence_str, game_info.get('_last_update', '')):
-                print(f"   Skipping prop {player_name}: FD odds stale")
-                continue
+            # Staleness already handled in get_player_props
 
             edge = {
                 'market_type': 'Player Prop',
@@ -2207,9 +2321,7 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
         game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
         commence_str = game_info.get('commence_time', '')
         game_live = is_game_live(commence_str)
-        if are_odds_stale(commence_str, fd_game_btts.get('_last_update', '')):
-            print(f"   Skipping BTTS {game_name}: FD odds stale")
-            continue
+        # Staleness already handled in get_btts
 
         fd_yes_prob = converter.decimal_to_implied_prob(fd_game_btts['yes_odds'])
         fd_no_prob = converter.decimal_to_implied_prob(fd_game_btts['no_odds'])
@@ -2423,10 +2535,7 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
         game_id = fd_p1_odds.get('game_id', '')
         commence_str = all_fd_games.get(game_id, {}).get('commence_time', '')
         game_live = is_game_live(commence_str)
-        fd_last_update = fd_p1_odds.get('last_update', '') or fd_p2_odds.get('last_update', '')
-        if are_odds_stale(commence_str, fd_last_update):
-            print(f"   Skipping {p1['name']} vs {p2['name']}: FD odds stale")
-            continue
+        # Staleness already handled in get_moneyline
 
         game_name = f"{p1['name']} vs {p2['name']}"
 
