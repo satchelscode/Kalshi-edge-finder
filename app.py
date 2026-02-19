@@ -434,27 +434,30 @@ def send_telegram_notification(edge: Dict):
         side = edge.get('kalshi_side', 'yes').upper()
         price = edge.get('kalshi_price', 0)
 
-        # Per-book devigged lines
+        # Per-book devigged lines in American odds
         per_book = edge.get('per_book_detail', {})
         book_lines = ""
         if per_book:
             for book, prob in sorted(per_book.items()):
-                book_lines += f"\n  {book}: {prob*100:.1f}%"
+                book_lines += f"\n  {book}: {prob_to_american(prob)}"
         else:
-            book_lines = f"\n  Consensus: {edge['fanduel_opposite_prob']:.1f}%"
+            consensus_prob = edge['fanduel_opposite_prob'] / 100.0
+            book_lines = f"\n  Consensus: {prob_to_american(consensus_prob)}"
 
         # What the trade would be
         kalshi_method = edge.get('kalshi_method', '')
+        consensus_opp_prob = edge['fanduel_opposite_prob'] / 100.0
+        kalshi_fees_prob = edge['kalshi_prob_after_fees'] / 100.0
 
         message = f"""+EV OPPORTUNITY ({sport} - {market_type}{live_tag})
 
 {edge['game']}
 
 Devigged Fair Lines ({mode}):
-  Consensus fair (opposite): {edge['fanduel_opposite_prob']:.1f}%{book_lines}
+  Consensus fair (opposite): {prob_to_american(consensus_opp_prob)}{book_lines}
 
 Kalshi: {kalshi_method} @ ${price:.2f}
-Kalshi after fees: {edge['kalshi_prob_after_fees']:.1f}%
+Kalshi after fees: {prob_to_american(kalshi_fees_prob)}
 Edge: {edge['arbitrage_profit']:.2f}%
 
 Would bet: {side} {ticker} @ {int(price*100)}c
