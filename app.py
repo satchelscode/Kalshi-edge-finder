@@ -705,9 +705,9 @@ class FanDuelAPI:
         plus 'fair_prob' and 'num_books' fields."""
         data = self._fetch(sport_key, 'h2h')
         games_dict = {}
-        # Collect per-game, per-outcome odds from all books
-        # Structure: {game_id: {outcome_name: [decimal_odds_from_each_book]}}
-        game_book_odds = {}
+        # Collect per-game book snapshots: {game_id: [{outcome_name: price, ...}, ...]}
+        # Each entry in the list is one book's complete pricing for this game
+        game_book_snapshots = {}
         latest_update = {}  # {game_id: latest_update_str}
 
         for game in data:
@@ -716,46 +716,34 @@ class FanDuelAPI:
             away = game.get('away_team', '')
             if home and away:
                 games_dict[game_id] = {'home': home, 'away': away, 'commence_time': game.get('commence_time', '')}
-            if game_id not in game_book_odds:
-                game_book_odds[game_id] = {}
+            if game_id not in game_book_snapshots:
+                game_book_snapshots[game_id] = []
             for bm in game.get('bookmakers', []):
                 bm_last_update = bm.get('last_update', '')
                 for mkt in bm.get('markets', []):
                     if mkt['key'] == 'h2h':
                         mkt_last_update = mkt.get('last_update', '') or bm_last_update
-                        # Track latest update across all books for staleness check
                         if game_id not in latest_update or mkt_last_update > latest_update.get(game_id, ''):
                             latest_update[game_id] = mkt_last_update
-                        # Collect this book's odds for devigging
                         book_outcomes = {}
                         for o in mkt.get('outcomes', []):
                             book_outcomes[o['name']] = o['price']
-                        # Only use if we got all outcomes for this book
-                        outcome_names = list(book_outcomes.keys())
-                        if len(outcome_names) >= 2:
-                            for oname in outcome_names:
-                                if oname not in game_book_odds[game_id]:
-                                    game_book_odds[game_id][oname] = []
-                                game_book_odds[game_id][oname].append(book_outcomes)
+                        if len(book_outcomes) >= 2:
+                            game_book_snapshots[game_id].append(book_outcomes)
 
-        # Now compute consensus fair probs per game
+        # Compute consensus fair probs per game
         odds_dict = {}
         total_books_used = 0
-        for game_id, outcome_books in game_book_odds.items():
-            outcome_names = list(outcome_books.keys())
+        for game_id, book_snaps in game_book_snapshots.items():
+            if len(book_snaps) < MIN_BOOKS_FOR_FAIR:
+                continue
+            # Get all outcome names from the first complete snapshot
+            outcome_names = list(book_snaps[0].keys())
             if len(outcome_names) < 2:
                 continue
-            # For each book that priced all outcomes, devig and collect fair probs
-            # outcome_books[name] = list of {all_outcomes} dicts from each book
-            # Restructure: list of complete book snapshots
-            all_book_snapshots = []
-            for snapshots_list in outcome_books.values():
-                for snap in snapshots_list:
-                    if snap not in all_book_snapshots:
-                        all_book_snapshots.append(snap)
-            # Deduplicate and devig each book
+            # Devig each book and collect fair probs per outcome
             fair_probs_per_outcome = {name: [] for name in outcome_names}
-            for snap in all_book_snapshots:
+            for snap in book_snaps:
                 if not all(name in snap for name in outcome_names):
                     continue
                 implied = {name: 1.0 / snap[name] for name in outcome_names}
@@ -765,24 +753,28 @@ class FanDuelAPI:
                 for name in outcome_names:
                     fair_probs_per_outcome[name].append(implied[name] / total_implied)
 
-            # Need enough books for consensus
             min_count = min(len(v) for v in fair_probs_per_outcome.values())
             if min_count < MIN_BOOKS_FOR_FAIR:
                 continue
 
+            all_valid = True
+            game_odds = {}
             for name in outcome_names:
                 fair_p = consensus_fair_prob(fair_probs_per_outcome[name])
                 n_books = len(fair_probs_per_outcome[name])
+                if fair_p <= 0.001:
+                    all_valid = False
+                    break
                 total_books_used = max(total_books_used, n_books)
-                # Store as synthetic decimal odds so existing edge code works,
-                # plus fair_prob for direct use
-                odds_dict[name] = {
-                    'odds': 1.0 / fair_p if fair_p > 0 else 100.0,
+                game_odds[name] = {
+                    'odds': 1.0 / fair_p,
                     'fair_prob': fair_p,
                     'num_books': n_books,
                     'game_id': game_id,
                     'last_update': latest_update.get(game_id, ''),
                 }
+            if all_valid:
+                odds_dict.update(game_odds)
 
         print(f"   Fair value {sport_key} moneyline: {len(odds_dict)} outcomes in {len(games_dict)} games (up to {total_books_used} books)")
         return {'odds': odds_dict, 'games': games_dict}
@@ -849,18 +841,21 @@ class FanDuelAPI:
                 continue
 
             game_spreads = {'_last_update': latest_update.get(game_id, '')}
+            skip_game = False
             for t in team_list:
                 fair_p = consensus_fair_prob(fair_probs[t])
-                # Use median spread point across books
+                if fair_p <= 0.001:
+                    skip_game = True
+                    break
                 pts = sorted(spread_points[t])
                 median_point = pts[len(pts) // 2]
                 game_spreads[t] = {
                     'point': median_point,
-                    'odds': 1.0 / fair_p if fair_p > 0 else 100.0,
+                    'odds': 1.0 / fair_p,
                     'fair_prob': fair_p,
                     'num_books': len(fair_probs[t]),
                 }
-            if len(game_spreads) > 1:
+            if not skip_game and len(game_spreads) > 1:
                 spreads[game_id] = game_spreads
 
         print(f"   Fair value {sport_key} spreads: {len(spreads)} games")
@@ -922,10 +917,12 @@ class FanDuelAPI:
                 under_fair_list.append(fair_under)
             over_fair = consensus_fair_prob(over_fair_list)
             under_fair = consensus_fair_prob(under_fair_list)
+            if over_fair <= 0.001 or under_fair <= 0.001:
+                continue
             totals[game_id] = {
                 'point': most_common_point,
-                'over_odds': 1.0 / over_fair if over_fair > 0 else 100.0,
-                'under_odds': 1.0 / under_fair if under_fair > 0 else 100.0,
+                'over_odds': 1.0 / over_fair,
+                'under_odds': 1.0 / under_fair,
                 'over_fair_prob': over_fair,
                 'under_fair_prob': under_fair,
                 'num_books': len(matching),
@@ -1018,9 +1015,11 @@ class FanDuelAPI:
                         no_fair_list.append(fair_no)
                     yes_fair = consensus_fair_prob(yes_fair_list)
                     no_fair = consensus_fair_prob(no_fair_list)
+                    if yes_fair <= 0.001 or no_fair <= 0.001:
+                        continue
                     btts[event_id] = {
-                        'yes_odds': 1.0 / yes_fair if yes_fair > 0 else 100.0,
-                        'no_odds': 1.0 / no_fair if no_fair > 0 else 100.0,
+                        'yes_odds': 1.0 / yes_fair,
+                        'no_odds': 1.0 / no_fair,
                         'num_books': len(book_snaps),
                         '_last_update': latest_update,
                     }
@@ -1115,11 +1114,13 @@ class FanDuelAPI:
                         under_fair_list.append(fair_under)
                     over_fair = consensus_fair_prob(over_fair_list)
                     under_fair = consensus_fair_prob(under_fair_list)
+                    if over_fair <= 0.001 or under_fair <= 0.001:
+                        continue
                     game_props.append({
                         'player': player,
                         'point': point,
-                        'over_odds': 1.0 / over_fair if over_fair > 0 else 100.0,
-                        'under_odds': 1.0 / under_fair if under_fair > 0 else 100.0,
+                        'over_odds': 1.0 / over_fair,
+                        'under_odds': 1.0 / under_fair,
                         'over_fair_prob': over_fair,
                         'under_fair_prob': under_fair,
                         'num_books': len(book_snaps),
@@ -5539,11 +5540,15 @@ def scan_all_sports(kalshi_api, fanduel_api):
     all_edges.extend(resolved)
     print(f"   Resolved markets: {len(resolved)} opportunities")
 
+    # Filter out edges below minimum threshold before returning
+    before_count = len(all_edges)
+    all_edges = [e for e in all_edges if e.get('arbitrage_profit', 0) >= MIN_EDGE_PERCENT]
+
     print(f"\n{'='*60}")
     print(f"SCAN COMPLETE")
     print(f"Markets checked: {', '.join(sports_scanned)}")
     print(f"Active today: {', '.join(sports_with_games) if sports_with_games else 'None'}")
-    print(f"Total edges: {len(all_edges)}")
+    print(f"Total edges >= {MIN_EDGE_PERCENT}%: {len(all_edges)} (filtered {before_count - len(all_edges)} sub-threshold)")
     print(f"{'='*60}\n")
 
     return all_edges, sports_scanned, sports_with_games
