@@ -155,7 +155,7 @@ AUTO_TRADE_ENABLED = True
 MAX_POSITIONS = 999  # No practical limit
 TARGET_PROFIT = 5.00  # Target $5 profit per FD arb trade
 MAX_RISK = 250.00     # Max total cost per FD arb order
-MIN_EDGE_PERCENT = 0.5  # Skip edges below this % (fees/slippage eat tiny edges)
+MIN_EDGE_PERCENT = 2.0  # Only notify/display edges >= 2% over fair value
 
 # Multi-book fair value configuration
 # Books to pull from The Odds API — mix of sharp + major US retail
