@@ -156,6 +156,7 @@ MAX_POSITIONS = 999  # No practical limit
 TARGET_PROFIT = 5.00  # Target $5 profit per FD arb trade
 MAX_RISK = 250.00     # Max total cost per FD arb order
 MIN_EDGE_PERCENT = 2.0  # Only notify/display edges >= 2% over fair value
+LIVE_PROP_MIN_EDGE = 5.0  # Live props need 5%+ (FD one-way comparison, noisier)
 
 # Multi-book fair value configuration
 # Pre-game: FanDuel + Pinnacle combined devig (require both)
@@ -833,13 +834,14 @@ class FanDuelAPI:
                     'per_book': per_book_fair[name],  # {book_key: devigged_prob}
                 }
             if all_valid:
-                odds_dict.update(game_odds)
+                odds_dict[game_id] = game_odds
                 if game_live:
                     live_count += 1
                 else:
                     pregame_count += 1
 
-        print(f"   Fair value {sport_key} moneyline: {len(odds_dict)} outcomes ({pregame_count} pregame, {live_count} live)")
+        total_outcomes = sum(len(v) for v in odds_dict.values())
+        print(f"   Fair value {sport_key} moneyline: {total_outcomes} outcomes ({pregame_count} pregame, {live_count} live)")
         return {'odds': odds_dict, 'games': games_dict}
 
     def get_spreads(self, sport_key: str) -> Dict:
@@ -1688,7 +1690,10 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         t2_name = team_map.get(team_abbrevs_list[1], team_abbrevs_list[1])
 
         fd_t1, fd_t2, matched_gid = match_kalshi_to_fanduel_game(t1_name, t2_name, fanduel_games)
-        if not fd_t1 or fd_t1 not in fanduel_odds or fd_t2 not in fanduel_odds:
+        if not fd_t1 or not matched_gid or matched_gid not in fanduel_odds:
+            continue
+        game_odds = fanduel_odds[matched_gid]  # {outcome_name: {odds, fair_prob, ...}}
+        if fd_t1 not in game_odds or fd_t2 not in game_odds:
             continue
         commence_str = fanduel_games.get(matched_gid, {}).get('commence_time', '')
         game_live = is_game_live(commence_str)
@@ -1715,10 +1720,10 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
 
         # For 3-way soccer: each Kalshi outcome's "opposite" is the sum of the other
         # two FD outcomes' implied probabilities. For 2-way: standard opposite.
-        if is_three_way and 'Draw' in fanduel_odds:
-            fd_draw_prob = converter.decimal_to_implied_prob(fanduel_odds['Draw']['odds'])
-            fd_t1_prob = converter.decimal_to_implied_prob(fanduel_odds[fd_t1]['odds'])
-            fd_t2_prob = converter.decimal_to_implied_prob(fanduel_odds[fd_t2]['odds'])
+        if is_three_way and 'Draw' in game_odds:
+            fd_draw_prob = converter.decimal_to_implied_prob(game_odds['Draw']['odds'])
+            fd_t1_prob = converter.decimal_to_implied_prob(game_odds[fd_t1]['odds'])
+            fd_t2_prob = converter.decimal_to_implied_prob(game_odds[fd_t2]['odds'])
 
             # Fetch draw orderbook
             ob_draw = kalshi_api.get_orderbook(team_markets[draw_abbrev]['ticker'])
@@ -1735,7 +1740,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                 entries.append({
                     'name': t1_name, 'price': t1_yes, 'eff': eff_t1,
                     'method': f"YES on {t1_name}", 'fd_opp_name': f"{fd_t2} + Draw",
-                    'fd_opp_prob': opp_prob_t1, 'fd_opp_odds': fanduel_odds[fd_t2]['odds'],
+                    'fd_opp_prob': opp_prob_t1, 'fd_opp_odds': game_odds[fd_t2]['odds'],
                     'ticker': team_markets[team_abbrevs_list[0]]['ticker'], 'side': 'yes',
                     'profit': profit,
                 })
@@ -1749,7 +1754,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                 entries.append({
                     'name': t2_name, 'price': t2_yes, 'eff': eff_t2,
                     'method': f"YES on {t2_name}", 'fd_opp_name': f"{fd_t1} + Draw",
-                    'fd_opp_prob': opp_prob_t2, 'fd_opp_odds': fanduel_odds[fd_t1]['odds'],
+                    'fd_opp_prob': opp_prob_t2, 'fd_opp_odds': game_odds[fd_t1]['odds'],
                     'ticker': team_markets[team_abbrevs_list[1]]['ticker'], 'side': 'yes',
                     'profit': profit,
                 })
@@ -1764,7 +1769,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                     entries.append({
                         'name': 'Draw', 'price': draw_yes, 'eff': eff_draw,
                         'method': f"YES on Draw", 'fd_opp_name': f"{fd_t1} + {fd_t2}",
-                        'fd_opp_prob': opp_prob_draw, 'fd_opp_odds': fanduel_odds[fd_t1]['odds'],
+                        'fd_opp_prob': opp_prob_draw, 'fd_opp_odds': game_odds[fd_t1]['odds'],
                         'ticker': team_markets[draw_abbrev]['ticker'], 'side': 'yes',
                         'profit': profit,
                     })
@@ -1776,14 +1781,14 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                 book_opp = {}
                 all_books_set = set()
                 for oname in opp_outcomes:
-                    odata = fanduel_odds.get(oname, {})
+                    odata = game_odds.get(oname, {})
                     for bk, bp in odata.get('per_book', {}).items():
                         all_books_set.add(bk)
                 for bk in all_books_set:
                     total = 0
                     have_all = True
                     for oname in opp_outcomes:
-                        bp = fanduel_odds.get(oname, {}).get('per_book', {}).get(bk)
+                        bp = game_odds.get(oname, {}).get('per_book', {}).get(bk)
                         if bp is None:
                             have_all = False
                             break
@@ -1815,7 +1820,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                     'total_implied_prob': (e['eff'] + e['fd_opp_prob']) * 100,
                     'arbitrage_profit': e['profit'],
                     'is_live': game_live,
-                    'fair_value_mode': fanduel_odds.get(fd_t1, {}).get('mode', ''),
+                    'fair_value_mode': game_odds.get(fd_t1, {}).get('mode', ''),
                     'per_book_detail': three_way_per_book.get(e['name'], {}),
                     'recommendation': f"Buy {e['method']} on Kalshi at ${e['price']:.2f} (Fair value: {e['fd_opp_prob']*100:.1f}%)",
                 }
@@ -1847,7 +1852,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
             for name, best_p, method, fd_opp, trade_ticker, trade_side in entries:
                 fee = kalshi_fee(best_p)
                 eff = best_p + fee
-                fd_prob = converter.decimal_to_implied_prob(fanduel_odds[fd_opp]['odds'])
+                fd_prob = converter.decimal_to_implied_prob(game_odds[fd_opp]['odds'])
                 total = eff + fd_prob
                 if total < 1.0:
                     profit = (1.0 / total - 1) * 100
@@ -1866,14 +1871,14 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                         'kalshi_ticker': trade_ticker,
                         'kalshi_side': trade_side,
                         'fanduel_opposite_team': fd_opp,
-                        'fanduel_opposite_odds': fanduel_odds[fd_opp]['odds'],
+                        'fanduel_opposite_odds': game_odds[fd_opp]['odds'],
                         'fanduel_opposite_prob': fd_prob * 100,
                         'total_implied_prob': total * 100,
                         'arbitrage_profit': profit,
                         'is_live': game_live,
-                        'fair_value_mode': fanduel_odds.get(fd_opp, {}).get('mode', ''),
-                        'per_book_detail': fanduel_odds.get(fd_opp, {}).get('per_book', {}),
-                        'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (Fair value: {fd_opp} at {fanduel_odds[fd_opp]['odds']:.2f})",
+                        'fair_value_mode': game_odds.get(fd_opp, {}).get('mode', ''),
+                        'per_book_detail': game_odds.get(fd_opp, {}).get('per_book', {}),
+                        'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (Fair value: {fd_opp} at {game_odds[fd_opp]['odds']:.2f})",
                     }
                     game_edges.append(edge)
 
@@ -2538,7 +2543,7 @@ def find_live_prop_value(kalshi_api, fd_data, series_ticker, sport_name, fd_mark
         # Edge = how much cheaper Kalshi is vs FD (in percentage points)
         edge_pct = (fd_implied - kalshi_eff) * 100
 
-        if edge_pct >= MIN_EDGE_PERCENT:
+        if edge_pct >= LIVE_PROP_MIN_EDGE:
             game_id = best_fd_match['game_id']
             game_info = fd_games.get(game_id, {})
             game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
@@ -2798,16 +2803,19 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
         return edges
     print(f"   Active tournament keys: {', '.join(active_keys)}")
 
-    all_fd_odds = {}  # player_name -> {odds, game_id, last_update}
+    all_fd_odds = {}  # player_name -> {odds, game_id, last_update, ...}
     all_fd_games = {}  # game_id -> {home, away, commence_time}
     for odds_key in active_keys:
         try:
             fd = fanduel_api.get_moneyline(odds_key)
             if fd['odds']:
-                for name, data in fd['odds'].items():
-                    all_fd_odds[name] = data
+                outcome_count = 0
+                for game_id, game_outcomes in fd['odds'].items():
+                    for name, data in game_outcomes.items():
+                        all_fd_odds[name] = data
+                        outcome_count += 1
                 all_fd_games.update(fd['games'])
-                print(f"   Fair value {odds_key}: {len(fd['odds'])} outcomes")
+                print(f"   Fair value {odds_key} moneyline: {outcome_count} outcomes across {len(fd['odds'])} games")
             time.sleep(0.3)
         except Exception as e:
             continue
