@@ -161,7 +161,7 @@ MAX_BOOK_DIVERGENCE = 0.10  # Reject edge if FD & Pinnacle devigged probs differ
 
 # Prop market-making: place resting NO limit orders based on FD one-way lines
 PROP_MM_ENABLED = True
-PROP_MM_EDGE_PP = 2.5      # Percentage points below FD implied NO (our edge buffer)
+PROP_MM_EDGE_PP = 1.0      # Percentage points below FD implied NO (our edge buffer)
 PROP_MM_CONTRACTS = 1       # Max 1 contract per prop
 
 # Multi-book fair value configuration
