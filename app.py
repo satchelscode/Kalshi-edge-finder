@@ -1470,7 +1470,9 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
         commence_str = fanduel_games.get(matched_gid, {}).get('commence_time', '')
         game_live = is_game_live(commence_str)
 
-        # Staleness already handled in get_moneyline (pre-game=FD+Pinnacle, live=Pinnacle)
+        # Skip live games — The Odds API live data is unreliable (timestamps fresh but odds stale)
+        if game_live:
+            continue
 
         # Fetch orderbooks for team markets
         ob1 = kalshi_api.get_orderbook(team_markets[team_abbrevs_list[0]]['ticker'])
@@ -1747,8 +1749,12 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
         fd_game_spreads = fd_spreads[matched_game_id]
         commence_str = fd_games.get(matched_game_id, {}).get('commence_time', '')
         game_live = is_game_live(commence_str)
-        # Staleness already handled in get_spreads
-        print(f"   Spread match: {t1_name} vs {t2_name} -> {fd_t1} vs {fd_t2}{' [LIVE]' if game_live else ''}")
+
+        # Skip live games — The Odds API live data is unreliable
+        if game_live:
+            continue
+
+        print(f"   Spread match: {t1_name} vs {t2_name} -> {fd_t1} vs {fd_t2}")
 
         # Step 3: For each market in this game, compare to FanDuel spread
         for mk in markets:
@@ -1928,7 +1934,10 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
         game_name = f"{fd_games[matched_game_id]['away']} at {fd_games[matched_game_id]['home']}"
         commence_str = fd_games.get(matched_game_id, {}).get('commence_time', '')
         game_live = is_game_live(commence_str)
-        # Staleness already handled in get_totals
+
+        # Skip live games — The Odds API live data is unreliable
+        if game_live:
+            continue
 
         # Step 3: For each total market in this game, compare to fair value
         for mk in group['markets']:
@@ -2254,7 +2263,10 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
         game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
         commence_str = game_info.get('commence_time', '')
         game_live = is_game_live(commence_str)
-        # Staleness already handled in get_btts
+
+        # Skip live games — The Odds API live data is unreliable
+        if game_live:
+            continue
 
         fd_yes_prob = converter.decimal_to_implied_prob(fd_game_btts['yes_odds'])
         fd_no_prob = converter.decimal_to_implied_prob(fd_game_btts['no_odds'])
@@ -2481,7 +2493,10 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
         game_id = fd_p1_odds.get('game_id', '')
         commence_str = all_fd_games.get(game_id, {}).get('commence_time', '')
         game_live = is_game_live(commence_str)
-        # Staleness already handled in get_moneyline
+
+        # Skip live games — The Odds API live data is unreliable
+        if game_live:
+            continue
 
         game_name = f"{p1['name']} vs {p2['name']}"
 
@@ -3835,18 +3850,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         print(f"   {name}: {len(edges)} edges")
         time.sleep(1.0)
 
-    # 4. Live player props — direct FD one-way vs Kalshi one-way comparison
-    for kalshi_series, (odds_key, fd_market, name) in PLAYER_PROP_SPORTS.items():
-        print(f"\n--- {name} Live ({kalshi_series}) ---")
-        fd = fanduel_api.get_fd_live_props(odds_key, fd_market)
-        sports_scanned.append(name)
-        if not fd['props']:
-            continue
-        sports_with_games.append(name)
-        edges = find_live_prop_value(kalshi_api, fd, kalshi_series, name, fd_market)
-        all_edges.extend(edges)
-        print(f"   {name} Live: {len(edges)} edges")
-        time.sleep(1.0)
+    # 4. Live player props — DISABLED (The Odds API live data is unreliable)
 
     # 5. BTTS markets
     for kalshi_series, (odds_key, name) in BTTS_SPORTS.items():
