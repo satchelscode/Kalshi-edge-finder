@@ -394,9 +394,9 @@ def _get_today_date_strs() -> set:
 
 
 def are_odds_stale(commence_time_str: str, last_update_str: str) -> bool:
-    """Check if FanDuel odds are stale for a live game.
-    Returns True if the game has started but FD odds haven't updated since before
-    the game started (pre-game odds frozen during live play).
+    """Check if live odds are stale.
+    Returns True if the game has started but odds haven't updated since before
+    the game started or are more than 5 minutes old.
     Returns False for pre-game games or if we can't determine staleness."""
     if not commence_time_str or not last_update_str:
         return False
@@ -408,8 +408,8 @@ def are_odds_stale(commence_time_str: str, last_update_str: str) -> bool:
         if ct > now:
             return False
         # Game is live: odds are stale if last_update is before game start
-        # or more than 15 minutes old (FD stopped updating through the API)
-        if lu < ct or (now - lu) > timedelta(minutes=15):
+        # or more than 5 minutes old (live odds change rapidly)
+        if lu < ct or (now - lu) > timedelta(minutes=5):
             return True
         return False
     except Exception:
@@ -435,6 +435,22 @@ def send_telegram_notification(edge: Dict):
         side = edge.get('kalshi_side', 'yes').upper()
         price = edge.get('kalshi_price', 0)
 
+        # Format odds freshness
+        odds_age_str = ""
+        last_update_str = edge.get('odds_last_update', '')
+        if last_update_str:
+            try:
+                lu = datetime.fromisoformat(last_update_str.replace('Z', '+00:00'))
+                age_sec = (datetime.now(timezone.utc) - lu).total_seconds()
+                if age_sec < 60:
+                    odds_age_str = f"\nOdds age: {int(age_sec)}s ago"
+                elif age_sec < 3600:
+                    odds_age_str = f"\nOdds age: {int(age_sec/60)}m ago"
+                else:
+                    odds_age_str = f"\nOdds age: {int(age_sec/3600)}h {int((age_sec%3600)/60)}m ago"
+            except Exception:
+                pass
+
         # Per-book lines in American odds
         per_book = edge.get('per_book_detail', {})
         kalshi_method = edge.get('kalshi_method', '')
@@ -451,7 +467,7 @@ def send_telegram_notification(edge: Dict):
 FanDuel Live Over: {prob_to_american(fd_implied)} ({fd_implied*100:.1f}%)
 Kalshi YES: {kalshi_method} @ ${price:.2f}
 Kalshi after fees: {prob_to_american(kalshi_fees_prob)} ({kalshi_fees_prob*100:.1f}%)
-Difference: {edge['arbitrage_profit']:.2f}%
+Difference: {edge['arbitrage_profit']:.2f}%{odds_age_str}
 
 Would bet: {side} {ticker} @ {int(price*100)}c
 
@@ -477,7 +493,7 @@ Devigged Fair Lines ({mode}):
 
 Kalshi: {kalshi_method} @ ${price:.2f}
 Kalshi after fees: {prob_to_american(kalshi_fees_prob)}
-Edge: {edge['arbitrage_profit']:.2f}%
+Edge: {edge['arbitrage_profit']:.2f}%{odds_age_str}
 
 Would bet: {side} {ticker} @ {int(price*100)}c
 
@@ -1822,6 +1838,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                     'is_live': game_live,
                     'fair_value_mode': game_odds.get(fd_t1, {}).get('mode', ''),
                     'per_book_detail': three_way_per_book.get(e['name'], {}),
+                    'odds_last_update': game_odds.get(fd_t1, {}).get('last_update', ''),
                     'recommendation': f"Buy {e['method']} on Kalshi at ${e['price']:.2f} (Fair value: {e['fd_opp_prob']*100:.1f}%)",
                 }
                 game_edges.append(edge)
@@ -1878,6 +1895,7 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                         'is_live': game_live,
                         'fair_value_mode': game_odds.get(fd_opp, {}).get('mode', ''),
                         'per_book_detail': game_odds.get(fd_opp, {}).get('per_book', {}),
+                        'odds_last_update': game_odds.get(fd_opp, {}).get('last_update', ''),
                         'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (Fair value: {fd_opp} at {game_odds[fd_opp]['odds']:.2f})",
                     }
                     game_edges.append(edge)
@@ -2062,6 +2080,7 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                     'is_live': game_live,
                     'fair_value_mode': fd_game_spreads.get('_mode', ''),
                     'per_book_detail': fd_opposite_spread.get('per_book', {}),
+                    'odds_last_update': fd_game_spreads.get('_last_update', ''),
                     'recommendation': f"Buy YES {team_name} -{floor_strike} on Kalshi at ${yes_price:.2f} (Fair value: {fd_opposite_name} {fd_opposite_spread['point']} at {fd_opposite_odds:.2f})",
                 }
                 edges.append(edge)
@@ -2208,6 +2227,7 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                         'is_live': game_live,
                         'fair_value_mode': fd_total.get('_mode', ''),
                         'per_book_detail': fd_total.get('per_book_under', {}),
+                        'odds_last_update': fd_total.get('_last_update', ''),
                         'recommendation': f"Buy YES Over {floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel Under {fd_line} at {fd_total['under_odds']:.2f})",
                     }
                     edges.append(edge)
@@ -2245,6 +2265,7 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                         'is_live': game_live,
                         'fair_value_mode': fd_total.get('_mode', ''),
                         'per_book_detail': fd_total.get('per_book_over', {}),
+                        'odds_last_update': fd_total.get('_last_update', ''),
                         'recommendation': f"Buy NO (Under {floor_strike}) on Kalshi at ${under_cost:.2f} (FanDuel Over {fd_line} at {fd_total['over_odds']:.2f})",
                     }
                     edges.append(edge)
@@ -2461,6 +2482,7 @@ def find_live_prop_value(kalshi_api, fd_data, series_ticker, sport_name, fd_mark
                 'over_odds': prop['over_odds'],
                 'fd_over_implied': prop['fd_over_implied'],
                 'game_id': game_id,
+                'last_update': prop.get('last_update', ''),
             })
 
     # Build team abbrev -> set of FD game_ids for game verification
@@ -2568,6 +2590,7 @@ def find_live_prop_value(kalshi_api, fd_data, series_ticker, sport_name, fd_mark
                 'is_live': True,
                 'fair_value_mode': 'live/fd one-way',
                 'per_book_detail': {'fanduel': fd_implied},
+                'odds_last_update': best_fd_match.get('last_update', ''),
                 'recommendation': f"Buy YES {player_name} {kalshi_line}+ on Kalshi at ${yes_price:.2f} (FD Over at {best_fd_match['over_odds']:.2f})",
             }
             edges.append(edge)
@@ -2694,6 +2717,7 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
                         'is_live': game_live,
                         'fair_value_mode': fd_game_btts.get('_mode', ''),
                         'per_book_detail': fd_game_btts.get('per_book_no', {}),
+                        'odds_last_update': fd_game_btts.get('_last_update', ''),
                         'recommendation': f"Buy YES BTTS on Kalshi at ${yes_price:.2f} (FanDuel BTTS No at {fd_game_btts['no_odds']:.2f})",
                     }
                     edges.append(edge)
@@ -2729,6 +2753,7 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
                         'is_live': game_live,
                         'fair_value_mode': fd_game_btts.get('_mode', ''),
                         'per_book_detail': fd_game_btts.get('per_book_yes', {}),
+                        'odds_last_update': fd_game_btts.get('_last_update', ''),
                         'recommendation': f"Buy NO BTTS on Kalshi at ${no_price:.2f} (FanDuel BTTS Yes at {fd_game_btts['yes_odds']:.2f})",
                     }
                     edges.append(edge)
@@ -2942,6 +2967,7 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
                     'is_live': game_live,
                     'fair_value_mode': fd_opp_data.get('mode', ''),
                     'per_book_detail': fd_opp_data.get('per_book', {}),
+                    'odds_last_update': fd_opp_data.get('last_update', ''),
                     'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (Fair value: {fd_opp_name} at {fd_opp_data['odds']:.2f})",
                 }
                 match_edges.append(edge)
