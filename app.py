@@ -2430,7 +2430,10 @@ def compare_pregame_props(kalshi_api, fd_data, prop_series_tickers, sport_name):
                 best_fd = fd_entry
                 break
 
-            # Get orderbook (even if no FD match, to show Kalshi-only data)
+            # Only fetch orderbook for FD-matched markets (saves ~580 API calls)
+            if not best_fd:
+                continue
+
             ob = kalshi_api.get_orderbook(ticker)
             if not ob:
                 continue
@@ -2439,10 +2442,8 @@ def compare_pregame_props(kalshi_api, fd_data, prop_series_tickers, sport_name):
             yes_price = get_best_yes_price(ob)
             no_price = get_best_no_price(ob)
 
-            game_name = ''
-            if best_fd:
-                game_info = fd_games.get(best_fd['game_id'], {})
-                game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
+            game_info = fd_games.get(best_fd['game_id'], {})
+            game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
 
             comp = {
                 'player': player_name,
@@ -2451,19 +2452,19 @@ def compare_pregame_props(kalshi_api, fd_data, prop_series_tickers, sport_name):
                 'game': game_name,
                 'ticker': ticker,
                 # FD side
-                'fd_matched': best_fd is not None,
-                'fd_american': best_fd['american_odds'] if best_fd else None,
-                'fd_implied': best_fd['fd_implied'] * 100 if best_fd else None,
-                'fd_player': best_fd['player'] if best_fd else None,
-                'fd_point': best_fd['point'] if best_fd else None,
+                'fd_matched': True,
+                'fd_american': best_fd['american_odds'],
+                'fd_implied': best_fd['fd_implied'] * 100,
+                'fd_player': best_fd['player'],
+                'fd_point': best_fd['point'],
                 # Kalshi side
                 'kalshi_yes': yes_price,
                 'kalshi_no': no_price,
                 'kalshi_yes_pct': yes_price * 100 if yes_price else None,
                 'kalshi_no_pct': no_price * 100 if no_price else None,
                 # Difference (FD implied - Kalshi YES = how much cheaper Kalshi is)
-                'diff_yes': (best_fd['fd_implied'] * 100 - yes_price * 100) if best_fd and yes_price else None,
-                'diff_no': ((1 - best_fd['fd_implied']) * 100 - no_price * 100) if best_fd and no_price else None,
+                'diff_yes': (best_fd['fd_implied'] * 100 - yes_price * 100) if yes_price else None,
+                'diff_no': ((1 - best_fd['fd_implied']) * 100 - no_price * 100) if no_price else None,
             }
             comparisons.append(comp)
 
@@ -4116,53 +4117,8 @@ def scan_all_sports(kalshi_api, fanduel_api):
     # Sync positions from Kalshi API at start of each scan
     _order_tracker.refresh_from_api(kalshi_api)
 
-    # 1. Moneyline markets
-    for kalshi_series, (odds_key, name, team_map) in MONEYLINE_SPORTS.items():
-        print(f"\n--- {name} Moneyline ({kalshi_series}) ---")
-        fd = fanduel_api.get_moneyline(odds_key)
-        sports_scanned.append(name)
-        if not fd['odds']:
-            continue
-        sports_with_games.append(name)
-        edges = find_moneyline_edges(kalshi_api, fd, kalshi_series, name, team_map)
-        all_edges.extend(edges)
-        print(f"   {name} moneyline: {len(edges)} edges")
-        time.sleep(1.0)
-
-    # 2. Spread markets
-    for kalshi_series, (odds_key, name, team_map) in SPREAD_SPORTS.items():
-        print(f"\n--- {name} ({kalshi_series}) ---")
-        fd = fanduel_api.get_spreads(odds_key)
-        sports_scanned.append(name)
-        if not fd['spreads']:
-            continue
-        sports_with_games.append(name)
-        edges = find_spread_edges(kalshi_api, fd, kalshi_series, name, team_map)
-        all_edges.extend(edges)
-        print(f"   {name}: {len(edges)} edges")
-        time.sleep(1.0)
-
-    # 3. Total markets
-    for kalshi_series, (odds_key, name) in TOTAL_SPORTS.items():
-        print(f"\n--- {name} ({kalshi_series}) ---")
-        # Use team_map from moneyline config if available
-        team_map = {}
-        for ms, (mk, mn, tm) in MONEYLINE_SPORTS.items():
-            if mk == odds_key:
-                team_map = tm
-                break
-        fd = fanduel_api.get_totals(odds_key)
-        sports_scanned.append(name)
-        if not fd['totals']:
-            continue
-        sports_with_games.append(name)
-        edges = find_total_edges(kalshi_api, fd, kalshi_series, name, team_map)
-        all_edges.extend(edges)
-        print(f"   {name}: {len(edges)} edges")
-        time.sleep(1.0)
-
-    # 4. Pre-game player prop comparison (FD one-way vs Kalshi YES/NO)
-    # Group PLAYER_PROP_SPORTS by sport_key so we fetch all stat types per game in one call
+    # 1. Pre-game player prop comparison (FD one-way vs Kalshi YES/NO)
+    # Run FIRST so /props page populates quickly after deploy
     all_prop_comparisons = []
     prop_sport_groups = {}  # sport_key -> {market_key: series_ticker, 'name': display_name}
     for series_ticker, (sport_key, market_key, display_name) in PLAYER_PROP_SPORTS.items():
@@ -4181,14 +4137,58 @@ def scan_all_sports(kalshi_api, fanduel_api):
         sports_with_games.append(group_name)
         comps = compare_pregame_props(kalshi_api, fd, group['tickers'], group_name)
         all_prop_comparisons.extend(comps)
-        matched = sum(1 for c in comps if c['fd_matched'])
-        print(f"   {group_name}: {len(comps)} Kalshi markets, {matched} matched to FD")
+        print(f"   {group_name}: {len(comps)} FD-matched props compared")
         time.sleep(1.0)
 
-    # Store prop comparisons in scan cache for /props route
+    # Store prop comparisons immediately so /props page has data ASAP
     with _scan_lock:
         _scan_cache['prop_comparisons'] = all_prop_comparisons
-        print(f"   CACHE WRITE: stored {len(all_prop_comparisons)} prop_comparisons (cache id={id(_scan_cache)})")
+    print(f"   Prop comparisons cached: {len(all_prop_comparisons)} total")
+
+    # 2. Moneyline markets
+    for kalshi_series, (odds_key, name, team_map) in MONEYLINE_SPORTS.items():
+        print(f"\n--- {name} Moneyline ({kalshi_series}) ---")
+        fd = fanduel_api.get_moneyline(odds_key)
+        sports_scanned.append(name)
+        if not fd['odds']:
+            continue
+        sports_with_games.append(name)
+        edges = find_moneyline_edges(kalshi_api, fd, kalshi_series, name, team_map)
+        all_edges.extend(edges)
+        print(f"   {name} moneyline: {len(edges)} edges")
+        time.sleep(1.0)
+
+    # 3. Spread markets
+    for kalshi_series, (odds_key, name, team_map) in SPREAD_SPORTS.items():
+        print(f"\n--- {name} ({kalshi_series}) ---")
+        fd = fanduel_api.get_spreads(odds_key)
+        sports_scanned.append(name)
+        if not fd['spreads']:
+            continue
+        sports_with_games.append(name)
+        edges = find_spread_edges(kalshi_api, fd, kalshi_series, name, team_map)
+        all_edges.extend(edges)
+        print(f"   {name}: {len(edges)} edges")
+        time.sleep(1.0)
+
+    # 4. Total markets
+    for kalshi_series, (odds_key, name) in TOTAL_SPORTS.items():
+        print(f"\n--- {name} ({kalshi_series}) ---")
+        # Use team_map from moneyline config if available
+        team_map = {}
+        for ms, (mk, mn, tm) in MONEYLINE_SPORTS.items():
+            if mk == odds_key:
+                team_map = tm
+                break
+        fd = fanduel_api.get_totals(odds_key)
+        sports_scanned.append(name)
+        if not fd['totals']:
+            continue
+        sports_with_games.append(name)
+        edges = find_total_edges(kalshi_api, fd, kalshi_series, name, team_map)
+        all_edges.extend(edges)
+        print(f"   {name}: {len(edges)} edges")
+        time.sleep(1.0)
 
     # 5. BTTS markets
     for kalshi_series, (odds_key, name) in BTTS_SPORTS.items():
@@ -4418,7 +4418,6 @@ def props_view():
             comparisons = list(_scan_cache.get('prop_comparisons', []))
             scan_ts = _scan_cache['timestamp']
             scan_count = _scan_cache['scan_count']
-        print(f"   CACHE READ /props: {len(comparisons)} prop_comparisons (cache id={id(_scan_cache)}, scan #{scan_count})")
 
         # Group by stat type for tab-like display
         stat_types = sorted(set(c['stat'] for c in comparisons)) if comparisons else []
@@ -4462,7 +4461,7 @@ tr:hover {{ background: rgba(0,255,136,0.05); }}
             html += '<div class="summary">No prop data yet. Waiting for background scan...</div>'
         else:
             matched = sum(1 for c in comparisons if c['fd_matched'])
-            html += f'<div class="summary"><strong>{len(comparisons)}</strong> Kalshi props found | <strong>{matched}</strong> matched to FanDuel | <strong>{len(comparisons) - matched}</strong> unmatched</div>'
+            html += f'<div class="summary"><strong>{len(comparisons)}</strong> FD-matched props compared</div>'
 
             # Stat type tabs
             html += '<div class="tabs">'
@@ -4471,12 +4470,11 @@ tr:hover {{ background: rgba(0,255,136,0.05); }}
                 html += f'<div class="tab" onclick="showStat(\'{st}\')">{st}</div>'
             html += '</div>'
 
-            # Sort: matched first (by diff_yes desc), then unmatched
-            matched_comps = sorted(
-                [c for c in comparisons if c['fd_matched']],
+            # Sort by YES diff descending
+            sorted_comps = sorted(
+                comparisons,
                 key=lambda c: c.get('diff_yes') or -999, reverse=True
             )
-            unmatched_comps = [c for c in comparisons if not c['fd_matched']]
 
             # Build table
             html += '<table>'
@@ -4485,8 +4483,7 @@ tr:hover {{ background: rgba(0,255,136,0.05); }}
             html += '<th>Kalshi YES</th><th>Kalshi NO</th>'
             html += '<th>YES Diff</th><th>NO Diff</th></tr>'
 
-            # Matched rows
-            for c in matched_comps:
+            for c in sorted_comps:
                 stat_class = f'stat-{c["stat"]}'
                 fd_odds_str = f"{c['fd_american']:+d}" if c['fd_american'] else '—'
                 fd_pct = f"{c['fd_implied']:.1f}%" if c['fd_implied'] else '—'
@@ -4516,21 +4513,6 @@ tr:hover {{ background: rgba(0,255,136,0.05); }}
                 html += f'<td>{fd_odds_str}</td><td>{fd_pct}</td>'
                 html += f'<td>{k_yes}</td><td>{k_no}</td>'
                 html += f'<td>{yes_diff}</td><td>{no_diff}</td></tr>'
-
-            # Unmatched rows
-            if unmatched_comps:
-                html += '<tr class="game-header"><td colspan="10">Unmatched (Kalshi only — no FD data)</td></tr>'
-                for c in unmatched_comps:
-                    stat_class = f'stat-{c["stat"]}'
-                    k_yes = f"${c['kalshi_yes']:.2f}" if c['kalshi_yes'] else '—'
-                    k_no = f"${c['kalshi_no']:.2f}" if c['kalshi_no'] else '—'
-                    threshold_str = f"{c['threshold']}+"
-                    html += f'<tr class="stat-row {stat_class} no-match" data-stat="{c["stat"]}">'
-                    html += f'<td>{c["player"]}</td>'
-                    html += f'<td>{c["stat"]}</td><td>{threshold_str}</td><td>—</td>'
-                    html += f'<td>—</td><td>—</td>'
-                    html += f'<td>{k_yes}</td><td>{k_no}</td>'
-                    html += f'<td>—</td><td>—</td></tr>'
 
             html += '</table>'
 
