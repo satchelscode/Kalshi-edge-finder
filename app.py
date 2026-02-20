@@ -5672,18 +5672,19 @@ def scan_all_sports(kalshi_api, fanduel_api):
         print(f"   {name}: {len(edges)} edges")
         time.sleep(1.0)
 
-    # 4. Player props
-    for kalshi_series, (odds_key, fd_market, name) in PLAYER_PROP_SPORTS.items():
-        print(f"\n--- {name} ({kalshi_series}) ---")
-        fd = fanduel_api.get_player_props(odds_key, fd_market)
-        sports_scanned.append(name)
-        if not fd['props']:
-            continue
-        sports_with_games.append(name)
-        edges = find_player_prop_edges(kalshi_api, fd, kalshi_series, name, fd_market)
-        all_edges.extend(edges)
-        print(f"   {name}: {len(edges)} edges")
-        time.sleep(1.0)
+    # 4. Player props — DISABLED (devigging doesn't work well for one-way markets;
+    #    completed props sniper handles guaranteed player props separately)
+    # for kalshi_series, (odds_key, fd_market, name) in PLAYER_PROP_SPORTS.items():
+    #     print(f"\n--- {name} ({kalshi_series}) ---")
+    #     fd = fanduel_api.get_player_props(odds_key, fd_market)
+    #     sports_scanned.append(name)
+    #     if not fd['props']:
+    #         continue
+    #     sports_with_games.append(name)
+    #     edges = find_player_prop_edges(kalshi_api, fd, kalshi_series, name, fd_market)
+    #     all_edges.extend(edges)
+    #     print(f"   {name}: {len(edges)} edges")
+    #     time.sleep(1.0)
 
     # 5. BTTS markets
     for kalshi_series, (odds_key, name) in BTTS_SPORTS.items():
