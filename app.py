@@ -159,6 +159,11 @@ MIN_EDGE_PERCENT = 2.0  # Only notify/display edges >= 2% over fair value
 LIVE_PROP_MIN_EDGE = 5.0  # Live props need 5%+ (FD one-way comparison, noisier)
 MAX_BOOK_DIVERGENCE = 0.10  # Reject edge if FD & Pinnacle devigged probs differ by >10pp
 
+# Prop market-making: place resting NO limit orders based on FD one-way lines
+PROP_MM_ENABLED = True
+PROP_MM_EDGE_PP = 2.5      # Percentage points below FD implied NO (our edge buffer)
+PROP_MM_CONTRACTS = 1       # Max 1 contract per prop
+
 # Multi-book fair value configuration
 # Pre-game: FanDuel + Pinnacle combined devig (require both)
 # Live: Pinnacle only devig (sharpest book with live odds)
@@ -1362,13 +1367,30 @@ class KalshiAPI:
             print(f"   Kalshi auth POST {path} error: {e}")
             return None
 
+    def _auth_delete(self, path: str) -> bool:
+        """Authenticated DELETE request. Returns True on success."""
+        if not self.private_key:
+            return False
+        try:
+            headers = self._sign_request('DELETE', path)
+            response = requests.delete(
+                f"https://api.elections.kalshi.com{path}",
+                headers={**self.session.headers, **headers},
+                timeout=10
+            )
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            print(f"   Kalshi auth DELETE {path} error: {e}")
+            return False
+
     def get_balance(self) -> Optional[Dict]:
         """Get account balance (in cents)."""
         return self._auth_get('/trade-api/v2/portfolio/balance')
 
-    def get_orders(self, status: str = None) -> List[Dict]:
+    def get_orders(self, status: str = None, limit: int = 200) -> List[Dict]:
         """Get orders, optionally filtered by status (resting/executed/canceled)."""
-        params = {}
+        params = {'limit': limit}
         if status:
             params['status'] = status
         result = self._auth_get('/trade-api/v2/portfolio/orders', params=params)
@@ -1451,6 +1473,11 @@ class KalshiAPI:
             print(f"   >>> ORDER {order_id}: {status}")
             return result
         return None
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a resting order by order_id."""
+        print(f"   >>> CANCELING ORDER: {order_id}")
+        return self._auth_delete(f'/trade-api/v2/portfolio/orders/{order_id}')
 
     def get_markets(self, series_ticker: str, limit: int = 200, status: str = 'open') -> List[Dict]:
         all_markets = []
@@ -2442,6 +2469,13 @@ def compare_pregame_props(kalshi_api, fd_data, prop_series_tickers, sport_name):
             yes_price = get_best_yes_price(ob)
             no_price = get_best_no_price(ob)
 
+            # Raw orderbook data for market-making (top-of-book check)
+            ob_data = ob.get('orderbook', {})
+            no_bids = ob_data.get('no', [])
+            yes_bids = ob_data.get('yes', [])
+            best_no_bid_cents = max(no_bids, key=lambda x: x[0])[0] if no_bids else 0
+            best_yes_bid_cents = max(yes_bids, key=lambda x: x[0])[0] if yes_bids else 0
+
             game_info = fd_games.get(best_fd['game_id'], {})
             game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
 
@@ -2462,6 +2496,9 @@ def compare_pregame_props(kalshi_api, fd_data, prop_series_tickers, sport_name):
                 'kalshi_no': no_price,
                 'kalshi_yes_pct': yes_price * 100 if yes_price else None,
                 'kalshi_no_pct': no_price * 100 if no_price else None,
+                # Raw orderbook for market-making
+                'best_no_bid_cents': best_no_bid_cents,
+                'best_yes_bid_cents': best_yes_bid_cents,
                 # Difference (FD implied - Kalshi YES = how much cheaper Kalshi is)
                 'diff_yes': (best_fd['fd_implied'] * 100 - yes_price * 100) if yes_price else None,
                 'diff_no': ((1 - best_fd['fd_implied']) * 100 - no_price * 100) if no_price else None,
@@ -2469,6 +2506,119 @@ def compare_pregame_props(kalshi_api, fd_data, prop_series_tickers, sport_name):
             comparisons.append(comp)
 
     return comparisons
+
+
+# ============================================================
+# PROP MARKET MAKER — Resting NO limit orders based on FD lines
+# ============================================================
+
+def manage_prop_orders(kalshi_api, comparisons):
+    """Place/adjust/cancel resting NO limit orders on player props.
+
+    Strategy:
+    - For each FD-matched prop, calculate NO bid = (100 - FD_implied%) - PROP_MM_EDGE_PP
+    - Only place if our price would be top of NO orderbook (highest NO bid)
+    - Max 1 contract per prop (open order OR filled position, never both)
+    - Adjust existing orders if FD line moved >= 2 cents
+    - Cancel orders for props no longer in FD data
+    """
+    if not PROP_MM_ENABLED:
+        return
+
+    # Sync state from Kalshi API: resting orders + filled positions
+    resting_orders = kalshi_api.get_orders(status='resting')
+    positions = kalshi_api.get_positions()
+
+    # Build lookup: ticker -> resting order info (only our prop MM orders)
+    prop_resting = {}
+    for order in resting_orders:
+        cid = order.get('client_order_id', '')
+        if cid.startswith('propmm_'):
+            ticker = order.get('ticker', '')
+            prop_resting[ticker] = {
+                'order_id': order.get('order_id'),
+                'no_price': order.get('no_price', 0),
+            }
+
+    # Build set of tickers where we already hold a position
+    filled_tickers = set()
+    for pos in positions:
+        ticker = pos.get('ticker', '')
+        qty = pos.get('position', 0)
+        if qty != 0:
+            filled_tickers.add(ticker)
+
+    placed = 0
+    adjusted = 0
+    canceled = 0
+    skipped_filled = 0
+    skipped_not_top = 0
+    active_tickers = set()
+
+    for comp in comparisons:
+        ticker = comp['ticker']
+        fd_implied_pct = comp['fd_implied']  # e.g. 53.2
+        active_tickers.add(ticker)
+
+        # Calculate NO bid: (100 - FD_over_implied) - edge_buffer
+        no_bid_cents = int(100 - fd_implied_pct - PROP_MM_EDGE_PP)
+
+        # Sanity bounds
+        if no_bid_cents < 5 or no_bid_cents > 95:
+            continue
+
+        # Skip if we already have a filled position on this ticker
+        if ticker in filled_tickers:
+            skipped_filled += 1
+            continue
+
+        # Check existing resting order
+        existing = prop_resting.get(ticker)
+        if existing:
+            # Price close enough (< 2 cent change) — keep existing
+            if abs(existing['no_price'] - no_bid_cents) < 2:
+                continue
+            # Price changed significantly — cancel old order, will re-place below
+            kalshi_api.cancel_order(existing['order_id'])
+            adjusted += 1
+            time.sleep(0.3)
+
+        # Top-of-book check: our NO bid must be highest (beat existing best)
+        best_no_bid = comp.get('best_no_bid_cents', 0)
+        if no_bid_cents <= best_no_bid:
+            skipped_not_top += 1
+            continue
+
+        # Don't cross the spread: NO bid must be < NO ask (= 100 - best YES bid)
+        best_yes_bid = comp.get('best_yes_bid_cents', 0)
+        if best_yes_bid > 0:
+            no_ask_cents = 100 - best_yes_bid
+            if no_bid_cents >= no_ask_cents:
+                skipped_not_top += 1
+                continue
+
+        # Place 1 contract NO limit order
+        client_id = f"propmm_{ticker}"
+        result = kalshi_api.place_order(
+            ticker=ticker,
+            side='no',
+            price_cents=no_bid_cents,
+            count=PROP_MM_CONTRACTS,
+            client_order_id=client_id,
+        )
+        if result:
+            placed += 1
+        time.sleep(0.3)
+
+    # Cancel orders for tickers no longer in FD data (line removed or game started)
+    for ticker, order_info in prop_resting.items():
+        if ticker not in active_tickers and ticker not in filled_tickers:
+            kalshi_api.cancel_order(order_info['order_id'])
+            canceled += 1
+            time.sleep(0.2)
+
+    print(f"   Prop MM: {placed} placed, {adjusted} adjusted, {canceled} stale canceled, "
+          f"{skipped_filled} already filled, {skipped_not_top} not top of book")
 
 
 # ============================================================
@@ -4153,6 +4303,11 @@ def scan_all_sports(kalshi_api, fanduel_api):
     except Exception as e:
         print(f"   Warning: failed to write props cache file: {e}")
     print(f"   Prop comparisons cached: {len(all_prop_comparisons)} total")
+
+    # 1b. Prop market-making: place/adjust NO limit orders
+    if all_prop_comparisons:
+        print(f"\n--- Prop Market Making ---")
+        manage_prop_orders(kalshi_api, all_prop_comparisons)
 
     # 2. Moneyline markets
     for kalshi_series, (odds_key, name, team_map) in MONEYLINE_SPORTS.items():
