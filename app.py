@@ -4188,6 +4188,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
     # Store prop comparisons in scan cache for /props route
     with _scan_lock:
         _scan_cache['prop_comparisons'] = all_prop_comparisons
+        print(f"   CACHE WRITE: stored {len(all_prop_comparisons)} prop_comparisons (cache id={id(_scan_cache)})")
 
     # 5. BTTS markets
     for kalshi_series, (odds_key, name) in BTTS_SPORTS.items():
@@ -4417,6 +4418,7 @@ def props_view():
             comparisons = list(_scan_cache.get('prop_comparisons', []))
             scan_ts = _scan_cache['timestamp']
             scan_count = _scan_cache['scan_count']
+        print(f"   CACHE READ /props: {len(comparisons)} prop_comparisons (cache id={id(_scan_cache)}, scan #{scan_count})")
 
         # Group by stat type for tab-like display
         stat_types = sorted(set(c['stat'] for c in comparisons)) if comparisons else []
