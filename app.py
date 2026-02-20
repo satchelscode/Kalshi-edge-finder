@@ -2687,6 +2687,30 @@ def _parse_espn_stat(stat_str: str, parse_type: str, stat_config=None) -> int:
         return 0
 
 
+# ESPN abbreviation → Kalshi abbreviation mapping (only teams that differ)
+# NBA: ESPN uses shorter abbrevs (GS, NY, NO, SA) vs Kalshi (GSW, NYK, NOP, SAS)
+# NHL: ESPN and Kalshi both use TB, NJ, SJ, LA — no mapping needed
+ESPN_TO_KALSHI = {
+    'GS': 'GSW', 'NY': 'NYK', 'NO': 'NOP', 'SA': 'SAS',
+    'UTAH': 'UTA', 'PHO': 'PHX',
+}
+
+# Soccer-specific ESPN→Kalshi mapping (separate to avoid conflicts with NBA/NHL abbrevs)
+ESPN_TO_KALSHI_SOCCER = {
+    # EPL
+    'LIV': 'LFC', 'MAN': 'MUN', 'MNC': 'MCI', 'CHE': 'CFC', 'BHA': 'BRI',
+    # Serie A
+    'ROMA': 'ROM', 'COMO': 'COM', 'BOL': 'BFC', 'MIL': 'ACM',
+    # Ligue 1
+    'LILL': 'LIL', 'LYON': 'OL', 'METZ': 'FCM', 'OLM': 'OM',
+    'LOR': 'FCL', 'NAN': 'FCN', 'MON': 'ASM', 'TOU': 'TFC',
+    # Bundesliga
+    'DOR': 'BVB', 'B04': 'LEV',
+    # La Liga
+    'MLL': 'MAL', 'BET': 'RBB',
+}
+
+
 def _get_live_games(espn_path: str) -> List[Dict]:
     """Get currently live games from ESPN scoreboard for any sport.
     Includes game_date_str to prevent matching yesterday's finals to today's markets."""
