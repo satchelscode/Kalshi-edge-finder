@@ -1651,6 +1651,8 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
             # Build edge dicts from 3-way entries
             game_edges = []
             for e in entries:
+                if e['profit'] < MIN_EDGE_PERCENT:
+                    continue
                 edge = {
                     'market_type': 'Moneyline',
                     'sport': sport_name,
@@ -1703,6 +1705,8 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                 total = eff + fd_prob
                 if total < 1.0:
                     profit = (1.0 / total - 1) * 100
+                    if profit < MIN_EDGE_PERCENT:
+                        continue
                     edge = {
                         'market_type': 'Moneyline',
                         'sport': sport_name,
@@ -1884,6 +1888,8 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
             total_implied = eff + fd_opposite_prob
             if total_implied < 1.0:
                 profit = (1.0 / total_implied - 1) * 100
+                if profit < MIN_EDGE_PERCENT:
+                    continue
                 game_name = f"{fd_games[matched_game_id]['away']} at {fd_games[matched_game_id]['home']}"
                 edge = {
                     'market_type': 'Spread',
@@ -2027,6 +2033,8 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                 total_implied = eff + fd_under_prob
                 if total_implied < 1.0:
                     profit = (1.0 / total_implied - 1) * 100
+                    if profit < MIN_EDGE_PERCENT:
+                        continue
                     edge = {
                         'market_type': 'Total',
                         'sport': sport_name,
@@ -2060,6 +2068,8 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                 total_implied = eff + fd_over_prob
                 if total_implied < 1.0:
                     profit = (1.0 / total_implied - 1) * 100
+                    if profit < MIN_EDGE_PERCENT:
+                        continue
                     edge = {
                         'market_type': 'Total',
                         'sport': sport_name,
@@ -2219,6 +2229,8 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
 
         if total_implied < 1.0:
             profit = (1.0 / total_implied - 1) * 100
+            if profit < MIN_EDGE_PERCENT:
+                continue
             game_id = best_fd_match['game_id']
             game_info = fd_games.get(game_id, {})
             game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
@@ -2349,6 +2361,8 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
                 total_implied = eff + fd_no_prob
                 if total_implied < 1.0:
                     profit = (1.0 / total_implied - 1) * 100
+                    if profit < MIN_EDGE_PERCENT:
+                        continue
                     edge = {
                         'market_type': 'BTTS',
                         'sport': sport_name,
@@ -2380,6 +2394,8 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
                 total_implied = eff + fd_yes_prob
                 if total_implied < 1.0:
                     profit = (1.0 / total_implied - 1) * 100
+                    if profit < MIN_EDGE_PERCENT:
+                        continue
                     edge = {
                         'market_type': 'BTTS',
                         'sport': sport_name,
@@ -2586,6 +2602,8 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
             total = eff + fd_prob
             if total < 1.0:
                 profit = (1.0 / total - 1) * 100
+                if profit < MIN_EDGE_PERCENT:
+                    continue
                 edge = {
                     'market_type': 'Tennis ML',
                     'sport': sport_name,
