@@ -161,8 +161,9 @@ MAX_BOOK_DIVERGENCE = 0.10  # Reject edge if FD & Pinnacle devigged probs differ
 
 # Prop market-making: place resting NO limit orders based on FD one-way lines
 PROP_MM_ENABLED = True
-PROP_MM_EDGE_PP = 1.0      # Percentage points below FD implied NO (our edge buffer)
+PROP_MM_EDGE_PP = 0.0      # Match FD exactly (no edge buffer — FD's vig IS our edge)
 PROP_MM_CONTRACTS = 1       # Max 1 contract per prop
+PROP_MM_YES_MIN_DIFF = 4.0  # Buy YES if YES Diff >= 4pp (FD implied much higher than Kalshi)
 
 # Multi-book fair value configuration
 # Pre-game: FanDuel + Pinnacle combined devig (require both)
@@ -2513,14 +2514,14 @@ def compare_pregame_props(kalshi_api, fd_data, prop_series_tickers, sport_name):
 # ============================================================
 
 def manage_prop_orders(kalshi_api, comparisons):
-    """Place/adjust/cancel resting NO limit orders on player props.
+    """Place/adjust/cancel limit orders on player props based on FD lines.
 
-    Strategy:
-    - For each FD-matched prop, calculate NO bid = (100 - FD_implied%) - PROP_MM_EDGE_PP
-    - Only place if our price would be top of NO orderbook (highest NO bid)
-    - Max 1 contract per prop (open order OR filled position, never both)
-    - Adjust existing orders if FD line moved >= 2 cents
-    - Cancel orders for props no longer in FD data
+    NO side: Bid NO at FD's implied NO price (matching FD, their vig is our edge).
+             Only place if top of NO orderbook.
+    YES side: Buy YES at Kalshi ask if YES Diff >= 4pp (FD thinks it's worth much
+              more than Kalshi price). Market buy 1 contract.
+
+    Max 1 contract per prop (open order OR filled position, never both).
     """
     if not PROP_MM_ENABLED:
         return
@@ -2548,28 +2549,54 @@ def manage_prop_orders(kalshi_api, comparisons):
         if qty != 0:
             filled_tickers.add(ticker)
 
-    placed = 0
+    no_placed = 0
+    yes_placed = 0
     adjusted = 0
     canceled = 0
     skipped_filled = 0
-    skipped_not_top = 0
+    skipped_no_not_top = 0
     active_tickers = set()
 
     for comp in comparisons:
         ticker = comp['ticker']
         fd_implied_pct = comp['fd_implied']  # e.g. 53.2
+        yes_diff = comp.get('diff_yes')  # FD implied - Kalshi YES (positive = YES looks cheap)
         active_tickers.add(ticker)
-
-        # Calculate NO bid: (100 - FD_over_implied) - edge_buffer
-        no_bid_cents = int(100 - fd_implied_pct - PROP_MM_EDGE_PP)
-
-        # Sanity bounds
-        if no_bid_cents < 5 or no_bid_cents > 95:
-            continue
 
         # Skip if we already have a filled position on this ticker
         if ticker in filled_tickers:
             skipped_filled += 1
+            continue
+
+        # --- YES SIDE: Buy YES if FD thinks it's worth 4+pp more than Kalshi ---
+        if yes_diff is not None and yes_diff >= PROP_MM_YES_MIN_DIFF:
+            # Check no existing resting order on this ticker
+            existing = prop_resting.get(ticker)
+            if not existing:
+                # Buy YES at the current ask price (market buy)
+                yes_price = comp.get('kalshi_yes')
+                if yes_price:
+                    yes_cents = int(yes_price * 100)
+                    if 5 <= yes_cents <= 95:
+                        client_id = f"propmm_{ticker}"
+                        result = kalshi_api.place_order(
+                            ticker=ticker,
+                            side='yes',
+                            price_cents=yes_cents,
+                            count=PROP_MM_CONTRACTS,
+                            client_order_id=client_id,
+                        )
+                        if result:
+                            yes_placed += 1
+                            print(f"   YES BUY: {comp['player']} {comp['stat']} {comp['threshold']}+ @ {yes_cents}¢ (diff {yes_diff:+.1f}pp)")
+                        time.sleep(0.3)
+            continue  # Don't also place NO on same ticker
+
+        # --- NO SIDE: Bid at FD's implied NO, only if top of book ---
+        no_bid_cents = int(100 - fd_implied_pct - PROP_MM_EDGE_PP)
+
+        # Sanity bounds
+        if no_bid_cents < 5 or no_bid_cents > 95:
             continue
 
         # Check existing resting order
@@ -2586,7 +2613,7 @@ def manage_prop_orders(kalshi_api, comparisons):
         # Top-of-book check: our NO bid must be highest (beat existing best)
         best_no_bid = comp.get('best_no_bid_cents', 0)
         if no_bid_cents <= best_no_bid:
-            skipped_not_top += 1
+            skipped_no_not_top += 1
             continue
 
         # Don't cross the spread: NO bid must be < NO ask (= 100 - best YES bid)
@@ -2594,7 +2621,7 @@ def manage_prop_orders(kalshi_api, comparisons):
         if best_yes_bid > 0:
             no_ask_cents = 100 - best_yes_bid
             if no_bid_cents >= no_ask_cents:
-                skipped_not_top += 1
+                skipped_no_not_top += 1
                 continue
 
         # Place 1 contract NO limit order
@@ -2607,7 +2634,7 @@ def manage_prop_orders(kalshi_api, comparisons):
             client_order_id=client_id,
         )
         if result:
-            placed += 1
+            no_placed += 1
         time.sleep(0.3)
 
     # Cancel orders for tickers no longer in FD data (line removed or game started)
@@ -2617,8 +2644,8 @@ def manage_prop_orders(kalshi_api, comparisons):
             canceled += 1
             time.sleep(0.2)
 
-    print(f"   Prop MM: {placed} placed, {adjusted} adjusted, {canceled} stale canceled, "
-          f"{skipped_filled} already filled, {skipped_not_top} not top of book")
+    print(f"   Prop MM: {no_placed} NO placed, {yes_placed} YES bought, {adjusted} adjusted, "
+          f"{canceled} stale canceled, {skipped_filled} filled, {skipped_no_not_top} NO not top")
 
 
 # ============================================================
