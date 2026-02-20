@@ -4140,9 +4140,18 @@ def scan_all_sports(kalshi_api, fanduel_api):
         print(f"   {group_name}: {len(comps)} FD-matched props compared")
         time.sleep(1.0)
 
-    # Store prop comparisons immediately so /props page has data ASAP
+    # Store prop comparisons to file (shared across gunicorn processes)
     with _scan_lock:
         _scan_cache['prop_comparisons'] = all_prop_comparisons
+    try:
+        import tempfile
+        props_file = '/tmp/props_cache.json'
+        tmp_file = props_file + '.tmp'
+        with open(tmp_file, 'w') as f:
+            json.dump({'comparisons': all_prop_comparisons, 'ts': datetime.utcnow().isoformat()}, f)
+        os.replace(tmp_file, props_file)
+    except Exception as e:
+        print(f"   Warning: failed to write props cache file: {e}")
     print(f"   Prop comparisons cached: {len(all_prop_comparisons)} total")
 
     # 2. Moneyline markets
@@ -4414,10 +4423,20 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
 def props_view():
     """Display FanDuel vs Kalshi player prop comparison table."""
     try:
+        # Read props from file (shared across gunicorn processes)
+        comparisons = []
+        props_ts = None
+        try:
+            with open('/tmp/props_cache.json', 'r') as f:
+                props_data = json.load(f)
+                comparisons = props_data.get('comparisons', [])
+                props_ts = props_data.get('ts')
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
         with _scan_lock:
-            comparisons = list(_scan_cache.get('prop_comparisons', []))
-            scan_ts = _scan_cache['timestamp']
-            scan_count = _scan_cache['scan_count']
+            scan_ts = _scan_cache.get('timestamp') or props_ts
+            scan_count = _scan_cache.get('scan_count', 0)
 
         # Group by stat type for tab-like display
         stat_types = sorted(set(c['stat'] for c in comparisons)) if comparisons else []
