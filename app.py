@@ -1095,6 +1095,165 @@ class FanDuelAPI:
         print(f"   Fair value {sport_key} btts: {len(btts)} games")
         return {'btts': btts, 'games': games_dict}
 
+    def get_player_props_pregame(self, sport_key: str, market_keys: list) -> Dict:
+        """Get pre-game player prop lines from FD + Pinnacle, both Over and Under.
+        Devigs each book's over/under to get fair probability per player/threshold.
+        Fetches all market_keys in one API call per event (saves API quota).
+
+        Returns:
+        {
+            'props': {
+                event_id: [
+                    {
+                        'player': str,
+                        'point': float,             # e.g. 19.5 for "20+ points"
+                        'fair_over': float,          # consensus devigged over prob
+                        'fair_under': float,         # consensus devigged under prob
+                        'per_book_over': {book: prob},
+                        'per_book_under': {book: prob},
+                        'last_update': str,
+                        'market_key': str,
+                    },
+                    ...
+                ],
+            },
+            'games': {event_id: {'home': str, 'away': str, 'commence_time': str}},
+        }
+        """
+        props = {}
+        games_dict = {}
+
+        events = self.get_events(sport_key)
+        if not events:
+            print(f"   OddsAPI {sport_key} props: no events today")
+            return {'props': props, 'games': games_dict}
+
+        # Only pre-game events
+        pregame_events = [e for e in events if not is_game_live(e.get('commence_time', ''))]
+        if not pregame_events:
+            print(f"   OddsAPI {sport_key} props: no pre-game events")
+            return {'props': props, 'games': games_dict}
+
+        bookmakers_str = ','.join(FAIR_VALUE_BOOKS)
+        markets_str = ','.join(market_keys)
+        print(f"   OddsAPI {sport_key}: {len(pregame_events)} pre-game events, fetching {markets_str}...")
+
+        for event in pregame_events:
+            event_id = event.get('id', '')
+            home = event.get('home_team', '')
+            away = event.get('away_team', '')
+            commence = event.get('commence_time', '')
+            if home and away:
+                games_dict[event_id] = {'home': home, 'away': away, 'commence_time': commence}
+
+            try:
+                url = f"{self.base_url}/sports/{sport_key}/events/{event_id}/odds"
+                params = {
+                    'apiKey': self.api_key,
+                    'regions': 'us,us2',
+                    'markets': markets_str,
+                    'bookmakers': bookmakers_str,
+                    'oddsFormat': 'decimal',
+                }
+                response = requests.get(url, params=params, timeout=15)
+                response.raise_for_status()
+                data = response.json()
+
+                # Collect snapshots per (market_key, player, point) per book
+                # Structure: {(market_key, player, point): [{'book': str, 'over_odds': f, 'under_odds': f, 'last_update': str}]}
+                prop_snapshots = {}
+
+                for bm in data.get('bookmakers', []):
+                    book_key = bm['key']
+                    bm_last_update = bm.get('last_update', '')
+                    for mkt in bm.get('markets', []):
+                        mkt_key = mkt['key']
+                        if mkt_key not in market_keys:
+                            continue
+                        mkt_last_update = mkt.get('last_update', '') or bm_last_update
+
+                        # Group outcomes by (player, point): collect Over and Under
+                        player_lines = {}  # (player, point) -> {'over': odds, 'under': odds}
+                        for o in mkt.get('outcomes', []):
+                            player = o.get('description', '')
+                            point = o.get('point')
+                            if not player or point is None:
+                                continue
+                            key = (player, point)
+                            if key not in player_lines:
+                                player_lines[key] = {}
+                            if o['name'] == 'Over':
+                                player_lines[key]['over'] = o['price']
+                            elif o['name'] == 'Under':
+                                player_lines[key]['under'] = o['price']
+
+                        # Only keep entries that have both Over and Under (needed for devigging)
+                        for (player, point), sides in player_lines.items():
+                            if 'over' in sides and 'under' in sides:
+                                snap_key = (mkt_key, player, point)
+                                if snap_key not in prop_snapshots:
+                                    prop_snapshots[snap_key] = []
+                                prop_snapshots[snap_key].append({
+                                    'book': book_key,
+                                    'over_odds': sides['over'],
+                                    'under_odds': sides['under'],
+                                    'last_update': mkt_last_update,
+                                })
+
+                # Devig and build fair probabilities
+                event_props = []
+                for (mkt_key, player, point), snaps in prop_snapshots.items():
+                    # Require both FD and Pinnacle for pre-game devigging
+                    books_present = {s['book'] for s in snaps}
+                    pregame_snaps = [s for s in snaps if s['book'] in PREGAME_BOOKS]
+                    if not all(b in books_present for b in PREGAME_BOOKS):
+                        continue
+
+                    over_fair_list = []
+                    under_fair_list = []
+                    per_book_over = {}
+                    per_book_under = {}
+                    for snap in pregame_snaps:
+                        over_imp = 1.0 / snap['over_odds']
+                        under_imp = 1.0 / snap['under_odds']
+                        fair_over, fair_under = devig_two_way(over_imp, under_imp)
+                        over_fair_list.append(fair_over)
+                        under_fair_list.append(fair_under)
+                        per_book_over[snap['book']] = fair_over
+                        per_book_under[snap['book']] = fair_under
+
+                    fair_over = consensus_fair_prob(over_fair_list)
+                    fair_under = consensus_fair_prob(under_fair_list)
+                    if fair_over <= 0.001 or fair_under <= 0.001:
+                        continue
+
+                    best_update = max(s['last_update'] for s in pregame_snaps)
+                    event_props.append({
+                        'player': player,
+                        'point': point,
+                        'fair_over': fair_over,
+                        'fair_under': fair_under,
+                        'per_book_over': per_book_over,
+                        'per_book_under': per_book_under,
+                        'last_update': best_update,
+                        'market_key': mkt_key,
+                    })
+
+                if event_props:
+                    props[event_id] = event_props
+
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else 'unknown'
+                print(f"   OddsAPI {sport_key} event {event_id} props: HTTP {status}")
+            except Exception as e:
+                print(f"   OddsAPI {sport_key} event {event_id} props: {e}")
+
+            time.sleep(0.5)
+
+        total_props = sum(len(v) for v in props.values())
+        print(f"   Pregame props {sport_key}: {total_props} devigged lines in {len(props)} games")
+        return {'props': props, 'games': games_dict}
+
     def get_fd_live_props(self, sport_key: str, market_key: str) -> Dict:
         """Get FanDuel one-way (over) player prop lines for LIVE games only.
         Returns raw FD implied probabilities — no devigging."""
@@ -2213,6 +2372,203 @@ def find_live_prop_value(kalshi_api, fd_data, series_ticker, sport_name, fd_mark
             }
             edges.append(edge)
             send_telegram_notification(edge)
+
+    return edges
+
+
+# ============================================================
+# PRE-GAME PLAYER PROP EDGE FINDER (YES + NO)
+# ============================================================
+
+def find_pregame_prop_edges(kalshi_api, fd_data, prop_series_tickers, sport_name):
+    """
+    Compare devigged FD+Pinnacle player prop probabilities to Kalshi YES and NO prices.
+
+    For each player/threshold:
+    - YES edge: if devigged fair_over prob > Kalshi YES ask price after fees
+    - NO edge:  if devigged fair_under prob > Kalshi NO ask price after fees
+
+    prop_series_tickers: dict mapping market_key -> series_ticker
+        e.g. {'player_points': 'KXNBAPTS', 'player_rebounds': 'KXNBAREB', ...}
+    """
+    fd_props = fd_data['props']
+    fd_games = fd_data['games']
+    edges = []
+    date_strs = _get_today_date_strs()
+
+    # Determine team map for game verification
+    first_ticker = next(iter(prop_series_tickers.values()), '')
+    if 'NBA' in first_ticker:
+        prop_team_map = NBA_TEAMS
+    elif 'NHL' in first_ticker:
+        prop_team_map = NHL_TEAMS
+    else:
+        prop_team_map = {}
+
+    # Build team abbrev -> set of FD game_ids for game verification
+    fd_game_team_abbrs = {}
+    for game_id, ginfo in fd_games.items():
+        fd_game_team_abbrs[game_id] = set()
+        for abbr, full_name in prop_team_map.items():
+            if _name_matches(full_name, ginfo.get('home', '')) or _name_matches(full_name, ginfo.get('away', '')):
+                fd_game_team_abbrs[game_id].add(abbr)
+
+    # Build FD lookup: {(player_lower, point, market_key): prop_data_with_game_id}
+    fd_lookup = {}
+    for game_id, event_props in fd_props.items():
+        for prop in event_props:
+            key = (prop['player'].lower().strip(), prop['point'], prop['market_key'])
+            fd_lookup[key] = {**prop, 'game_id': game_id}
+
+    # Process each prop series ticker
+    for market_key, series_ticker in prop_series_tickers.items():
+        kalshi_markets = kalshi_api.get_markets(series_ticker)
+        today_markets = [m for m in kalshi_markets
+                         if any(ds in m.get('ticker', '') for ds in date_strs)]
+        if not today_markets:
+            continue
+
+        print(f"   Kalshi {series_ticker}: {len(today_markets)} markets today")
+
+        for m in today_markets:
+            ticker = m.get('ticker', '')
+            title = m.get('title', '')
+            subtitle = m.get('subtitle', '')
+
+            # Extract game teams from ticker
+            ticker_game_abbrs = set()
+            ticker_parts = ticker.split('-')
+            if len(ticker_parts) >= 2:
+                game_part = ticker_parts[1]
+                date_stripped = re.sub(r'^\d{2}[A-Z]{3}\d{2}', '', game_part)
+                if prop_team_map:
+                    team_abbr_set = set(prop_team_map.keys())
+                    for i in range(1, len(date_stripped)):
+                        t1, t2 = date_stripped[:i], date_stripped[i:]
+                        if t1 in team_abbr_set and t2 in team_abbr_set:
+                            ticker_game_abbrs = {t1, t2}
+                            break
+
+            # Extract player name and threshold: "Nikola Jokic: 25+ points"
+            prop_match = re.match(r'^(.+?):\s*(\d+\.?\d*)\+', title or subtitle or '')
+            if not prop_match:
+                continue
+
+            player_name = prop_match.group(1).strip()
+            kalshi_threshold = float(prop_match.group(2))
+            # Kalshi "20+" = Over 19.5 in sportsbook terms
+            fd_point = kalshi_threshold - 0.5
+
+            # Find matching FD prop by player name + point + market_key
+            best_fd = None
+            for (fd_player, fd_pt, fd_mk), fd_entry in fd_lookup.items():
+                if fd_mk != market_key:
+                    continue
+                if abs(fd_pt - fd_point) > 0.5:
+                    continue
+                if not _match_player_name(player_name, fd_entry['player']):
+                    continue
+                # Verify game teams match
+                if ticker_game_abbrs and fd_entry['game_id'] in fd_game_team_abbrs:
+                    game_abbrs = fd_game_team_abbrs[fd_entry['game_id']]
+                    if not ticker_game_abbrs.issubset(game_abbrs):
+                        continue
+                best_fd = fd_entry
+                break
+
+            if not best_fd:
+                continue
+
+            # Cross-book divergence check on the FD data itself
+            if books_diverge(best_fd.get('per_book_over', {})):
+                print(f"   Skipping {player_name} {kalshi_threshold}+ {market_key}: books diverge >10pp")
+                continue
+
+            # Get orderbook
+            ob = kalshi_api.get_orderbook(ticker)
+            if not ob:
+                continue
+            time.sleep(0.3)
+
+            fair_over = best_fd['fair_over']
+            fair_under = best_fd['fair_under']
+            game_id = best_fd['game_id']
+            game_info = fd_games.get(game_id, {})
+            game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
+
+            stat_label = market_key.replace('player_', '').replace('_', ' ').title()
+
+            # Check YES edge: fair_over > Kalshi YES ask after fees
+            yes_price = get_best_yes_price(ob)
+            if yes_price is not None and yes_price < 0.99:
+                fee = kalshi_fee(yes_price)
+                eff = yes_price + fee
+                total_implied = eff + fair_under  # Kalshi YES cost + fair NO prob
+                if total_implied < 1.0:
+                    profit = (1.0 / total_implied - 1) * 100
+                    if profit >= MIN_EDGE_PERCENT:
+                        edge = {
+                            'market_type': f'Prop {stat_label}',
+                            'sport': sport_name,
+                            'game': game_name,
+                            'team': f"{player_name} {kalshi_threshold}+",
+                            'opposite_team': f"Under {fd_point}",
+                            'kalshi_price': yes_price,
+                            'kalshi_price_after_fees': eff,
+                            'kalshi_prob_after_fees': eff * 100,
+                            'kalshi_method': f"YES {player_name} {kalshi_threshold}+ {stat_label}",
+                            'kalshi_ticker': ticker,
+                            'kalshi_side': 'yes',
+                            'fanduel_opposite_team': f"Under {fd_point}",
+                            'fanduel_opposite_odds': 1.0 / fair_under if fair_under > 0 else 0,
+                            'fanduel_opposite_prob': fair_under * 100,
+                            'total_implied_prob': total_implied * 100,
+                            'arbitrage_profit': profit,
+                            'is_live': False,
+                            'fair_value_mode': 'pregame/fd+pin',
+                            'per_book_detail': best_fd.get('per_book_under', {}),
+                            'odds_last_update': best_fd.get('last_update', ''),
+                            'recommendation': f"Buy YES {player_name} {kalshi_threshold}+ {stat_label} at ${yes_price:.2f}",
+                        }
+                        edges.append(edge)
+                        send_telegram_notification(edge)
+                        auto_trade_edge(edge, kalshi_api)
+
+            # Check NO edge: fair_under > Kalshi NO ask after fees
+            no_price = get_best_no_price(ob)
+            if no_price is not None and no_price < 0.99:
+                fee = kalshi_fee(no_price)
+                eff = no_price + fee
+                total_implied = eff + fair_over  # Kalshi NO cost + fair YES prob
+                if total_implied < 1.0:
+                    profit = (1.0 / total_implied - 1) * 100
+                    if profit >= MIN_EDGE_PERCENT:
+                        edge = {
+                            'market_type': f'Prop {stat_label}',
+                            'sport': sport_name,
+                            'game': game_name,
+                            'team': f"{player_name} Under {fd_point}",
+                            'opposite_team': f"{kalshi_threshold}+",
+                            'kalshi_price': no_price,
+                            'kalshi_price_after_fees': eff,
+                            'kalshi_prob_after_fees': eff * 100,
+                            'kalshi_method': f"NO {player_name} {kalshi_threshold}+ {stat_label}",
+                            'kalshi_ticker': ticker,
+                            'kalshi_side': 'no',
+                            'fanduel_opposite_team': f"Over {fd_point}",
+                            'fanduel_opposite_odds': 1.0 / fair_over if fair_over > 0 else 0,
+                            'fanduel_opposite_prob': fair_over * 100,
+                            'total_implied_prob': total_implied * 100,
+                            'arbitrage_profit': profit,
+                            'is_live': False,
+                            'fair_value_mode': 'pregame/fd+pin',
+                            'per_book_detail': best_fd.get('per_book_over', {}),
+                            'odds_last_update': best_fd.get('last_update', ''),
+                            'recommendation': f"Buy NO {player_name} {kalshi_threshold}+ {stat_label} at ${no_price:.2f}",
+                        }
+                        edges.append(edge)
+                        send_telegram_notification(edge)
+                        auto_trade_edge(edge, kalshi_api)
 
     return edges
 
@@ -3908,7 +4264,27 @@ def scan_all_sports(kalshi_api, fanduel_api):
         print(f"   {name}: {len(edges)} edges")
         time.sleep(1.0)
 
-    # 4. Live player props — DISABLED (The Odds API live data is unreliable)
+    # 4. Pre-game player prop edges (YES + NO comparison)
+    # Group PLAYER_PROP_SPORTS by sport_key so we fetch all stat types per game in one call
+    prop_sport_groups = {}  # sport_key -> {market_key: series_ticker, 'name': display_name}
+    for series_ticker, (sport_key, market_key, display_name) in PLAYER_PROP_SPORTS.items():
+        if sport_key not in prop_sport_groups:
+            prop_sport_groups[sport_key] = {'tickers': {}, 'name': display_name.split()[0]}  # 'NBA', 'NHL'
+        prop_sport_groups[sport_key]['tickers'][market_key] = series_ticker
+
+    for sport_key, group in prop_sport_groups.items():
+        group_name = f"{group['name']} Props"
+        print(f"\n--- {group_name} (pregame) ---")
+        market_keys = list(group['tickers'].keys())
+        fd = fanduel_api.get_player_props_pregame(sport_key, market_keys)
+        sports_scanned.append(group_name)
+        if not fd['props']:
+            continue
+        sports_with_games.append(group_name)
+        edges = find_pregame_prop_edges(kalshi_api, fd, group['tickers'], group_name)
+        all_edges.extend(edges)
+        print(f"   {group_name}: {len(edges)} edges")
+        time.sleep(1.0)
 
     # 5. BTTS markets
     for kalshi_series, (odds_key, name) in BTTS_SPORTS.items():
