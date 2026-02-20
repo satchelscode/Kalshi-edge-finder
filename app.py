@@ -881,7 +881,9 @@ class FanDuelAPI:
                 continue
             team_list = sorted(team_names)
 
+            label = 'live/pin' if game_live else 'pregame/fd+pin'
             fair_probs = {t: [] for t in team_list}
+            per_book_fair = {t: {} for t in team_list}
             spread_points = {t: [] for t in team_list}
             for snap in snaps_to_use:
                 outcomes = snap['outcomes']
@@ -892,14 +894,16 @@ class FanDuelAPI:
                 if total <= 0:
                     continue
                 for t in team_list:
-                    fair_probs[t].append(implied[t] / total)
+                    devigged = implied[t] / total
+                    fair_probs[t].append(devigged)
+                    per_book_fair[t][snap['book']] = devigged
                     spread_points[t].append(outcomes[t]['point'])
 
             if not all(len(v) > 0 for v in fair_probs.values()):
                 continue
 
             best_update = max(s['last_update'] for s in snaps_to_use)
-            game_spreads = {'_last_update': best_update}
+            game_spreads = {'_last_update': best_update, '_mode': label}
             skip_game = False
             for t in team_list:
                 fair_p = consensus_fair_prob(fair_probs[t])
@@ -913,6 +917,7 @@ class FanDuelAPI:
                     'odds': 1.0 / fair_p,
                     'fair_prob': fair_p,
                     'num_books': len(fair_probs[t]),
+                    'per_book': per_book_fair[t],
                 }
             if not skip_game and len(game_spreads) > 1:
                 spreads[game_id] = game_spreads
@@ -981,8 +986,11 @@ class FanDuelAPI:
             if not matching:
                 matching = snaps_to_use
 
+            label = 'live/pin' if game_live else 'pregame/fd+pin'
             over_fair_list = []
             under_fair_list = []
+            per_book_over = {}
+            per_book_under = {}
             for snap in matching:
                 d = snap['data']
                 over_imp = 1.0 / d['over_odds']
@@ -990,6 +998,8 @@ class FanDuelAPI:
                 fair_over, fair_under = devig_two_way(over_imp, under_imp)
                 over_fair_list.append(fair_over)
                 under_fair_list.append(fair_under)
+                per_book_over[snap['book']] = fair_over
+                per_book_under[snap['book']] = fair_under
 
             over_fair = consensus_fair_prob(over_fair_list)
             under_fair = consensus_fair_prob(under_fair_list)
@@ -1005,6 +1015,9 @@ class FanDuelAPI:
                 'under_fair_prob': under_fair,
                 'num_books': len(matching),
                 '_last_update': best_update,
+                '_mode': label,
+                'per_book_over': per_book_over,
+                'per_book_under': per_book_under,
             }
 
         print(f"   Fair value {sport_key} totals: {len(totals)} games")
@@ -1096,8 +1109,11 @@ class FanDuelAPI:
                         continue
                     snaps_to_use = pregame_snaps
 
+                label = 'live/pin' if game_live else 'pregame/fd+pin'
                 yes_fair_list = []
                 no_fair_list = []
+                per_book_yes = {}
+                per_book_no = {}
                 for snap in snaps_to_use:
                     d = snap['data']
                     yes_imp = 1.0 / d['yes_odds']
@@ -1105,6 +1121,8 @@ class FanDuelAPI:
                     fair_yes, fair_no = devig_two_way(yes_imp, no_imp)
                     yes_fair_list.append(fair_yes)
                     no_fair_list.append(fair_no)
+                    per_book_yes[snap['book']] = fair_yes
+                    per_book_no[snap['book']] = fair_no
 
                 yes_fair = consensus_fair_prob(yes_fair_list)
                 no_fair = consensus_fair_prob(no_fair_list)
@@ -1117,6 +1135,9 @@ class FanDuelAPI:
                     'no_odds': 1.0 / no_fair,
                     'num_books': len(snaps_to_use),
                     '_last_update': best_update,
+                    '_mode': label,
+                    'per_book_yes': per_book_yes,
+                    'per_book_no': per_book_no,
                 }
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else 'unknown'
@@ -1228,8 +1249,11 @@ class FanDuelAPI:
                     if not snaps_to_use:
                         continue
 
+                    label = 'live/pin' if game_live else 'pregame/fd+pin'
                     over_fair_list = []
                     under_fair_list = []
+                    per_book_over = {}
+                    per_book_under = {}
                     for snap in snaps_to_use:
                         d = snap['data']
                         over_imp = 1.0 / d['over_odds']
@@ -1237,6 +1261,8 @@ class FanDuelAPI:
                         fair_over, fair_under = devig_two_way(over_imp, under_imp)
                         over_fair_list.append(fair_over)
                         under_fair_list.append(fair_under)
+                        per_book_over[snap['book']] = fair_over
+                        per_book_under[snap['book']] = fair_under
                     over_fair = consensus_fair_prob(over_fair_list)
                     under_fair = consensus_fair_prob(under_fair_list)
                     if over_fair <= 0.001 or under_fair <= 0.001:
@@ -1249,6 +1275,9 @@ class FanDuelAPI:
                         'over_fair_prob': over_fair,
                         'under_fair_prob': under_fair,
                         'num_books': len(snaps_to_use),
+                        '_mode': label,
+                        'per_book_over': per_book_over,
+                        'per_book_under': per_book_under,
                     })
                 if game_props:
                     props[event_id] = game_props
@@ -1648,6 +1677,29 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                         'profit': profit,
                     })
 
+            # Build per-book opposite probs for 3-way outcomes
+            # For "YES on Team1", opposite = P(Team2) + P(Draw) per book
+            three_way_per_book = {}
+            for e_name, opp_outcomes in [(t1_name, [fd_t2, 'Draw']), (t2_name, [fd_t1, 'Draw']), ('Draw', [fd_t1, fd_t2])]:
+                book_opp = {}
+                all_books_set = set()
+                for oname in opp_outcomes:
+                    odata = fanduel_odds.get(oname, {})
+                    for bk, bp in odata.get('per_book', {}).items():
+                        all_books_set.add(bk)
+                for bk in all_books_set:
+                    total = 0
+                    have_all = True
+                    for oname in opp_outcomes:
+                        bp = fanduel_odds.get(oname, {}).get('per_book', {}).get(bk)
+                        if bp is None:
+                            have_all = False
+                            break
+                        total += bp
+                    if have_all:
+                        book_opp[bk] = total
+                three_way_per_book[e_name] = book_opp
+
             # Build edge dicts from 3-way entries
             game_edges = []
             for e in entries:
@@ -1671,6 +1723,8 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                     'total_implied_prob': (e['eff'] + e['fd_opp_prob']) * 100,
                     'arbitrage_profit': e['profit'],
                     'is_live': game_live,
+                    'fair_value_mode': fanduel_odds.get(fd_t1, {}).get('mode', ''),
+                    'per_book_detail': three_way_per_book.get(e['name'], {}),
                     'recommendation': f"Buy {e['method']} on Kalshi at ${e['price']:.2f} (Fair value: {e['fd_opp_prob']*100:.1f}%)",
                 }
                 game_edges.append(edge)
@@ -1909,6 +1963,8 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                     'total_implied_prob': total_implied * 100,
                     'arbitrage_profit': profit,
                     'is_live': game_live,
+                    'fair_value_mode': fd_game_spreads.get('_mode', ''),
+                    'per_book_detail': fd_opposite_spread.get('per_book', {}),
                     'recommendation': f"Buy YES {team_name} -{floor_strike} on Kalshi at ${yes_price:.2f} (Fair value: {fd_opposite_name} {fd_opposite_spread['point']} at {fd_opposite_odds:.2f})",
                 }
                 edges.append(edge)
@@ -2053,6 +2109,8 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                         'total_implied_prob': total_implied * 100,
                         'arbitrage_profit': profit,
                         'is_live': game_live,
+                        'fair_value_mode': fd_total.get('_mode', ''),
+                        'per_book_detail': fd_total.get('per_book_under', {}),
                         'recommendation': f"Buy YES Over {floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel Under {fd_line} at {fd_total['under_odds']:.2f})",
                     }
                     edges.append(edge)
@@ -2088,6 +2146,8 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                         'total_implied_prob': total_implied * 100,
                         'arbitrage_profit': profit,
                         'is_live': game_live,
+                        'fair_value_mode': fd_total.get('_mode', ''),
+                        'per_book_detail': fd_total.get('per_book_over', {}),
                         'recommendation': f"Buy NO (Under {floor_strike}) on Kalshi at ${under_cost:.2f} (FanDuel Over {fd_line} at {fd_total['over_odds']:.2f})",
                     }
                     edges.append(edge)
@@ -2134,6 +2194,8 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
                 'over_odds': prop['over_odds'],
                 'under_odds': prop['under_odds'],
                 'game_id': game_id,
+                '_mode': prop.get('_mode', ''),
+                'per_book_under': prop.get('per_book_under', {}),
             })
 
     # Build team abbrev -> set of FD game_ids for game verification
@@ -2256,6 +2318,8 @@ def find_player_prop_edges(kalshi_api, fd_data, series_ticker, sport_name, fd_ma
                 'total_implied_prob': total_implied * 100,
                 'arbitrage_profit': profit,
                 'is_live': game_live,
+                'fair_value_mode': best_fd_match.get('_mode', ''),
+                'per_book_detail': best_fd_match.get('per_book_under', {}),
                 'recommendation': f"Buy YES {player_name} {kalshi_line}+ on Kalshi at ${yes_price:.2f} (FanDuel Under {best_fd_match['point']} at {best_fd_match['under_odds']:.2f})",
             }
             edges.append(edge)
@@ -2381,6 +2445,8 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
                         'total_implied_prob': total_implied * 100,
                         'arbitrage_profit': profit,
                         'is_live': game_live,
+                        'fair_value_mode': fd_game_btts.get('_mode', ''),
+                        'per_book_detail': fd_game_btts.get('per_book_no', {}),
                         'recommendation': f"Buy YES BTTS on Kalshi at ${yes_price:.2f} (FanDuel BTTS No at {fd_game_btts['no_odds']:.2f})",
                     }
                     edges.append(edge)
@@ -2414,6 +2480,8 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
                         'total_implied_prob': total_implied * 100,
                         'arbitrage_profit': profit,
                         'is_live': game_live,
+                        'fair_value_mode': fd_game_btts.get('_mode', ''),
+                        'per_book_detail': fd_game_btts.get('per_book_yes', {}),
                         'recommendation': f"Buy NO BTTS on Kalshi at ${no_price:.2f} (FanDuel BTTS Yes at {fd_game_btts['yes_odds']:.2f})",
                     }
                     edges.append(edge)
@@ -2622,6 +2690,8 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
                     'total_implied_prob': total * 100,
                     'arbitrage_profit': profit,
                     'is_live': game_live,
+                    'fair_value_mode': fd_opp_data.get('mode', ''),
+                    'per_book_detail': fd_opp_data.get('per_book', {}),
                     'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (Fair value: {fd_opp_name} at {fd_opp_data['odds']:.2f})",
                 }
                 match_edges.append(edge)
