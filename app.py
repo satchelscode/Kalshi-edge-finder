@@ -4429,6 +4429,33 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
         return f"<h1 style='color:red'>Error</h1><pre>{e}</pre>", 500
 
 
+def _test_kalshi_props():
+    """Test helper: check what Kalshi returns for NBA prop series tickers."""
+    try:
+        kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+        date_strs = _get_today_date_strs()
+        result = {}
+        for series_ticker in ['KXNBAPTS', 'KXNBAREB', 'KXNBAAST', 'KXNBA3PT']:
+            markets = kalshi.get_markets(series_ticker)
+            today = [m for m in markets if any(ds in m.get('ticker', '') for ds in date_strs)]
+            sample_tickers = [m.get('ticker', '') for m in today[:3]]
+            sample_titles = [m.get('title', '') for m in today[:3]]
+            result[series_ticker] = {
+                'total_markets': len(markets),
+                'today_markets': len(today),
+                'sample_tickers': sample_tickers,
+                'sample_titles': sample_titles,
+            }
+            if markets and not today:
+                # Show what dates exist in the market tickers
+                all_tickers = [m.get('ticker', '') for m in markets[:5]]
+                result[series_ticker]['sample_all_tickers'] = all_tickers
+            time.sleep(0.3)
+        return result
+    except Exception as e:
+        return {'error': str(e)}
+
+
 @app.route('/api/test-props')
 def test_props():
     """Debug endpoint: fetch one NBA event's player props from The Odds API and show raw response."""
@@ -4511,6 +4538,9 @@ def test_props():
             'api_response_status': raw_status,
             'bookmakers_found': [bm['key'] for bm in raw_data.get('bookmakers', [])],
             'bookmakers_detail': bookmakers_summary,
+            'kalshi_check': _test_kalshi_props(),
+            'date_strs': list(_get_today_date_strs()),
+            'scan_cache_prop_count': len(_scan_cache.get('prop_comparisons', [])),
         })
     except Exception as e:
         import traceback
