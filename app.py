@@ -245,6 +245,7 @@ _scan_cache = {
     'timestamp': None,
     'scan_count': 0,
     'is_scanning': False,
+    'prop_comparisons': [],
 }
 SCAN_REST_SECONDS = 30  # Rest between scans
 
@@ -1096,8 +1097,8 @@ class FanDuelAPI:
         return {'btts': btts, 'games': games_dict}
 
     def get_player_props_pregame(self, sport_key: str, market_keys: list) -> Dict:
-        """Get pre-game player prop lines from FD + Pinnacle, both Over and Under.
-        Devigs each book's over/under to get fair probability per player/threshold.
+        """Get FanDuel one-way player prop lines for pre-game events.
+        Returns raw FanDuel Over implied probabilities (no devigging, no Pinnacle).
         Fetches all market_keys in one API call per event (saves API quota).
 
         Returns:
@@ -1106,11 +1107,10 @@ class FanDuelAPI:
                 event_id: [
                     {
                         'player': str,
-                        'point': float,             # e.g. 19.5 for "20+ points"
-                        'fair_over': float,          # consensus devigged over prob
-                        'fair_under': float,         # consensus devigged under prob
-                        'per_book_over': {book: prob},
-                        'per_book_under': {book: prob},
+                        'point': float,            # e.g. 9.5 for "10+ points"
+                        'over_odds': float,         # FD decimal odds
+                        'fd_implied': float,         # 1/over_odds (raw implied prob)
+                        'american_odds': int,        # American odds for display
                         'last_update': str,
                         'market_key': str,
                     },
@@ -1134,7 +1134,6 @@ class FanDuelAPI:
             print(f"   OddsAPI {sport_key} props: no pre-game events")
             return {'props': props, 'games': games_dict}
 
-        bookmakers_str = ','.join(FAIR_VALUE_BOOKS)
         markets_str = ','.join(market_keys)
         print(f"   OddsAPI {sport_key}: {len(pregame_events)} pre-game events, fetching {markets_str}...")
 
@@ -1152,92 +1151,46 @@ class FanDuelAPI:
                     'apiKey': self.api_key,
                     'regions': 'us,us2',
                     'markets': markets_str,
-                    'bookmakers': bookmakers_str,
+                    'bookmakers': 'fanduel',
                     'oddsFormat': 'decimal',
                 }
                 response = requests.get(url, params=params, timeout=15)
                 response.raise_for_status()
                 data = response.json()
 
-                # Collect snapshots per (market_key, player, point) per book
-                # Structure: {(market_key, player, point): [{'book': str, 'over_odds': f, 'under_odds': f, 'last_update': str}]}
-                prop_snapshots = {}
-
+                event_props = []
                 for bm in data.get('bookmakers', []):
-                    book_key = bm['key']
+                    if bm['key'] != 'fanduel':
+                        continue
                     bm_last_update = bm.get('last_update', '')
                     for mkt in bm.get('markets', []):
                         mkt_key = mkt['key']
                         if mkt_key not in market_keys:
                             continue
                         mkt_last_update = mkt.get('last_update', '') or bm_last_update
-
-                        # Group outcomes by (player, point): collect Over and Under
-                        player_lines = {}  # (player, point) -> {'over': odds, 'under': odds}
                         for o in mkt.get('outcomes', []):
+                            if o.get('name') != 'Over':
+                                continue
                             player = o.get('description', '')
                             point = o.get('point')
                             if not player or point is None:
                                 continue
-                            key = (player, point)
-                            if key not in player_lines:
-                                player_lines[key] = {}
-                            if o['name'] == 'Over':
-                                player_lines[key]['over'] = o['price']
-                            elif o['name'] == 'Under':
-                                player_lines[key]['under'] = o['price']
-
-                        # Only keep entries that have both Over and Under (needed for devigging)
-                        for (player, point), sides in player_lines.items():
-                            if 'over' in sides and 'under' in sides:
-                                snap_key = (mkt_key, player, point)
-                                if snap_key not in prop_snapshots:
-                                    prop_snapshots[snap_key] = []
-                                prop_snapshots[snap_key].append({
-                                    'book': book_key,
-                                    'over_odds': sides['over'],
-                                    'under_odds': sides['under'],
-                                    'last_update': mkt_last_update,
-                                })
-
-                # Devig and build fair probabilities
-                event_props = []
-                for (mkt_key, player, point), snaps in prop_snapshots.items():
-                    # Require both FD and Pinnacle for pre-game devigging
-                    books_present = {s['book'] for s in snaps}
-                    pregame_snaps = [s for s in snaps if s['book'] in PREGAME_BOOKS]
-                    if not all(b in books_present for b in PREGAME_BOOKS):
-                        continue
-
-                    over_fair_list = []
-                    under_fair_list = []
-                    per_book_over = {}
-                    per_book_under = {}
-                    for snap in pregame_snaps:
-                        over_imp = 1.0 / snap['over_odds']
-                        under_imp = 1.0 / snap['under_odds']
-                        fair_over, fair_under = devig_two_way(over_imp, under_imp)
-                        over_fair_list.append(fair_over)
-                        under_fair_list.append(fair_under)
-                        per_book_over[snap['book']] = fair_over
-                        per_book_under[snap['book']] = fair_under
-
-                    fair_over = consensus_fair_prob(over_fair_list)
-                    fair_under = consensus_fair_prob(under_fair_list)
-                    if fair_over <= 0.001 or fair_under <= 0.001:
-                        continue
-
-                    best_update = max(s['last_update'] for s in pregame_snaps)
-                    event_props.append({
-                        'player': player,
-                        'point': point,
-                        'fair_over': fair_over,
-                        'fair_under': fair_under,
-                        'per_book_over': per_book_over,
-                        'per_book_under': per_book_under,
-                        'last_update': best_update,
-                        'market_key': mkt_key,
-                    })
+                            decimal_odds = o['price']
+                            fd_implied = 1.0 / decimal_odds
+                            # Convert to American for display
+                            if decimal_odds >= 2.0:
+                                american = int(round((decimal_odds - 1) * 100))
+                            else:
+                                american = int(round(-100 / (decimal_odds - 1)))
+                            event_props.append({
+                                'player': player,
+                                'point': point,
+                                'over_odds': decimal_odds,
+                                'fd_implied': fd_implied,
+                                'american_odds': american,
+                                'last_update': mkt_last_update,
+                                'market_key': mkt_key,
+                            })
 
                 if event_props:
                     props[event_id] = event_props
@@ -1251,7 +1204,7 @@ class FanDuelAPI:
             time.sleep(0.5)
 
         total_props = sum(len(v) for v in props.values())
-        print(f"   Pregame props {sport_key}: {total_props} devigged lines in {len(props)} games")
+        print(f"   FD pregame props {sport_key}: {total_props} lines in {len(props)} games")
         return {'props': props, 'games': games_dict}
 
     def get_fd_live_props(self, sport_key: str, market_key: str) -> Dict:
@@ -2377,23 +2330,24 @@ def find_live_prop_value(kalshi_api, fd_data, series_ticker, sport_name, fd_mark
 
 
 # ============================================================
-# PRE-GAME PLAYER PROP EDGE FINDER (YES + NO)
+# PRE-GAME PLAYER PROP COMPARISON (FD one-way vs Kalshi YES/NO)
 # ============================================================
 
-def find_pregame_prop_edges(kalshi_api, fd_data, prop_series_tickers, sport_name):
+def compare_pregame_props(kalshi_api, fd_data, prop_series_tickers, sport_name):
     """
-    Compare devigged FD+Pinnacle player prop probabilities to Kalshi YES and NO prices.
+    Compare FanDuel one-way player prop odds to Kalshi YES/NO prices.
+    Returns comparison data for display (not just edges).
 
-    For each player/threshold:
-    - YES edge: if devigged fair_over prob > Kalshi YES ask price after fees
-    - NO edge:  if devigged fair_under prob > Kalshi NO ask price after fees
+    For each matched player/threshold:
+    - FD American odds + implied prob (raw, one-way)
+    - Kalshi YES ask + NO ask prices
+    - Difference between FD implied and Kalshi price
 
     prop_series_tickers: dict mapping market_key -> series_ticker
-        e.g. {'player_points': 'KXNBAPTS', 'player_rebounds': 'KXNBAREB', ...}
     """
     fd_props = fd_data['props']
     fd_games = fd_data['games']
-    edges = []
+    comparisons = []
     date_strs = _get_today_date_strs()
 
     # Determine team map for game verification
@@ -2405,7 +2359,7 @@ def find_pregame_prop_edges(kalshi_api, fd_data, prop_series_tickers, sport_name
     else:
         prop_team_map = {}
 
-    # Build team abbrev -> set of FD game_ids for game verification
+    # Build team abbrev -> set of FD game_ids
     fd_game_team_abbrs = {}
     for game_id, ginfo in fd_games.items():
         fd_game_team_abbrs[game_id] = set()
@@ -2428,7 +2382,8 @@ def find_pregame_prop_edges(kalshi_api, fd_data, prop_series_tickers, sport_name
         if not today_markets:
             continue
 
-        print(f"   Kalshi {series_ticker}: {len(today_markets)} markets today")
+        stat_label = market_key.replace('player_', '').replace('_', ' ').title()
+        print(f"   Kalshi {series_ticker}: {len(today_markets)} {stat_label} markets today")
 
         for m in today_markets:
             ticker = m.get('ticker', '')
@@ -2456,10 +2411,9 @@ def find_pregame_prop_edges(kalshi_api, fd_data, prop_series_tickers, sport_name
 
             player_name = prop_match.group(1).strip()
             kalshi_threshold = float(prop_match.group(2))
-            # Kalshi "20+" = Over 19.5 in sportsbook terms
-            fd_point = kalshi_threshold - 0.5
+            fd_point = kalshi_threshold - 0.5  # Kalshi "20+" = FD Over 19.5
 
-            # Find matching FD prop by player name + point + market_key
+            # Find matching FD prop
             best_fd = None
             for (fd_player, fd_pt, fd_mk), fd_entry in fd_lookup.items():
                 if fd_mk != market_key:
@@ -2468,7 +2422,6 @@ def find_pregame_prop_edges(kalshi_api, fd_data, prop_series_tickers, sport_name
                     continue
                 if not _match_player_name(player_name, fd_entry['player']):
                     continue
-                # Verify game teams match
                 if ticker_game_abbrs and fd_entry['game_id'] in fd_game_team_abbrs:
                     game_abbrs = fd_game_team_abbrs[fd_entry['game_id']]
                     if not ticker_game_abbrs.issubset(game_abbrs):
@@ -2476,101 +2429,44 @@ def find_pregame_prop_edges(kalshi_api, fd_data, prop_series_tickers, sport_name
                 best_fd = fd_entry
                 break
 
-            if not best_fd:
-                continue
-
-            # Cross-book divergence check on the FD data itself
-            if books_diverge(best_fd.get('per_book_over', {})):
-                print(f"   Skipping {player_name} {kalshi_threshold}+ {market_key}: books diverge >10pp")
-                continue
-
-            # Get orderbook
+            # Get orderbook (even if no FD match, to show Kalshi-only data)
             ob = kalshi_api.get_orderbook(ticker)
             if not ob:
                 continue
-            time.sleep(0.3)
+            time.sleep(0.15)
 
-            fair_over = best_fd['fair_over']
-            fair_under = best_fd['fair_under']
-            game_id = best_fd['game_id']
-            game_info = fd_games.get(game_id, {})
-            game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
-
-            stat_label = market_key.replace('player_', '').replace('_', ' ').title()
-
-            # Check YES edge: fair_over > Kalshi YES ask after fees
             yes_price = get_best_yes_price(ob)
-            if yes_price is not None and yes_price < 0.99:
-                fee = kalshi_fee(yes_price)
-                eff = yes_price + fee
-                total_implied = eff + fair_under  # Kalshi YES cost + fair NO prob
-                if total_implied < 1.0:
-                    profit = (1.0 / total_implied - 1) * 100
-                    if profit >= MIN_EDGE_PERCENT:
-                        edge = {
-                            'market_type': f'Prop {stat_label}',
-                            'sport': sport_name,
-                            'game': game_name,
-                            'team': f"{player_name} {kalshi_threshold}+",
-                            'opposite_team': f"Under {fd_point}",
-                            'kalshi_price': yes_price,
-                            'kalshi_price_after_fees': eff,
-                            'kalshi_prob_after_fees': eff * 100,
-                            'kalshi_method': f"YES {player_name} {kalshi_threshold}+ {stat_label}",
-                            'kalshi_ticker': ticker,
-                            'kalshi_side': 'yes',
-                            'fanduel_opposite_team': f"Under {fd_point}",
-                            'fanduel_opposite_odds': 1.0 / fair_under if fair_under > 0 else 0,
-                            'fanduel_opposite_prob': fair_under * 100,
-                            'total_implied_prob': total_implied * 100,
-                            'arbitrage_profit': profit,
-                            'is_live': False,
-                            'fair_value_mode': 'pregame/fd+pin',
-                            'per_book_detail': best_fd.get('per_book_under', {}),
-                            'odds_last_update': best_fd.get('last_update', ''),
-                            'recommendation': f"Buy YES {player_name} {kalshi_threshold}+ {stat_label} at ${yes_price:.2f}",
-                        }
-                        edges.append(edge)
-                        send_telegram_notification(edge)
-                        auto_trade_edge(edge, kalshi_api)
-
-            # Check NO edge: fair_under > Kalshi NO ask after fees
             no_price = get_best_no_price(ob)
-            if no_price is not None and no_price < 0.99:
-                fee = kalshi_fee(no_price)
-                eff = no_price + fee
-                total_implied = eff + fair_over  # Kalshi NO cost + fair YES prob
-                if total_implied < 1.0:
-                    profit = (1.0 / total_implied - 1) * 100
-                    if profit >= MIN_EDGE_PERCENT:
-                        edge = {
-                            'market_type': f'Prop {stat_label}',
-                            'sport': sport_name,
-                            'game': game_name,
-                            'team': f"{player_name} Under {fd_point}",
-                            'opposite_team': f"{kalshi_threshold}+",
-                            'kalshi_price': no_price,
-                            'kalshi_price_after_fees': eff,
-                            'kalshi_prob_after_fees': eff * 100,
-                            'kalshi_method': f"NO {player_name} {kalshi_threshold}+ {stat_label}",
-                            'kalshi_ticker': ticker,
-                            'kalshi_side': 'no',
-                            'fanduel_opposite_team': f"Over {fd_point}",
-                            'fanduel_opposite_odds': 1.0 / fair_over if fair_over > 0 else 0,
-                            'fanduel_opposite_prob': fair_over * 100,
-                            'total_implied_prob': total_implied * 100,
-                            'arbitrage_profit': profit,
-                            'is_live': False,
-                            'fair_value_mode': 'pregame/fd+pin',
-                            'per_book_detail': best_fd.get('per_book_over', {}),
-                            'odds_last_update': best_fd.get('last_update', ''),
-                            'recommendation': f"Buy NO {player_name} {kalshi_threshold}+ {stat_label} at ${no_price:.2f}",
-                        }
-                        edges.append(edge)
-                        send_telegram_notification(edge)
-                        auto_trade_edge(edge, kalshi_api)
 
-    return edges
+            game_name = ''
+            if best_fd:
+                game_info = fd_games.get(best_fd['game_id'], {})
+                game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
+
+            comp = {
+                'player': player_name,
+                'stat': stat_label,
+                'threshold': int(kalshi_threshold) if kalshi_threshold == int(kalshi_threshold) else kalshi_threshold,
+                'game': game_name,
+                'ticker': ticker,
+                # FD side
+                'fd_matched': best_fd is not None,
+                'fd_american': best_fd['american_odds'] if best_fd else None,
+                'fd_implied': best_fd['fd_implied'] * 100 if best_fd else None,
+                'fd_player': best_fd['player'] if best_fd else None,
+                'fd_point': best_fd['point'] if best_fd else None,
+                # Kalshi side
+                'kalshi_yes': yes_price,
+                'kalshi_no': no_price,
+                'kalshi_yes_pct': yes_price * 100 if yes_price else None,
+                'kalshi_no_pct': no_price * 100 if no_price else None,
+                # Difference (FD implied - Kalshi YES = how much cheaper Kalshi is)
+                'diff_yes': (best_fd['fd_implied'] * 100 - yes_price * 100) if best_fd and yes_price else None,
+                'diff_no': ((1 - best_fd['fd_implied']) * 100 - no_price * 100) if best_fd and no_price else None,
+            }
+            comparisons.append(comp)
+
+    return comparisons
 
 
 # ============================================================
@@ -4264,8 +4160,9 @@ def scan_all_sports(kalshi_api, fanduel_api):
         print(f"   {name}: {len(edges)} edges")
         time.sleep(1.0)
 
-    # 4. Pre-game player prop edges (YES + NO comparison)
+    # 4. Pre-game player prop comparison (FD one-way vs Kalshi YES/NO)
     # Group PLAYER_PROP_SPORTS by sport_key so we fetch all stat types per game in one call
+    all_prop_comparisons = []
     prop_sport_groups = {}  # sport_key -> {market_key: series_ticker, 'name': display_name}
     for series_ticker, (sport_key, market_key, display_name) in PLAYER_PROP_SPORTS.items():
         if sport_key not in prop_sport_groups:
@@ -4281,10 +4178,15 @@ def scan_all_sports(kalshi_api, fanduel_api):
         if not fd['props']:
             continue
         sports_with_games.append(group_name)
-        edges = find_pregame_prop_edges(kalshi_api, fd, group['tickers'], group_name)
-        all_edges.extend(edges)
-        print(f"   {group_name}: {len(edges)} edges")
+        comps = compare_pregame_props(kalshi_api, fd, group['tickers'], group_name)
+        all_prop_comparisons.extend(comps)
+        matched = sum(1 for c in comps if c['fd_matched'])
+        print(f"   {group_name}: {len(comps)} Kalshi markets, {matched} matched to FD")
         time.sleep(1.0)
+
+    # Store prop comparisons in scan cache for /props route
+    with _scan_lock:
+        _scan_cache['prop_comparisons'] = all_prop_comparisons
 
     # 5. BTTS markets
     for kalshi_series, (odds_key, name) in BTTS_SPORTS.items():
@@ -4474,7 +4376,7 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
 .no-edge {{ text-align: center; padding: 50px 20px; color: #888; }}
 </style></head><body><div class="container">
 <h1>Kalshi Edge Finder</h1>
-<div class="sub">Background Scanner: Scan #{scan_count} {'🔄 SCANNING...' if is_scanning else '✓ idle'} | Last: {scan_ts[:19] if scan_ts else 'waiting...'} | <a href="/orders" style="color:#3498db">Orders ({_order_tracker.get_open_count()})</a> | <a href="/history" style="color:#e67e22">History</a></div>
+<div class="sub">Background Scanner: Scan #{scan_count} {'🔄 SCANNING...' if is_scanning else '✓ idle'} | Last: {scan_ts[:19] if scan_ts else 'waiting...'} | <a href="/props" style="color:#9b59b6">Props</a> | <a href="/orders" style="color:#3498db">Orders ({_order_tracker.get_open_count()})</a> | <a href="/history" style="color:#e67e22">History</a></div>
 <div class="info">Scanning: {', '.join(scanned)} | Active: {', '.join(active) if active else 'None'}</div>
 <div class="count">"""
 
@@ -4504,6 +4406,151 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
 
     except Exception as e:
         return f"<h1 style='color:red'>Error</h1><pre>{e}</pre>", 500
+
+
+@app.route('/props')
+def props_view():
+    """Display FanDuel vs Kalshi player prop comparison table."""
+    try:
+        with _scan_lock:
+            comparisons = list(_scan_cache.get('prop_comparisons', []))
+            scan_ts = _scan_cache['timestamp']
+            scan_count = _scan_cache['scan_count']
+
+        # Group by stat type for tab-like display
+        stat_types = sorted(set(c['stat'] for c in comparisons)) if comparisons else []
+
+        html = f"""<!DOCTYPE html>
+<html><head>
+<title>Player Props - FD vs Kalshi</title>
+<meta http-equiv="refresh" content="60">
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #1a1a2e, #16213e); color: #eee; min-height: 100vh; }}
+.container {{ max-width: 1400px; margin: 0 auto; }}
+h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
+.sub {{ text-align: center; color: #aaa; margin-bottom: 20px; }}
+.nav {{ text-align: center; margin-bottom: 15px; }}
+.nav a {{ color: #3498db; text-decoration: none; margin: 0 12px; font-size: 0.95em; }}
+.nav a:hover {{ color: #00ff88; }}
+.tabs {{ display: flex; gap: 8px; margin-bottom: 15px; flex-wrap: wrap; }}
+.tab {{ padding: 8px 16px; border-radius: 6px; cursor: pointer; background: #0f3460; color: #aaa; border: 1px solid #2a2a3e; font-size: 0.9em; }}
+.tab.active {{ background: #00ff88; color: #1a1a2e; font-weight: bold; border-color: #00ff88; }}
+.tab:hover {{ border-color: #00ff88; }}
+.summary {{ text-align: center; padding: 10px; background: #0f3460; border-radius: 8px; margin-bottom: 15px; font-size: 0.95em; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 0.85em; }}
+th {{ background: #0f3460; padding: 10px 8px; text-align: left; border-bottom: 2px solid #00ff88; white-space: nowrap; position: sticky; top: 0; }}
+td {{ padding: 8px; border-bottom: 1px solid #2a2a3e; }}
+tr:hover {{ background: rgba(0,255,136,0.05); }}
+.pos {{ color: #00ff88; font-weight: bold; }}
+.neg {{ color: #ff6b6b; }}
+.neutral {{ color: #888; }}
+.no-match {{ color: #666; font-style: italic; }}
+.game-header {{ background: #0a1628; padding: 10px; font-weight: bold; color: #3498db; border-bottom: 2px solid #3498db; }}
+.stat-section {{ display: none; }}
+.stat-section.active {{ display: block; }}
+</style>
+</head><body><div class="container">
+<h1>Player Props: FD vs Kalshi</h1>
+<div class="sub">Scan #{scan_count} | Last: {scan_ts[:19] if scan_ts else 'waiting...'}</div>
+<div class="nav"><a href="/debug">Edges</a> | <a href="/props"><strong>Props</strong></a> | <a href="/orders">Orders</a> | <a href="/history">History</a></div>
+"""
+
+        if not comparisons:
+            html += '<div class="summary">No prop data yet. Waiting for background scan...</div>'
+        else:
+            matched = sum(1 for c in comparisons if c['fd_matched'])
+            html += f'<div class="summary"><strong>{len(comparisons)}</strong> Kalshi props found | <strong>{matched}</strong> matched to FanDuel | <strong>{len(comparisons) - matched}</strong> unmatched</div>'
+
+            # Stat type tabs
+            html += '<div class="tabs">'
+            html += '<div class="tab active" onclick="showStat(\'all\')">All</div>'
+            for st in stat_types:
+                html += f'<div class="tab" onclick="showStat(\'{st}\')">{st}</div>'
+            html += '</div>'
+
+            # Sort: matched first (by diff_yes desc), then unmatched
+            matched_comps = sorted(
+                [c for c in comparisons if c['fd_matched']],
+                key=lambda c: c.get('diff_yes') or -999, reverse=True
+            )
+            unmatched_comps = [c for c in comparisons if not c['fd_matched']]
+
+            # Build table
+            html += '<table>'
+            html += '<tr><th>Player</th><th>Stat</th><th>Threshold</th><th>Game</th>'
+            html += '<th>FD Odds</th><th>FD Implied%</th>'
+            html += '<th>Kalshi YES</th><th>Kalshi NO</th>'
+            html += '<th>YES Diff</th><th>NO Diff</th></tr>'
+
+            # Matched rows
+            for c in matched_comps:
+                stat_class = f'stat-{c["stat"]}'
+                fd_odds_str = f"{c['fd_american']:+d}" if c['fd_american'] else '—'
+                fd_pct = f"{c['fd_implied']:.1f}%" if c['fd_implied'] else '—'
+                k_yes = f"${c['kalshi_yes']:.2f} ({c['kalshi_yes_pct']:.0f}%)" if c['kalshi_yes'] else '—'
+                k_no = f"${c['kalshi_no']:.2f} ({c['kalshi_no_pct']:.0f}%)" if c['kalshi_no'] else '—'
+
+                # YES diff: positive = FD thinks more likely than Kalshi price (potential YES buy)
+                if c['diff_yes'] is not None:
+                    d = c['diff_yes']
+                    cls = 'pos' if d > 2 else ('neg' if d < -2 else 'neutral')
+                    yes_diff = f'<span class="{cls}">{d:+.1f}pp</span>'
+                else:
+                    yes_diff = '—'
+
+                # NO diff: positive = FD thinks less likely than Kalshi implies (potential NO buy)
+                if c['diff_no'] is not None:
+                    d = c['diff_no']
+                    cls = 'pos' if d > 2 else ('neg' if d < -2 else 'neutral')
+                    no_diff = f'<span class="{cls}">{d:+.1f}pp</span>'
+                else:
+                    no_diff = '—'
+
+                threshold_str = f"{c['threshold']}+"
+                html += f'<tr class="stat-row {stat_class}" data-stat="{c["stat"]}">'
+                html += f'<td><strong>{c["player"]}</strong></td>'
+                html += f'<td>{c["stat"]}</td><td>{threshold_str}</td><td>{c["game"]}</td>'
+                html += f'<td>{fd_odds_str}</td><td>{fd_pct}</td>'
+                html += f'<td>{k_yes}</td><td>{k_no}</td>'
+                html += f'<td>{yes_diff}</td><td>{no_diff}</td></tr>'
+
+            # Unmatched rows
+            if unmatched_comps:
+                html += '<tr class="game-header"><td colspan="10">Unmatched (Kalshi only — no FD data)</td></tr>'
+                for c in unmatched_comps:
+                    stat_class = f'stat-{c["stat"]}'
+                    k_yes = f"${c['kalshi_yes']:.2f}" if c['kalshi_yes'] else '—'
+                    k_no = f"${c['kalshi_no']:.2f}" if c['kalshi_no'] else '—'
+                    threshold_str = f"{c['threshold']}+"
+                    html += f'<tr class="stat-row {stat_class} no-match" data-stat="{c["stat"]}">'
+                    html += f'<td>{c["player"]}</td>'
+                    html += f'<td>{c["stat"]}</td><td>{threshold_str}</td><td>—</td>'
+                    html += f'<td>—</td><td>—</td>'
+                    html += f'<td>{k_yes}</td><td>{k_no}</td>'
+                    html += f'<td>—</td><td>—</td></tr>'
+
+            html += '</table>'
+
+        html += """
+<script>
+function showStat(stat) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    event.target.classList.add('active');
+    document.querySelectorAll('.stat-row').forEach(row => {
+        if (stat === 'all' || row.dataset.stat === stat) {
+            row.style.display = '';
+        } else {
+            row.style.display = 'none';
+        }
+    });
+}
+</script>"""
+        html += "</div></body></html>"
+        return html
+
+    except Exception as e:
+        import traceback
+        return f"<h1 style='color:red'>Error</h1><pre>{traceback.format_exc()}</pre>", 500
 
 
 def _lookup_team_name(abbrev: str, series_prefix: str = '') -> Optional[str]:
