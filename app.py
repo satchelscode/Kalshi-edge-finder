@@ -4140,9 +4140,18 @@ def scan_all_sports(kalshi_api, fanduel_api):
         print(f"   {group_name}: {len(comps)} FD-matched props compared")
         time.sleep(1.0)
 
-    # Store prop comparisons immediately so /props page has data ASAP
+    # Store prop comparisons to file (shared across gunicorn processes)
     with _scan_lock:
         _scan_cache['prop_comparisons'] = all_prop_comparisons
+    try:
+        import tempfile
+        props_file = '/tmp/props_cache.json'
+        tmp_file = props_file + '.tmp'
+        with open(tmp_file, 'w') as f:
+            json.dump({'comparisons': all_prop_comparisons, 'ts': datetime.utcnow().isoformat()}, f)
+        os.replace(tmp_file, props_file)
+    except Exception as e:
+        print(f"   Warning: failed to write props cache file: {e}")
     print(f"   Prop comparisons cached: {len(all_prop_comparisons)} total")
 
     # 2. Moneyline markets
@@ -4414,21 +4423,31 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
 def props_view():
     """Display FanDuel vs Kalshi player prop comparison table."""
     try:
-        with _scan_lock:
-            comparisons = list(_scan_cache.get('prop_comparisons', []))
-            scan_ts = _scan_cache['timestamp']
-            scan_count = _scan_cache['scan_count']
-            cache_keys = list(_scan_cache.keys())
+        # Read props from file (shared across gunicorn processes)
+        comparisons = []
+        props_ts = None
+        try:
+            with open('/tmp/props_cache.json', 'r') as f:
+                props_data = json.load(f)
+                comparisons = props_data.get('comparisons', [])
+                props_ts = props_data.get('ts')
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
 
-        print(f"PROPS ROUTE: {len(comparisons)} comparisons, scan #{scan_count}, cache keys={cache_keys}, cache id={id(_scan_cache)}")
+        with _scan_lock:
+            scan_ts = _scan_cache.get('timestamp') or props_ts
+            scan_count = _scan_cache.get('scan_count', 0)
 
         # Group by stat type for tab-like display
         stat_types = sorted(set(c['stat'] for c in comparisons)) if comparisons else []
 
+        # Refresh every 10s while waiting for first scan, 60s once data is loaded
+        refresh_secs = 10 if not comparisons else 60
+
         html = f"""<!DOCTYPE html>
 <html><head>
 <title>Player Props - FD vs Kalshi</title>
-<meta http-equiv="refresh" content="60">
+<meta http-equiv="refresh" content="{refresh_secs}">
 <style>
 body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #1a1a2e, #16213e); color: #eee; min-height: 100vh; }}
 .container {{ max-width: 1400px; margin: 0 auto; }}
@@ -4461,7 +4480,7 @@ tr:hover {{ background: rgba(0,255,136,0.05); }}
 """
 
         if not comparisons:
-            html += '<div class="summary">No prop data yet. Waiting for background scan...</div>'
+            html += '<div class="summary">Loading prop data... first scan takes ~2 minutes after deploy. Auto-refreshing every 10s.</div>'
         else:
             matched = sum(1 for c in comparisons if c['fd_matched'])
             html += f'<div class="summary"><strong>{len(comparisons)}</strong> FD-matched props compared</div>'
