@@ -6007,14 +6007,12 @@ def scan_all_sports(kalshi_api, fanduel_api):
     if completed or nhl_tied:
         sports_with_games.append('Live Props')
 
-    # 8. Resolved markets — game results, crypto prices, economic data
-    print(f"\n--- Resolved Markets (Known Outcomes) ---")
-    sports_scanned.append('Resolved')
-    resolved = find_all_resolved_markets(kalshi_api)
-    if resolved:
-        sports_with_games.append('Resolved')
-    all_edges.extend(resolved)
-    print(f"   Resolved markets: {len(resolved)} opportunities")
+    # 8. Resolved markets — DISABLED (was auto-trading game results, crypto, econ)
+    # This was buying contracts on games it thought were final via ESPN,
+    # but incorrect game matching caused real money losses.
+    # Only completed props sniper should auto-trade.
+    # resolved = find_all_resolved_markets(kalshi_api)
+    print(f"\n--- Resolved Markets: DISABLED ---")
 
     # Filter out edges below minimum threshold before returning
     before_count = len(all_edges)
