@@ -157,6 +157,7 @@ TARGET_PROFIT = 5.00  # Target $5 profit per FD arb trade
 MAX_RISK = 250.00     # Max total cost per FD arb order
 MIN_EDGE_PERCENT = 2.0  # Only notify/display edges >= 2% over fair value
 LIVE_PROP_MIN_EDGE = 5.0  # Live props need 5%+ (FD one-way comparison, noisier)
+MAX_BOOK_DIVERGENCE = 0.10  # Reject edge if FD & Pinnacle devigged probs differ by >10pp
 
 # Multi-book fair value configuration
 # Pre-game: FanDuel + Pinnacle combined devig (require both)
@@ -414,6 +415,15 @@ def are_odds_stale(commence_time_str: str, last_update_str: str) -> bool:
         return False
     except Exception:
         return False
+
+
+def books_diverge(per_book_detail: dict) -> bool:
+    """Return True if FanDuel and Pinnacle devigged probs disagree by more than MAX_BOOK_DIVERGENCE.
+    Catches secretly-live games where one book has stale odds even though commence_time says pre-game."""
+    if not per_book_detail or len(per_book_detail) < 2:
+        return False
+    probs = list(per_book_detail.values())
+    return (max(probs) - min(probs)) > MAX_BOOK_DIVERGENCE
 
 
 def send_telegram_notification(edge: Dict):
@@ -1599,6 +1609,9 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                     'odds_last_update': game_odds.get(fd_t1, {}).get('last_update', ''),
                     'recommendation': f"Buy {e['method']} on Kalshi at ${e['price']:.2f} (Fair value: {e['fd_opp_prob']*100:.1f}%)",
                 }
+                if books_diverge(edge['per_book_detail']):
+                    print(f"   Skipping {edge['game']} 3-way ML: books diverge >10pp")
+                    continue
                 game_edges.append(edge)
 
             if game_edges:
@@ -1656,6 +1669,9 @@ def find_moneyline_edges(kalshi_api, fd_data, series_ticker, sport_name, team_ma
                         'odds_last_update': game_odds.get(fd_opp, {}).get('last_update', ''),
                         'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (Fair value: {fd_opp} at {game_odds[fd_opp]['odds']:.2f})",
                     }
+                    if books_diverge(edge['per_book_detail']):
+                        print(f"   Skipping {edge['game']} 2-way ML: books diverge >10pp")
+                        continue
                     game_edges.append(edge)
 
             # Only trade the best edge per game (don't bet both sides)
@@ -1845,6 +1861,9 @@ def find_spread_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                     'odds_last_update': fd_game_spreads.get('_last_update', ''),
                     'recommendation': f"Buy YES {team_name} -{floor_strike} on Kalshi at ${yes_price:.2f} (Fair value: {fd_opposite_name} {fd_opposite_spread['point']} at {fd_opposite_odds:.2f})",
                 }
+                if books_diverge(edge['per_book_detail']):
+                    print(f"   Skipping {edge['game']} spread: books diverge >10pp")
+                    continue
                 edges.append(edge)
                 send_telegram_notification(edge)
                 auto_trade_edge(edge, kalshi_api)
@@ -1995,6 +2014,9 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                         'odds_last_update': fd_total.get('_last_update', ''),
                         'recommendation': f"Buy YES Over {floor_strike} on Kalshi at ${yes_price:.2f} (FanDuel Under {fd_line} at {fd_total['under_odds']:.2f})",
                     }
+                    if books_diverge(edge['per_book_detail']):
+                        print(f"   Skipping {edge['game']} Over total: books diverge >10pp")
+                        continue
                     edges.append(edge)
                     send_telegram_notification(edge)
                     auto_trade_edge(edge, kalshi_api)
@@ -2033,6 +2055,9 @@ def find_total_edges(kalshi_api, fd_data, series_ticker, sport_name, team_map):
                         'odds_last_update': fd_total.get('_last_update', ''),
                         'recommendation': f"Buy NO (Under {floor_strike}) on Kalshi at ${under_cost:.2f} (FanDuel Over {fd_line} at {fd_total['over_odds']:.2f})",
                     }
+                    if books_diverge(edge['per_book_detail']):
+                        print(f"   Skipping {edge['game']} Under total: books diverge >10pp")
+                        continue
                     edges.append(edge)
                     send_telegram_notification(edge)
                     auto_trade_edge(edge, kalshi_api)
@@ -2316,6 +2341,9 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
                         'odds_last_update': fd_game_btts.get('_last_update', ''),
                         'recommendation': f"Buy YES BTTS on Kalshi at ${yes_price:.2f} (FanDuel BTTS No at {fd_game_btts['no_odds']:.2f})",
                     }
+                    if books_diverge(edge['per_book_detail']):
+                        print(f"   Skipping {edge['game']} BTTS YES: books diverge >10pp")
+                        continue
                     edges.append(edge)
                     send_telegram_notification(edge)
                     auto_trade_edge(edge, kalshi_api)
@@ -2352,6 +2380,9 @@ def find_btts_edges(kalshi_api, fd_data, series_ticker, sport_name):
                         'odds_last_update': fd_game_btts.get('_last_update', ''),
                         'recommendation': f"Buy NO BTTS on Kalshi at ${no_price:.2f} (FanDuel BTTS Yes at {fd_game_btts['yes_odds']:.2f})",
                     }
+                    if books_diverge(edge['per_book_detail']):
+                        print(f"   Skipping {edge['game']} BTTS NO: books diverge >10pp")
+                        continue
                     edges.append(edge)
                     send_telegram_notification(edge)
                     auto_trade_edge(edge, kalshi_api)
@@ -2569,6 +2600,9 @@ def find_tennis_edges(kalshi_api, fanduel_api, series_ticker: str, odds_api_keys
                     'odds_last_update': fd_opp_data.get('last_update', ''),
                     'recommendation': f"Buy {method} on Kalshi at ${best_p:.2f} (Fair value: {fd_opp_name} at {fd_opp_data['odds']:.2f})",
                 }
+                if books_diverge(edge['per_book_detail']):
+                    print(f"   Skipping {edge['game']} tennis ML: books diverge >10pp")
+                    continue
                 match_edges.append(edge)
         # Only trade the best edge per match to avoid betting both sides
         if match_edges:

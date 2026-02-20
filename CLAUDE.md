@@ -148,10 +148,13 @@ found any guaranteed edge. The try/except caught it silently.
 - **Edge:** `edge_pct = (fd_over_implied - kalshi_eff) * 100`
 - **Threshold:** 5% minimum (`LIVE_PROP_MIN_EDGE = 5.0`)
 
-### Staleness
+### Staleness & Data Quality
 - Live data from The Odds API must be < 15 seconds old
 - All notifications include "Odds age" timestamp
 - Pre-game data has no staleness requirement
+- **Cross-book divergence check:** If FanDuel and Pinnacle devigged probs differ by >10pp,
+  the edge is rejected. Catches secretly-live games where API reports wrong commence_time
+  (e.g., WTA match already started but API said pre-game, FD at -111 vs Pinnacle at +157).
 
 ---
 
@@ -162,6 +165,7 @@ AUTO_TRADE_ENABLED = True
 MAX_POSITIONS = 999
 MIN_EDGE_PERCENT = 2.0             # Only notify/display edges >= 2% over fair value
 LIVE_PROP_MIN_EDGE = 5.0           # Live props need 5%+ (noisier one-way comparison)
+MAX_BOOK_DIVERGENCE = 0.10         # Reject edge if books disagree by >10 percentage points
 COMPLETED_PROP_MAX_PRICE = 1.00    # Buy any completed prop < $1.00
 SCAN_REST_SECONDS = 30             # Rest between background scans
 
