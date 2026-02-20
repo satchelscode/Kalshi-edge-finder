@@ -156,6 +156,7 @@ MAX_POSITIONS = 999  # No practical limit
 TARGET_PROFIT = 5.00  # Target $5 profit per FD arb trade
 MAX_RISK = 250.00     # Max total cost per FD arb order
 MIN_EDGE_PERCENT = 2.0  # Only notify/display edges >= 2% over fair value
+LIVE_PROP_MIN_EDGE = 5.0  # Live props need 5%+ (FD one-way comparison, noisier)
 
 # Multi-book fair value configuration
 # Pre-game: FanDuel + Pinnacle combined devig (require both)
@@ -2538,7 +2539,7 @@ def find_live_prop_value(kalshi_api, fd_data, series_ticker, sport_name, fd_mark
         # Edge = how much cheaper Kalshi is vs FD (in percentage points)
         edge_pct = (fd_implied - kalshi_eff) * 100
 
-        if edge_pct >= MIN_EDGE_PERCENT:
+        if edge_pct >= LIVE_PROP_MIN_EDGE:
             game_id = best_fd_match['game_id']
             game_info = fd_games.get(game_id, {})
             game_name = f"{game_info.get('away', '?')} at {game_info.get('home', '?')}"
