@@ -164,6 +164,9 @@ PROP_MM_ENABLED = True
 PROP_MM_EDGE_PP = 0.0      # Match FD exactly (no edge buffer — FD's vig IS our edge)
 PROP_MM_CONTRACTS = 1       # Max 1 contract per prop
 PROP_MM_YES_MIN_DIFF = 4.0  # Buy YES if YES Diff >= 4pp (FD implied much higher than Kalshi)
+PROPMM_BETS_FILE = '/tmp/propmm_bets.json'
+PROPMM_UPDATE_INTERVAL_MINS = 30  # Telegram status update frequency
+PROPMM_MORNING_HOUR_ET = 9        # 9am ET for daily W/L summary
 
 # Multi-book fair value configuration
 # Pre-game: FanDuel + Pinnacle combined devig (require both)
@@ -2591,7 +2594,10 @@ def manage_prop_orders(kalshi_api, comparisons):
                         )
                         if result:
                             yes_placed += 1
+                            order_status = result.get('order', {}).get('status', 'unknown')
                             print(f"   YES BUY: {comp['player']} {comp['stat']} {comp['threshold']}+ @ {yes_cents}¢ (diff {yes_diff:+.1f}pp)")
+                            record_propmm_bet(ticker, comp['player'], comp['stat'], comp['threshold'],
+                                              'yes', yes_cents, yes_diff, order_status)
                         time.sleep(0.3)
             continue  # Don't also place NO on same ticker
 
@@ -2638,6 +2644,10 @@ def manage_prop_orders(kalshi_api, comparisons):
         )
         if result:
             no_placed += 1
+            order_status = result.get('order', {}).get('status', 'unknown')
+            no_diff = comp.get('diff_no', 0) or 0
+            record_propmm_bet(ticker, comp['player'], comp['stat'], comp['threshold'],
+                              'no', no_bid_cents, no_diff, order_status)
         time.sleep(0.3)
 
     # Cancel orders for tickers no longer in FD data (line removed or game started)
@@ -2649,6 +2659,232 @@ def manage_prop_orders(kalshi_api, comparisons):
 
     print(f"   Prop MM: {no_placed} NO placed, {yes_placed} YES bought, {adjusted} adjusted, "
           f"{canceled} stale canceled, {skipped_filled} filled, {skipped_no_not_top} NO not top")
+
+
+# ============================================================
+# PROP MM BET TRACKING & TELEGRAM REPORTING
+# ============================================================
+
+def _read_propmm_bets():
+    """Read tracked prop MM bets from persistent file."""
+    try:
+        with open(PROPMM_BETS_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {'bets': {}, 'last_status_update': None, 'last_morning_summary': None}
+
+
+def _write_propmm_bets(data):
+    """Write prop MM bets to file (atomic)."""
+    try:
+        tmp_file = PROPMM_BETS_FILE + '.tmp'
+        with open(tmp_file, 'w') as f:
+            json.dump(data, f)
+        os.replace(tmp_file, PROPMM_BETS_FILE)
+    except Exception as e:
+        print(f"   Warning: failed to write propmm bets file: {e}")
+
+
+def record_propmm_bet(ticker, player, stat, threshold, side, price_cents, diff_pp, order_status):
+    """Record a prop MM bet in the tracking file."""
+    data = _read_propmm_bets()
+    data['bets'][ticker] = {
+        'player': player,
+        'stat': stat,
+        'threshold': threshold,
+        'side': side,
+        'price_cents': price_cents,
+        'diff_pp': round(diff_pp, 1),
+        'placed_at': datetime.utcnow().isoformat(),
+        'order_status': order_status,
+    }
+    _write_propmm_bets(data)
+
+
+def send_propmm_status_telegram(kalshi_api):
+    """Send Telegram update of active prop MM bets (every 30 mins)."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    data = _read_propmm_bets()
+    if not data['bets']:
+        return
+
+    # Throttle: only send every PROPMM_UPDATE_INTERVAL_MINS minutes
+    last_update = data.get('last_status_update')
+    if last_update:
+        try:
+            last_dt = datetime.fromisoformat(last_update)
+            elapsed = (datetime.utcnow() - last_dt).total_seconds()
+            if elapsed < PROPMM_UPDATE_INTERVAL_MINS * 60:
+                return
+        except Exception:
+            pass
+
+    # Get current state from Kalshi
+    positions = kalshi_api.get_positions()
+    resting_orders = kalshi_api.get_orders(status='resting')
+    prop_series_prefixes = tuple(PLAYER_PROP_SPORTS.keys())
+
+    pos_tickers = set()
+    for pos in positions:
+        t = pos.get('ticker', '')
+        if t.startswith(prop_series_prefixes) and pos.get('position', 0) != 0:
+            pos_tickers.add(t)
+
+    resting_tickers = set()
+    for order in resting_orders:
+        t = order.get('ticker', '')
+        if t.startswith(prop_series_prefixes):
+            resting_tickers.add(t)
+
+    # Categorize tracked bets
+    filled_bets = []
+    resting_bets = []
+    total_cost_cents = 0
+
+    for ticker, bet in data['bets'].items():
+        if ticker in pos_tickers:
+            filled_bets.append(bet)
+            total_cost_cents += bet['price_cents']
+        elif ticker in resting_tickers:
+            resting_bets.append(bet)
+
+    active_count = len(filled_bets) + len(resting_bets)
+    if active_count == 0:
+        return
+
+    lines = [f"PROP MM STATUS ({active_count} active bets)"]
+
+    if filled_bets:
+        lines.append(f"\nFilled ({len(filled_bets)}):")
+        for bet in sorted(filled_bets, key=lambda x: x['player']):
+            lines.append(f"  {bet['side'].upper()} {bet['player']} {bet['stat']} {bet['threshold']}+ @ {bet['price_cents']}c ({bet['diff_pp']:+.1f}pp)")
+        lines.append(f"\nTotal invested: ${total_cost_cents / 100:.2f}")
+
+    if resting_bets:
+        lines.append(f"\nResting ({len(resting_bets)}):")
+        for bet in sorted(resting_bets, key=lambda x: x['player']):
+            lines.append(f"  {bet['side'].upper()} {bet['player']} {bet['stat']} {bet['threshold']}+ @ {bet['price_cents']}c ({bet['diff_pp']:+.1f}pp)")
+
+    message = '\n'.join(lines)
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, json={'chat_id': TELEGRAM_CHAT_ID, 'text': message}, timeout=10)
+        data['last_status_update'] = datetime.utcnow().isoformat()
+        _write_propmm_bets(data)
+        print(f"   Prop MM Telegram update sent ({active_count} active bets)")
+    except Exception as e:
+        print(f"   Prop MM Telegram update failed: {e}")
+
+
+def send_propmm_morning_summary(kalshi_api):
+    """Send daily W/L summary with ROI at 9am ET."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    # Check if it's 9am Eastern
+    now_utc = datetime.now(timezone.utc)
+    try:
+        import zoneinfo
+        et = zoneinfo.ZoneInfo('America/New_York')
+    except Exception:
+        et = timezone(timedelta(hours=-5))
+    now_et = now_utc.astimezone(et)
+
+    if now_et.hour != PROPMM_MORNING_HOUR_ET:
+        return
+
+    data = _read_propmm_bets()
+    today_str = now_et.strftime('%Y-%m-%d')
+
+    if data.get('last_morning_summary') == today_str:
+        return
+
+    if not data['bets']:
+        return
+
+    # Get settlements and positions from Kalshi
+    settlements = kalshi_api.get_settlements()
+    positions = kalshi_api.get_positions()
+
+    settle_by_ticker = {}
+    for s in settlements:
+        settle_by_ticker[s.get('ticker', '')] = s
+
+    pos_tickers = set()
+    for pos in positions:
+        if pos.get('position', 0) != 0:
+            pos_tickers.add(pos.get('ticker', ''))
+
+    winners = []
+    losers = []
+    pending_count = 0
+    total_cost_cents = 0
+    total_revenue_cents = 0
+
+    for ticker, bet in data['bets'].items():
+        if ticker in settle_by_ticker:
+            s = settle_by_ticker[ticker]
+            cost_cents = s.get('yes_total_cost', 0) + s.get('no_total_cost', 0)
+            revenue_cents = s.get('revenue', 0)
+            profit_cents = revenue_cents - cost_cents
+
+            total_cost_cents += cost_cents
+            total_revenue_cents += revenue_cents
+
+            entry = {**bet, 'ticker': ticker, 'cost': cost_cents, 'revenue': revenue_cents}
+            if profit_cents > 0:
+                winners.append(entry)
+            else:
+                losers.append(entry)
+        elif ticker in pos_tickers:
+            pending_count += 1
+
+    settled_count = len(winners) + len(losers)
+    if settled_count == 0:
+        return
+
+    net_pl_cents = total_revenue_cents - total_cost_cents
+    roi = (net_pl_cents / total_cost_cents * 100) if total_cost_cents > 0 else 0
+    win_rate = (len(winners) / settled_count * 100) if settled_count > 0 else 0
+    yesterday_str = (now_et - timedelta(days=1)).strftime('%b %d')
+    sign = '+' if net_pl_cents >= 0 else ''
+
+    lines = [f"PROP MM DAILY SUMMARY ({yesterday_str})"]
+    lines.append(f"\nResults: {len(winners)}W / {len(losers)}L ({win_rate:.0f}%)")
+    lines.append(f"Invested: ${total_cost_cents / 100:.2f}")
+    lines.append(f"Returned: ${total_revenue_cents / 100:.2f}")
+    lines.append(f"Net P/L: {sign}${net_pl_cents / 100:.2f}")
+    lines.append(f"ROI: {sign}{roi:.1f}%")
+
+    if winners:
+        lines.append(f"\nWinners:")
+        for w in winners:
+            lines.append(f"  W {w['player']} {w['stat']} {w['threshold']}+ {w['side'].upper()} @ {w['price_cents']}c")
+
+    if losers:
+        lines.append(f"\nLosers:")
+        for l in losers:
+            lines.append(f"  L {l['player']} {l['stat']} {l['threshold']}+ {l['side'].upper()} @ {l['price_cents']}c")
+
+    if pending_count > 0:
+        lines.append(f"\nStill pending: {pending_count} bets")
+
+    message = '\n'.join(lines)
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, json={'chat_id': TELEGRAM_CHAT_ID, 'text': message}, timeout=10)
+        # Mark sent and clean up settled bets
+        data['last_morning_summary'] = today_str
+        settled_tickers = set(settle_by_ticker.keys())
+        data['bets'] = {t: b for t, b in data['bets'].items() if t not in settled_tickers}
+        _write_propmm_bets(data)
+        print(f"   Prop MM morning summary sent: {len(winners)}W/{len(losers)}L, ROI {sign}{roi:.1f}%")
+    except Exception as e:
+        print(f"   Prop MM morning summary failed: {e}")
 
 
 # ============================================================
@@ -4470,6 +4706,13 @@ def _background_scan_loop():
                 _scan_cache['is_scanning'] = False
 
             print(f"Background scan #{_scan_cache['scan_count']} complete: {len(all_edges)} edges. Resting {SCAN_REST_SECONDS}s...")
+
+            # Prop MM Telegram reporting (runs after each scan, self-throttled)
+            try:
+                send_propmm_status_telegram(kalshi)
+                send_propmm_morning_summary(kalshi)
+            except Exception as te:
+                print(f"   Prop MM Telegram check error: {te}")
 
         except Exception as e:
             import traceback
