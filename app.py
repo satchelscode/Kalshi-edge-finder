@@ -6,7 +6,7 @@ import re
 import base64
 import hashlib
 import threading
-from flask import Flask, render_template, jsonify, request, redirect
+from flask import Flask, render_template, jsonify, request, redirect, Response
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple
@@ -4418,6 +4418,9 @@ def props_view():
             comparisons = list(_scan_cache.get('prop_comparisons', []))
             scan_ts = _scan_cache['timestamp']
             scan_count = _scan_cache['scan_count']
+            cache_keys = list(_scan_cache.keys())
+
+        print(f"PROPS ROUTE: {len(comparisons)} comparisons, scan #{scan_count}, cache keys={cache_keys}, cache id={id(_scan_cache)}")
 
         # Group by stat type for tab-like display
         stat_types = sorted(set(c['stat'] for c in comparisons)) if comparisons else []
@@ -4531,7 +4534,7 @@ function showStat(stat) {
 }
 </script>"""
         html += "</div></body></html>"
-        return html
+        return Response(html, mimetype='text/html', headers={'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'})
 
     except Exception as e:
         import traceback
