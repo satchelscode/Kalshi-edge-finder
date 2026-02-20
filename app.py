@@ -2530,15 +2530,18 @@ def manage_prop_orders(kalshi_api, comparisons):
     resting_orders = kalshi_api.get_orders(status='resting')
     positions = kalshi_api.get_positions()
 
-    # Build lookup: ticker -> resting order info (only our prop MM orders)
+    # Build lookup: ticker -> resting order info
+    # Note: Kalshi GET orders may not return client_order_id, so we match by
+    # ticker prefix against known prop series to identify prop MM orders.
+    prop_series_prefixes = tuple(PLAYER_PROP_SPORTS.keys())  # e.g. ('KXNBAPTS', 'KXNBAREB', ...)
     prop_resting = {}
     for order in resting_orders:
-        cid = order.get('client_order_id', '')
-        if cid.startswith('propmm_'):
-            ticker = order.get('ticker', '')
+        ticker = order.get('ticker', '')
+        if ticker and ticker.startswith(prop_series_prefixes):
             prop_resting[ticker] = {
                 'order_id': order.get('order_id'),
                 'no_price': order.get('no_price', 0),
+                'side': order.get('side', ''),
             }
 
     # Build set of tickers where we already hold a position
