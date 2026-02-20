@@ -1133,10 +1133,6 @@ class FanDuelAPI:
         live_count = len(events) - len(pregame_events)
         if not pregame_events:
             print(f"   OddsAPI {sport_key} props: no pre-game events ({len(events)} total, {live_count} live)")
-            if events:
-                # Show first event time for debugging
-                first_ct = events[0].get('commence_time', '?')
-                print(f"   First event commence_time: {first_ct} (now: {datetime.now(timezone.utc).isoformat()})")
             return {'props': props, 'games': games_dict}
 
         markets_str = ','.join(market_keys)
@@ -1163,18 +1159,6 @@ class FanDuelAPI:
                 response.raise_for_status()
                 data = response.json()
 
-                # Debug: show what the API returned for this event
-                bookmakers_returned = [bm['key'] for bm in data.get('bookmakers', [])]
-                if not bookmakers_returned:
-                    print(f"   {away} @ {home}: API returned NO bookmakers (FD may not have props for this game)")
-                else:
-                    fd_bms = [bm for bm in data.get('bookmakers', []) if bm['key'] == 'fanduel']
-                    if not fd_bms:
-                        print(f"   {away} @ {home}: bookmakers={bookmakers_returned} but NO fanduel")
-                    else:
-                        fd_markets_found = [mkt['key'] for mkt in fd_bms[0].get('markets', [])]
-                        print(f"   {away} @ {home}: FD markets={fd_markets_found}")
-
                 event_props = []
                 for bm in data.get('bookmakers', []):
                     if bm['key'] != 'fanduel':
@@ -1185,10 +1169,7 @@ class FanDuelAPI:
                         if mkt_key not in market_keys:
                             continue
                         mkt_last_update = mkt.get('last_update', '') or bm_last_update
-                        outcomes = mkt.get('outcomes', [])
-                        over_count = sum(1 for o in outcomes if o.get('name') == 'Over')
-                        print(f"     {mkt_key}: {len(outcomes)} outcomes, {over_count} Over lines")
-                        for o in outcomes:
+                        for o in mkt.get('outcomes', []):
                             if o.get('name') != 'Over':
                                 continue
                             player = o.get('description', '')
@@ -1214,7 +1195,6 @@ class FanDuelAPI:
 
                 if event_props:
                     props[event_id] = event_props
-                    print(f"     -> {len(event_props)} props extracted")
 
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else 'unknown'
@@ -4427,124 +4407,6 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2.2em; margin-bottom: 5px; 
 
     except Exception as e:
         return f"<h1 style='color:red'>Error</h1><pre>{e}</pre>", 500
-
-
-def _test_kalshi_props():
-    """Test helper: check what Kalshi returns for NBA prop series tickers."""
-    try:
-        kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
-        date_strs = _get_today_date_strs()
-        result = {}
-        for series_ticker in ['KXNBAPTS', 'KXNBAREB', 'KXNBAAST', 'KXNBA3PT']:
-            markets = kalshi.get_markets(series_ticker)
-            today = [m for m in markets if any(ds in m.get('ticker', '') for ds in date_strs)]
-            sample_tickers = [m.get('ticker', '') for m in today[:3]]
-            sample_titles = [m.get('title', '') for m in today[:3]]
-            result[series_ticker] = {
-                'total_markets': len(markets),
-                'today_markets': len(today),
-                'sample_tickers': sample_tickers,
-                'sample_titles': sample_titles,
-            }
-            if markets and not today:
-                # Show what dates exist in the market tickers
-                all_tickers = [m.get('ticker', '') for m in markets[:5]]
-                result[series_ticker]['sample_all_tickers'] = all_tickers
-            time.sleep(0.3)
-        return result
-    except Exception as e:
-        return {'error': str(e)}
-
-
-@app.route('/api/test-props')
-def test_props():
-    """Debug endpoint: fetch one NBA event's player props from The Odds API and show raw response."""
-    try:
-        if not ODDS_API_KEY:
-            return jsonify({'error': 'No ODDS_API_KEY configured'}), 400
-
-        fd_api = FanDuelAPI(ODDS_API_KEY)
-        sport_key = 'basketball_nba'
-
-        # Step 1: Get events
-        events = fd_api.get_events(sport_key)
-        if not events:
-            return jsonify({'error': 'No events returned from Odds API', 'sport': sport_key})
-
-        now_utc = datetime.now(timezone.utc)
-        events_info = []
-        for e in events[:5]:
-            ct = e.get('commence_time', '')
-            live = is_game_live(ct)
-            events_info.append({
-                'id': e.get('id', ''),
-                'home': e.get('home_team', ''),
-                'away': e.get('away_team', ''),
-                'commence_time': ct,
-                'is_live': live,
-            })
-
-        # Find first pre-game event
-        pregame = [e for e in events if not is_game_live(e.get('commence_time', ''))]
-        target_event = pregame[0] if pregame else events[0]
-        event_id = target_event.get('id', '')
-
-        # Step 2: Fetch player props for this one event
-        markets_str = 'player_points,player_rebounds,player_assists,player_threes'
-        url = f"{fd_api.base_url}/sports/{sport_key}/events/{event_id}/odds"
-        params = {
-            'apiKey': fd_api.api_key,
-            'regions': 'us,us2',
-            'markets': markets_str,
-            'bookmakers': 'fanduel',
-            'oddsFormat': 'decimal',
-        }
-        response = requests.get(url, params=params, timeout=15)
-        raw_status = response.status_code
-        try:
-            raw_data = response.json()
-        except Exception:
-            raw_data = {'raw_text': response.text[:2000]}
-
-        # Summarize bookmaker data
-        bookmakers_summary = []
-        for bm in raw_data.get('bookmakers', []):
-            markets_summary = []
-            for mkt in bm.get('markets', []):
-                outcomes_sample = mkt.get('outcomes', [])[:3]
-                markets_summary.append({
-                    'key': mkt['key'],
-                    'outcome_count': len(mkt.get('outcomes', [])),
-                    'sample_outcomes': outcomes_sample,
-                })
-            bookmakers_summary.append({
-                'key': bm['key'],
-                'title': bm.get('title', ''),
-                'markets': markets_summary,
-            })
-
-        return jsonify({
-            'now_utc': now_utc.isoformat(),
-            'total_events': len(events),
-            'pregame_events': len(pregame),
-            'events_sample': events_info,
-            'test_event': {
-                'id': event_id,
-                'home': target_event.get('home_team', ''),
-                'away': target_event.get('away_team', ''),
-                'commence_time': target_event.get('commence_time', ''),
-                'is_live': is_game_live(target_event.get('commence_time', '')),
-            },
-            'api_response_status': raw_status,
-            'bookmakers_found': [bm['key'] for bm in raw_data.get('bookmakers', [])],
-            'bookmakers_detail': bookmakers_summary,
-            'kalshi_check': _test_kalshi_props(),
-            'date_strs': list(_get_today_date_strs()),
-            'scan_cache_prop_count': len(_scan_cache.get('prop_comparisons', [])),
-        })
-    except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
 @app.route('/props')
