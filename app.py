@@ -396,7 +396,7 @@ def _get_today_date_strs() -> set:
 def are_odds_stale(commence_time_str: str, last_update_str: str) -> bool:
     """Check if live odds are stale.
     Returns True if the game has started but odds haven't updated since before
-    the game started or are more than 5 minutes old.
+    the game started or are more than 15 seconds old.
     Returns False for pre-game games or if we can't determine staleness."""
     if not commence_time_str or not last_update_str:
         return False
@@ -408,8 +408,8 @@ def are_odds_stale(commence_time_str: str, last_update_str: str) -> bool:
         if ct > now:
             return False
         # Game is live: odds are stale if last_update is before game start
-        # or more than 5 minutes old (live odds change rapidly)
-        if lu < ct or (now - lu) > timedelta(minutes=5):
+        # or more than 15 seconds old (API data must be near real-time for live)
+        if lu < ct or (now - lu) > timedelta(seconds=15):
             return True
         return False
     except Exception:
