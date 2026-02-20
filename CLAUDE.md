@@ -25,9 +25,10 @@ Two-part system on Kalshi:
    - Moneyline edges (NBA, NHL, NCAAB, soccer) — **NOTIFICATION ONLY**
    - Spread edges (NBA, NHL, NCAAB) — **NOTIFICATION ONLY**
    - Total edges (NBA, NHL, NCAAB) — **NOTIFICATION ONLY**
+   - **Pre-game player prop edges (NBA, NHL) — YES + NO sides — NOTIFICATION ONLY**
    - BTTS edges (soccer) — **NOTIFICATION ONLY**
    - Tennis match-winner edges — **NOTIFICATION ONLY**
-   - Live player prop value (FD one-way vs Kalshi) — **NOTIFICATION ONLY**
+   - Live player prop value (FD one-way vs Kalshi) — DISABLED (live data unreliable)
    - Completed props + NHL tied (also here, duplicated from sniper) — **AUTO-TRADES**
 
 ### Key Components
@@ -142,16 +143,27 @@ found any guaranteed edge. The try/except caught it silently.
 - **Formula:** `fair_A = implied_A / (implied_A + implied_B)` (normalize to remove vig)
 - **Edge:** `total_implied = kalshi_eff + fd_opposite_fair_prob; if < 1.0 → edge`
 
-### Live Player Props (Direct One-Way Comparison)
-- FanDuel offers one-way Over lines; Kalshi offers one-way YES
-- **No devigging** — directly compare FD Over implied vs Kalshi YES + fees
-- **Edge:** `edge_pct = (fd_over_implied - kalshi_eff) * 100`
-- **Threshold:** 5% minimum (`LIVE_PROP_MIN_EDGE = 5.0`)
+### Pre-game Player Props (YES + NO, Devigged)
+- FanDuel + Pinnacle Over/Under for each player/threshold → multiplicative devig
+- **Both sides compared** against Kalshi orderbook:
+  - YES edge: `kalshi_yes_eff + fair_under < 1.0`
+  - NO edge: `kalshi_no_eff + fair_over < 1.0`
+- Kalshi thresholds map to API points: "20+" = Over 19.5 (`point = threshold - 0.5`)
+- Stats covered: Points, Rebounds, Assists, 3PM (NBA); Points, Assists, Saves (NHL)
+- Uses `PLAYER_PROP_SPORTS` config for series tickers
+- All stat types fetched in one API call per game (saves API quota)
 
-### Staleness
+### Live Player Props — DISABLED
+- Was: FanDuel one-way Over vs Kalshi YES (no devigging)
+- Disabled because The Odds API live data is unreliable
+
+### Staleness & Data Quality
 - Live data from The Odds API must be < 15 seconds old
 - All notifications include "Odds age" timestamp
 - Pre-game data has no staleness requirement
+- **Cross-book divergence check:** If FanDuel and Pinnacle devigged probs differ by >10pp,
+  the edge is rejected. Catches secretly-live games where API reports wrong commence_time
+  (e.g., WTA match already started but API said pre-game, FD at -111 vs Pinnacle at +157).
 
 ---
 
@@ -162,6 +174,7 @@ AUTO_TRADE_ENABLED = True
 MAX_POSITIONS = 999
 MIN_EDGE_PERCENT = 2.0             # Only notify/display edges >= 2% over fair value
 LIVE_PROP_MIN_EDGE = 5.0           # Live props need 5%+ (noisier one-way comparison)
+MAX_BOOK_DIVERGENCE = 0.10         # Reject edge if books disagree by >10 percentage points
 COMPLETED_PROP_MAX_PRICE = 1.00    # Buy any completed prop < $1.00
 SCAN_REST_SECONDS = 30             # Rest between background scans
 
@@ -243,9 +256,10 @@ TELEGRAM_CHAT_ID          # Optional: notification target
 | 1660-1920 | find_moneyline_edges (2-way + 3-way) | ACTIVE (notify only) |
 | 1920-2100 | find_spread_edges | ACTIVE (notify only) |
 | 2100-2280 | find_total_edges | ACTIVE (notify only) |
-| 2280-2450 | find_live_prop_value | ACTIVE (notify only) |
-| 2450-2620 | find_btts_edges | ACTIVE (notify only) |
-| 2620-2820 | find_tennis_edges | ACTIVE (notify only) |
+| 2280-2380 | find_live_prop_value | DISABLED (live data unreliable) |
+| 2380-2530 | find_pregame_prop_edges (YES + NO) | ACTIVE (notify only) |
+| 2530-2700 | find_btts_edges | ACTIVE (notify only) |
+| 2700-2900 | find_tennis_edges | ACTIVE (notify only) |
 | 2820-3600 | Completed props infrastructure (ESPN, box scores) | ACTIVE (auto-trades) |
 | 3600-3800 | find_basketball_analytically_final | DISABLED (not called) |
 | 3800-3990 | auto_trade_completed_prop | ACTIVE (auto-trades) |
