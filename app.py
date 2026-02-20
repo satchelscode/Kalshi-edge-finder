@@ -4418,17 +4418,17 @@ def props_view():
             comparisons = list(_scan_cache.get('prop_comparisons', []))
             scan_ts = _scan_cache['timestamp']
             scan_count = _scan_cache['scan_count']
-            cache_keys = list(_scan_cache.keys())
-
-        print(f"PROPS ROUTE: {len(comparisons)} comparisons, scan #{scan_count}, cache keys={cache_keys}, cache id={id(_scan_cache)}")
 
         # Group by stat type for tab-like display
         stat_types = sorted(set(c['stat'] for c in comparisons)) if comparisons else []
 
+        # Refresh every 10s while waiting for first scan, 60s once data is loaded
+        refresh_secs = 10 if not comparisons else 60
+
         html = f"""<!DOCTYPE html>
 <html><head>
 <title>Player Props - FD vs Kalshi</title>
-<meta http-equiv="refresh" content="60">
+<meta http-equiv="refresh" content="{refresh_secs}">
 <style>
 body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #1a1a2e, #16213e); color: #eee; min-height: 100vh; }}
 .container {{ max-width: 1400px; margin: 0 auto; }}
@@ -4461,7 +4461,7 @@ tr:hover {{ background: rgba(0,255,136,0.05); }}
 """
 
         if not comparisons:
-            html += '<div class="summary">No prop data yet. Waiting for background scan...</div>'
+            html += '<div class="summary">Loading prop data... first scan takes ~2 minutes after deploy. Auto-refreshing every 10s.</div>'
         else:
             matched = sum(1 for c in comparisons if c['fd_matched'])
             html += f'<div class="summary"><strong>{len(comparisons)}</strong> FD-matched props compared</div>'
