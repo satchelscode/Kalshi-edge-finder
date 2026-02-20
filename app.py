@@ -3850,18 +3850,7 @@ def scan_all_sports(kalshi_api, fanduel_api):
         print(f"   {name}: {len(edges)} edges")
         time.sleep(1.0)
 
-    # 4. Live player props — direct FD one-way vs Kalshi one-way comparison
-    for kalshi_series, (odds_key, fd_market, name) in PLAYER_PROP_SPORTS.items():
-        print(f"\n--- {name} Live ({kalshi_series}) ---")
-        fd = fanduel_api.get_fd_live_props(odds_key, fd_market)
-        sports_scanned.append(name)
-        if not fd['props']:
-            continue
-        sports_with_games.append(name)
-        edges = find_live_prop_value(kalshi_api, fd, kalshi_series, name, fd_market)
-        all_edges.extend(edges)
-        print(f"   {name} Live: {len(edges)} edges")
-        time.sleep(1.0)
+    # 4. Live player props — DISABLED (The Odds API live data is unreliable)
 
     # 5. BTTS markets
     for kalshi_series, (odds_key, name) in BTTS_SPORTS.items():
