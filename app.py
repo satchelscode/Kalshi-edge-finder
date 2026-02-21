@@ -3216,84 +3216,83 @@ def process_combo_rfq(kalshi_api, rfq: Dict) -> bool:
             'leg_tickers': [l.get('market_ticker', '') for l in legs],
             'leg_sides': [l.get('side', '') for l in legs],
             'fair_yes': fair_yes,
+            'quoted_ts': time.time(),
         }
         return True
 
     return False
 
 
-def _check_combo_fills(kalshi_api):
-    """Check pending combo quotes for fills or expirations.
-    Updates bets file and sends Telegram for fills.
+def _check_combo_fills_ws(rfq_id, quote_id, kalshi_api):
+    """Handle a fill detected via WebSocket event. Called immediately on quote_executed/accepted."""
+    pq = _combo_pending_quotes.get(rfq_id)
+    if not pq:
+        # Try matching by quote_id
+        for rid, p in list(_combo_pending_quotes.items()):
+            if p.get('quote_id') == quote_id:
+                pq = p
+                rfq_id = rid
+                break
+    if not pq:
+        return
+
+    # Update bets file
+    data = _read_combo_bets()
+    bet_key = pq.get('quote_id', rfq_id)
+    if bet_key not in data.get('bets', {}):
+        bet_key = rfq_id
+    if bet_key in data.get('bets', {}):
+        cost = data['bets'][bet_key].get('cost_cents', 0)
+        data['bets'][bet_key]['status'] = 'filled'
+        data['bets'][bet_key]['filled_at'] = datetime.utcnow().isoformat()
+        data['total_exposure_cents'] = max(0, data.get('total_exposure_cents', 0) - cost)
+        _write_combo_bets(data)
+
+    n_legs = pq['legs']
+    cost = pq['cost_cents']
+    print(f"   COMBO FILLED: {n_legs}-leg parlay, NO @ {pq['no_bid_cents']}c, "
+          f"{pq['contracts']} contracts, cost ${cost/100:.2f}")
+
+    legs_for_tg = [{'market_ticker': t, 'side': s}
+                   for t, s in zip(pq['leg_tickers'], pq['leg_sides'])]
+    send_combo_telegram('FILLED', rfq_id, legs_for_tg,
+                       pq['fair_yes'], pq['no_bid_cents'], pq['contracts'])
+
+    _combo_pending_quotes.pop(rfq_id, None)
+
+
+def _expire_old_combo_quotes():
+    """Auto-expire pending quotes older than 60 seconds. No REST calls needed.
+    RFQs close within seconds, so anything >60s old is definitely dead.
     """
     if not _combo_pending_quotes:
         return
 
-    resolved = []
+    now = time.time()
+    expired = []
     for rfq_id, pq in list(_combo_pending_quotes.items()):
-        try:
-            rfq_data = kalshi_api.get_rfq(rfq_id)
-            if not rfq_data:
-                continue
+        quoted_at = pq.get('quoted_ts', 0)
+        if quoted_at and (now - quoted_at) > 60:
+            expired.append(rfq_id)
 
-            rfq_status = rfq_data.get('status', rfq_data.get('rfq', {}).get('status', ''))
-            # Also check nested structure
-            if not rfq_status and isinstance(rfq_data.get('rfq'), dict):
-                rfq_status = rfq_data['rfq'].get('status', '')
+    if not expired:
+        return
 
-            if rfq_status == 'open':
-                continue  # Still pending
+    data = _read_combo_bets()
+    for rfq_id in expired:
+        pq = _combo_pending_quotes.get(rfq_id, {})
+        quote_id = pq.get('quote_id', rfq_id)
+        bet_key = quote_id if quote_id in data.get('bets', {}) else rfq_id
+        if bet_key in data.get('bets', {}):
+            cost = data['bets'][bet_key].get('cost_cents', 0)
+            data['bets'][bet_key]['status'] = 'expired'
+            data['total_exposure_cents'] = max(0, data.get('total_exposure_cents', 0) - cost)
 
-            # RFQ is no longer open — check if our quote was filled
-            filled = False
-            quote_id = pq.get('quote_id', '')
-
-            if quote_id and quote_id != rfq_id:
-                quote_data = kalshi_api.get_quote(quote_id)
-                if quote_data:
-                    q = quote_data.get('quote', quote_data)
-                    quote_status = q.get('status', '')
-                    filled = quote_status in ('filled', 'accepted', 'executed')
-                    print(f"   Combo quote {quote_id[:8]}: status={quote_status}, filled={filled}")
-
-            # Update bets file
-            data = _read_combo_bets()
-            bet_key = quote_id if quote_id in data.get('bets', {}) else rfq_id
-            if bet_key in data.get('bets', {}):
-                cost = data['bets'][bet_key].get('cost_cents', 0)
-                if filled:
-                    data['bets'][bet_key]['status'] = 'filled'
-                    data['bets'][bet_key]['filled_at'] = datetime.utcnow().isoformat()
-                else:
-                    data['bets'][bet_key]['status'] = 'expired'
-                # Release exposure on both fills and expirations — filled quotes
-                # become positions (risk already taken), expired ones are dead
-                data['total_exposure_cents'] = max(0, data.get('total_exposure_cents', 0) - cost)
-                _write_combo_bets(data)
-
-            if filled:
-                n_legs = pq['legs']
-                cost = pq['cost_cents']
-                max_win = (100 - pq['no_bid_cents']) * pq['contracts']
-                print(f"   COMBO FILLED: {n_legs}-leg parlay, NO @ {pq['no_bid_cents']}c, "
-                      f"{pq['contracts']} contracts, cost ${cost/100:.2f}")
-
-                # Build legs list for Telegram
-                legs_for_tg = [{'market_ticker': t, 'side': s}
-                               for t, s in zip(pq['leg_tickers'], pq['leg_sides'])]
-                send_combo_telegram('FILLED', rfq_id, legs_for_tg,
-                                   pq['fair_yes'], pq['no_bid_cents'], pq['contracts'])
-            else:
-                print(f"   Combo RFQ {rfq_id[:8]}: expired/rejected, exposure released ${pq['cost_cents']/100:.2f}")
-
-            resolved.append(rfq_id)
-
-        except Exception as e:
-            print(f"   Combo fill check error for {rfq_id[:8]}: {e}")
-
-    # Clean up resolved quotes
-    for rfq_id in resolved:
         _combo_pending_quotes.pop(rfq_id, None)
+
+    _write_combo_bets(data)
+    if expired:
+        print(f"   Combo MM: auto-expired {len(expired)} stale pending quotes")
 
 
 def _combo_ws_auth_headers(api_key_id, private_key):
@@ -3318,14 +3317,15 @@ def _combo_ws_auth_headers(api_key_id, private_key):
 
 
 def _combo_fill_checker_loop(kalshi_api):
-    """Background thread to periodically check pending combo quotes for fills."""
+    """Background thread to auto-expire old pending quotes. No REST calls.
+    Fill detection is handled by WebSocket quote_executed/accepted events.
+    """
     while True:
         try:
-            if _combo_pending_quotes:
-                _check_combo_fills(kalshi_api)
+            _expire_old_combo_quotes()
         except Exception as e:
             print(f"   Combo fill checker error: {e}")
-        time.sleep(30)  # Check every 30s to avoid 429s competing with quote submissions
+        time.sleep(60)  # Check every 60s — just cleanup, no API calls
 
 
 def _combo_mm_loop():
@@ -3501,14 +3501,11 @@ def _combo_mm_loop():
                     rfq_id = quote_event.get('rfq_id', '')
                     print(f"   Combo MM WS: {msg_type} quote={quote_id[:12] if quote_id else '?'} rfq={rfq_id[:12] if rfq_id else '?'}")
 
-                    # Trigger immediate fill check if this matches a pending quote
-                    if rfq_id in _combo_pending_quotes or any(
-                        pq.get('quote_id') == quote_id for pq in _combo_pending_quotes.values()
-                    ):
-                        try:
-                            _check_combo_fills(kalshi)
-                        except Exception as e:
-                            print(f"   Combo MM WS fill check error: {e}")
+                    # Handle fill instantly via WS event — no REST call needed
+                    try:
+                        _check_combo_fills_ws(rfq_id, quote_id, kalshi)
+                    except Exception as e:
+                        print(f"   Combo MM WS fill check error: {e}")
 
                 # Periodic heartbeat logging
                 now = time.time()
