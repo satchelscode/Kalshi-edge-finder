@@ -171,7 +171,7 @@ PROPMM_MORNING_HOUR_ET = 9        # 9am ET for daily W/L summary
 # Combo (parlay) market-making: quote NO on incoming RFQs
 COMBO_MM_ENABLED = True
 COMBO_MM_MAX_EXPOSURE = 100.00     # Total $ at risk across all open combo positions
-COMBO_MM_EDGE_CENTS = 0.25         # Quote N cents under fair NO (our edge)
+COMBO_MM_EDGE_CENTS = 0            # Quote at exact fair NO (maximize fills)
 COMBO_MM_POLL_SECONDS = 1          # Poll for new RFQs every N seconds
 COMBO_MM_ELIGIBLE_PREFIXES = ('KXNBA', 'KXNCAAMB')  # NBA + NCAAB tickers only
 COMBO_MM_MIN_LEGS = 2              # Minimum legs to quote
@@ -3294,6 +3294,7 @@ def _combo_mm_loop():
 
     kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
     fill_check_counter = 0
+    poll_count = 0
 
     while True:
         try:
@@ -3302,6 +3303,15 @@ def _combo_mm_loop():
                 continue
 
             open_rfqs = kalshi.get_rfqs(status='open')
+            poll_count += 1
+
+            # Heartbeat every 60 polls (~60s) so we can confirm loop is alive
+            if poll_count % 60 == 0:
+                n_open = len(open_rfqs) if open_rfqs else 0
+                n_quoted = len(_combo_quoted_rfqs)
+                n_pending = len(_combo_pending_quotes)
+                print(f"   Combo MM heartbeat: poll #{poll_count}, {n_open} open RFQs, "
+                      f"{n_quoted} already quoted, {n_pending} pending fills")
 
             for rfq in open_rfqs:
                 rfq_id = rfq.get('id', '')
