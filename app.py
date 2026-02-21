@@ -171,7 +171,7 @@ PROPMM_MORNING_HOUR_ET = 9        # 9am ET for daily W/L summary
 # Combo (parlay) market-making: quote NO on incoming RFQs
 COMBO_MM_ENABLED = True
 COMBO_MM_MAX_EXPOSURE = 100.00     # Total $ at risk across all open combo positions
-COMBO_MM_EDGE_CENTS = 2            # Quote N cents under fair NO (our edge)
+COMBO_MM_EDGE_CENTS = 0.25         # Quote N cents under fair NO (our edge)
 COMBO_MM_POLL_SECONDS = 1          # Poll for new RFQs every N seconds
 COMBO_MM_ELIGIBLE_PREFIXES = ('KXNBA', 'KXNCAAMB')  # NBA + NCAAB tickers only
 COMBO_MM_MIN_LEGS = 2              # Minimum legs to quote
@@ -3140,9 +3140,9 @@ def process_combo_rfq(kalshi_api, rfq: Dict) -> bool:
         print(f"   Combo RFQ {rfq_id[:8]}: skipped (fair YES {fair_yes*100:.1f}% out of range)")
         return False
 
-    # Calculate our quote prices
-    no_bid_cents = int(fair_no * 100) - COMBO_MM_EDGE_CENTS
-    yes_bid_cents = max(1, int(fair_yes * 100) - COMBO_MM_EDGE_CENTS)
+    # Calculate our quote prices (round to nearest cent after subtracting fractional edge)
+    no_bid_cents = int(round(fair_no * 100 - COMBO_MM_EDGE_CENTS))
+    yes_bid_cents = max(1, int(round(fair_yes * 100 - COMBO_MM_EDGE_CENTS)))
 
     # Sanity: NO bid must be reasonable
     if no_bid_cents < 10 or no_bid_cents > 97:
