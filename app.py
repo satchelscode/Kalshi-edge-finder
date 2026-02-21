@@ -171,7 +171,7 @@ PROPMM_MORNING_HOUR_ET = 9        # 9am ET for daily W/L summary
 # Combo (parlay) market-making: quote NO on incoming RFQs
 COMBO_MM_ENABLED = True
 COMBO_MM_MAX_QUOTE_COST = 50.00    # Max $ per individual quote (cap single-parlay risk)
-COMBO_MM_EDGE_CENTS = -2           # Bid 2c ABOVE fair NO to win fills (still +EV on parlay math)
+COMBO_MM_EDGE_CENTS = -4           # Bid 4c ABOVE fair NO to win fills ($50 cap limits risk)
 COMBO_MM_POLL_SECONDS = 1          # Poll for new RFQs every N seconds
 COMBO_MM_ELIGIBLE_PREFIXES = ('KXNBA', 'KXNCAAMB')  # NBA + NCAAB tickers only
 COMBO_MM_MIN_LEGS = 2              # Minimum legs to quote
