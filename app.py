@@ -172,7 +172,7 @@ PROPMM_MORNING_HOUR_ET = 9        # 9am ET for daily W/L summary
 # Combo (parlay) market-making: quote NO on incoming RFQs
 COMBO_MM_ENABLED = True
 COMBO_MM_MAX_QUOTE_COST = 150.00   # Max $ per individual quote (cap single-parlay risk)
-COMBO_MM_EDGE_CENTS = -4           # Bid 4c ABOVE fair NO to win fills ($50 cap limits risk)
+COMBO_MM_EDGE_CENTS = -8           # Bid 8c ABOVE fair NO to win fills
 COMBO_MM_POLL_SECONDS = 0.25       # Poll for new RFQs every N seconds
 COMBO_MM_ELIGIBLE_PREFIXES = ('KXNBA', 'KXNCAAMB')  # NBA + NCAAB tickers only
 COMBO_MM_MIN_LEGS = 2              # Minimum legs to quote
@@ -3325,7 +3325,7 @@ def _combo_fill_checker_loop(kalshi_api):
                 _check_combo_fills(kalshi_api)
         except Exception as e:
             print(f"   Combo fill checker error: {e}")
-        time.sleep(5)
+        time.sleep(30)  # Check every 30s to avoid 429s competing with quote submissions
 
 
 def _combo_mm_loop():
