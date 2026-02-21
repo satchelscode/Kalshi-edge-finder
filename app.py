@@ -171,7 +171,7 @@ PROPMM_MORNING_HOUR_ET = 9        # 9am ET for daily W/L summary
 # Combo (parlay) market-making: quote NO on incoming RFQs
 COMBO_MM_ENABLED = True
 COMBO_MM_MAX_QUOTE_COST = 150.00   # Max $ per individual quote (cap single-parlay risk)
-COMBO_MM_EDGE_CENTS = 0            # Quote at exact fair NO (maximize fills)
+COMBO_MM_EDGE_CENTS = -1           # Bid 1c ABOVE fair NO to win fills (still +EV on parlay math)
 COMBO_MM_POLL_SECONDS = 1          # Poll for new RFQs every N seconds
 COMBO_MM_ELIGIBLE_PREFIXES = ('KXNBA', 'KXNCAAMB')  # NBA + NCAAB tickers only
 COMBO_MM_MIN_LEGS = 2              # Minimum legs to quote
@@ -2583,7 +2583,7 @@ def manage_prop_orders(kalshi_api, comparisons):
     YES side: Buy YES at Kalshi ask if YES Diff >= 4pp (FD thinks it's worth much
               more than Kalshi price). Market buy 1 contract.
 
-    Max 1 contract per prop (open order OR filled position, never both).
+    Max PROP_MM_CONTRACTS per prop (accounts for existing filled positions).
     """
     if not PROP_MM_ENABLED:
         return
@@ -2606,13 +2606,13 @@ def manage_prop_orders(kalshi_api, comparisons):
                 'side': order.get('side', ''),
             }
 
-    # Build set of tickers where we already hold a position
-    filled_tickers = set()
+    # Build dict of tickers where we already hold a position: ticker -> abs(qty)
+    filled_tickers = {}
     for pos in positions:
         ticker = pos.get('ticker', '')
-        qty = pos.get('position', 0)
-        if qty != 0:
-            filled_tickers.add(ticker)
+        qty = abs(pos.get('position', 0))
+        if qty > 0:
+            filled_tickers[ticker] = qty
 
     no_placed = 0
     yes_placed = 0
@@ -2628,10 +2628,14 @@ def manage_prop_orders(kalshi_api, comparisons):
         yes_diff = comp.get('diff_yes')  # FD implied - Kalshi YES (positive = YES looks cheap)
         active_tickers.add(ticker)
 
-        # Skip if we already have a filled position on this ticker
-        if ticker in filled_tickers:
+        # Skip if we already have max contracts filled on this ticker
+        existing_qty = filled_tickers.get(ticker, 0)
+        if existing_qty >= PROP_MM_CONTRACTS:
             skipped_filled += 1
             continue
+
+        # How many more contracts we can place on this ticker
+        remaining_contracts = PROP_MM_CONTRACTS - existing_qty
 
         # --- YES SIDE: Buy YES if FD thinks it's worth 4+pp more than Kalshi ---
         if yes_diff is not None and yes_diff >= PROP_MM_YES_MIN_DIFF:
@@ -2648,7 +2652,7 @@ def manage_prop_orders(kalshi_api, comparisons):
                             ticker=ticker,
                             side='yes',
                             price_cents=yes_cents,
-                            count=PROP_MM_CONTRACTS,
+                            count=remaining_contracts,
                             client_order_id=client_id,
                         )
                         if result:
@@ -2692,13 +2696,13 @@ def manage_prop_orders(kalshi_api, comparisons):
                 skipped_no_not_top += 1
                 continue
 
-        # Place 1 contract NO limit order
+        # Place NO limit order (up to remaining contracts)
         client_id = f"propmm_{ticker}"
         result = kalshi_api.place_order(
             ticker=ticker,
             side='no',
             price_cents=no_bid_cents,
-            count=PROP_MM_CONTRACTS,
+            count=remaining_contracts,
             client_order_id=client_id,
         )
         if result:
