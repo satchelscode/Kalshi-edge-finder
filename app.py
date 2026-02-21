@@ -162,7 +162,7 @@ MAX_BOOK_DIVERGENCE = 0.10  # Reject edge if FD & Pinnacle devigged probs differ
 # Prop market-making: place resting NO limit orders based on FD one-way lines
 PROP_MM_ENABLED = True
 PROP_MM_EDGE_PP = 0.0      # Match FD exactly (no edge buffer — FD's vig IS our edge)
-PROP_MM_CONTRACTS = 1       # Max 1 contract per prop
+PROP_MM_CONTRACTS = 10      # Max 10 contracts per prop
 PROP_MM_YES_MIN_DIFF = 4.0  # Buy YES if YES Diff >= 4pp (FD implied much higher than Kalshi)
 PROPMM_BETS_FILE = '/tmp/propmm_bets.json'
 PROPMM_UPDATE_INTERVAL_MINS = 30  # Telegram status update frequency
@@ -171,7 +171,7 @@ PROPMM_MORNING_HOUR_ET = 9        # 9am ET for daily W/L summary
 # Combo (parlay) market-making: quote NO on incoming RFQs
 COMBO_MM_ENABLED = True
 COMBO_MM_MAX_EXPOSURE = 100.00     # Total $ at risk across all open combo positions
-COMBO_MM_EDGE_CENTS = 2            # Quote N cents under fair NO (our edge)
+COMBO_MM_EDGE_CENTS = 0.25         # Quote N cents under fair NO (our edge)
 COMBO_MM_POLL_SECONDS = 1          # Poll for new RFQs every N seconds
 COMBO_MM_ELIGIBLE_PREFIXES = ('KXNBA', 'KXNCAAMB')  # NBA + NCAAB tickers only
 COMBO_MM_MIN_LEGS = 2              # Minimum legs to quote
@@ -3140,9 +3140,9 @@ def process_combo_rfq(kalshi_api, rfq: Dict) -> bool:
         print(f"   Combo RFQ {rfq_id[:8]}: skipped (fair YES {fair_yes*100:.1f}% out of range)")
         return False
 
-    # Calculate our quote prices
-    no_bid_cents = int(fair_no * 100) - COMBO_MM_EDGE_CENTS
-    yes_bid_cents = max(1, int(fair_yes * 100) - COMBO_MM_EDGE_CENTS)
+    # Calculate our quote prices (round to nearest cent after subtracting fractional edge)
+    no_bid_cents = int(round(fair_no * 100 - COMBO_MM_EDGE_CENTS))
+    yes_bid_cents = max(1, int(round(fair_yes * 100 - COMBO_MM_EDGE_CENTS)))
 
     # Sanity: NO bid must be reasonable
     if no_bid_cents < 10 or no_bid_cents > 97:
