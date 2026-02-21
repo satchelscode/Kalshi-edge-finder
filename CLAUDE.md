@@ -2,12 +2,13 @@
 
 ## Project Overview
 
-Two-part system on Kalshi:
+Three-part system on Kalshi:
 1. **Auto-trades guaranteed markets** — completed props, NHL tied totals (real money, every 15s)
-2. **Sends Telegram notifications for +EV edges** — moneylines, spreads, totals, BTTS, tennis, live player props (NO trading, notification only)
+2. **Prop market-making** — places YES/NO orders on pre-game player props based on FanDuel lines (real money, every scan)
+3. **Sends Telegram notifications for +EV edges** — moneylines, spreads, totals, BTTS, tennis (NO trading, notification only)
 
 **Tech Stack:** Python (Flask backend) + HTML/CSS/JS (frontend)
-**Main Entry Point:** `app.py` (contains ALL business logic - ~4600 lines)
+**Main Entry Point:** `app.py` (contains ALL business logic - ~5000 lines)
 **Deployment:** Render.com with GitHub CI/CD
 
 ---
@@ -22,22 +23,28 @@ Two-part system on Kalshi:
    - Basketball analytically final — DISABLED (not reliable)
 
 2. **Background Scanner** (`_background_scan_loop`) — Runs continuously (~30s rest between scans)
-   - Moneyline edges (NBA, NHL, NCAAB, soccer) — **NOTIFICATION ONLY**
+   - Pre-game player prop comparison (FD one-way vs Kalshi YES/NO) → **`/props` web page + file cache**
+   - **Prop market-making** (`manage_prop_orders`) — **AUTO-TRADES** (YES buys + NO limit orders)
+   - Moneyline edges (NBA, NHL, NCAAB, UFC, soccer) — **NOTIFICATION ONLY**
    - Spread edges (NBA, NHL, NCAAB) — **NOTIFICATION ONLY**
    - Total edges (NBA, NHL, NCAAB) — **NOTIFICATION ONLY**
-   - **Pre-game player prop edges (NBA, NHL) — YES + NO sides — NOTIFICATION ONLY**
    - BTTS edges (soccer) — **NOTIFICATION ONLY**
    - Tennis match-winner edges — **NOTIFICATION ONLY**
    - Live player prop value (FD one-way vs Kalshi) — DISABLED (live data unreliable)
    - Completed props + NHL tied (also here, duplicated from sniper) — **AUTO-TRADES**
+   - Prop MM Telegram reporting (30-min status + 9am daily summary)
 
 ### Key Components
 
 - **FanDuelAPI class** — Fetches odds from The Odds API (FanDuel + Pinnacle)
-- **KalshiAPI class** — Fetches markets/orderbooks and places orders on Kalshi
+- **KalshiAPI class** — Fetches markets/orderbooks and places/cancels orders on Kalshi
 - **OrderTracker class** — Tracks positions, prevents betting both sides of same game
 - **OddsConverter class** — Handles decimal/American odds conversion
-- **_scan_cache** — Thread-safe cache for scan results (displayed on web dashboard)
+- **_scan_cache** — Thread-safe in-memory cache for scan results (displayed on web dashboard)
+- **File-based caches** (`/tmp/`) — Props and bet data shared across gunicorn processes
+  - Gunicorn may use separate processes for background thread vs web requests
+  - In-memory dicts are NOT shared across processes → use file-based caching
+  - Atomic writes via `os.replace()` prevent partial reads
 
 ---
 
@@ -45,8 +52,13 @@ Two-part system on Kalshi:
 
 ### AUTO-TRADES (real money):
 - `auto_trade_completed_prop()` — buys completed props and NHL tied totals
-- Called from `find_completed_props()` and `find_nhl_tied_game_totals()`
-- These are GUARANTEED outcomes — player already hit stat, or NHL game tied (no ties allowed)
+  - Called from `find_completed_props()` and `find_nhl_tied_game_totals()`
+  - These are GUARANTEED outcomes — player already hit stat, or NHL game tied (no ties allowed)
+- `manage_prop_orders()` — prop market-making on pre-game player props
+  - **YES side:** Buys 1 YES contract at market when FD implied > Kalshi YES by 4+pp
+  - **NO side:** Places 1 resting NO limit order at FD's implied NO price, only if top of orderbook
+  - Max 1 contract per prop (open + filled combined), no rebuy once filled
+  - Bets tracked in `/tmp/propmm_bets.json` for Telegram reporting
 
 ### NOTIFICATION ONLY (no money):
 - `auto_trade_edge()` — **ALWAYS returns None** (line 543)
@@ -153,6 +165,17 @@ found any guaranteed edge. The try/except caught it silently.
 - Uses `PLAYER_PROP_SPORTS` config for series tickers
 - All stat types fetched in one API call per game (saves API quota)
 
+### Prop Market-Making (manage_prop_orders)
+- FanDuel publishes one-way Over lines on player props (e.g., "LaMelo Ball 4+ Threes at -130")
+- FD's implied probability includes ~4-5% vig — they want to be on the NO side
+- **NO side:** We mirror FD's position by bidding NO at FD's implied NO price (vig = our edge)
+  - Only places if we'd be top of NO orderbook (highest bid)
+  - Resting limit order, 1 contract max
+- **YES side:** If FD's implied Over exceeds Kalshi's YES ask by 4+pp, buy 1 YES at market
+  - Market buy (immediate fill), 1 contract max, no rebuy once filled
+- Bets tracked in `/tmp/propmm_bets.json` for Telegram reporting
+- `compare_pregame_props()` provides raw orderbook data (`best_no_bid_cents`, `best_yes_bid_cents`)
+
 ### Live Player Props — DISABLED
 - Was: FanDuel one-way Over vs Kalshi YES (no devigging)
 - Disabled because The Odds API live data is unreliable
@@ -178,6 +201,14 @@ MAX_BOOK_DIVERGENCE = 0.10         # Reject edge if books disagree by >10 percen
 COMPLETED_PROP_MAX_PRICE = 1.00    # Buy any completed prop < $1.00
 SCAN_REST_SECONDS = 30             # Rest between background scans
 
+# Prop market-making
+PROP_MM_ENABLED = True
+PROP_MM_EDGE_PP = 0.0              # Match FD exactly for NO bids (FD's vig IS our edge)
+PROP_MM_CONTRACTS = 1              # Max 1 contract per prop
+PROP_MM_YES_MIN_DIFF = 4.0         # Buy YES if FD implied > Kalshi YES by 4+pp
+PROPMM_UPDATE_INTERVAL_MINS = 30   # Telegram status update frequency
+PROPMM_MORNING_HOUR_ET = 9         # 9am ET daily W/L summary
+
 # Books used for fair value
 PREGAME_BOOKS = ['fanduel', 'pinnacle']
 LIVE_BOOK = 'pinnacle'
@@ -187,7 +218,7 @@ LIVE_BOOK = 'pinnacle'
 
 ## Telegram Notifications
 
-Two formats:
+Four formats:
 
 ### Devigged Edge (moneyline/spread/total/BTTS/tennis)
 ```
@@ -215,6 +246,37 @@ Odds age: 8s ago
 Would bet: YES TICKER @ 60c
 ```
 
+### Prop MM Status (every 30 minutes)
+```
+PROP MM STATUS (13 active bets)
+
+Filled (11):
+  YES Anthony Edwards Assists 4+ @ 53c (+5.5pp)
+  YES Deni Avdija Threes 2+ @ 61c (+5.2pp)
+  ...
+
+Total invested: $6.37
+
+Resting (2):
+  YES Donte DiVincenzo Rebounds 4+ @ 57c (+4.5pp)
+```
+
+### Prop MM Daily Summary (9am ET)
+```
+PROP MM DAILY SUMMARY (Feb 20)
+
+Results: 8W / 5L (62%)
+Invested: $6.37
+Returned: $8.00
+Net P/L: +$1.63
+ROI: +25.6%
+
+Winners:
+  W Nikola Jokić Points 30+ YES @ 49c
+Losers:
+  L James Harden Threes 3+ YES @ 43c
+```
+
 ---
 
 ## Environment Variables Required
@@ -232,12 +294,16 @@ TELEGRAM_CHAT_ID          # Optional: notification target
 ## File Structure
 
 ```
-/app.py              - ALL business logic (~4600 lines)
+/app.py              - ALL business logic (~5000 lines)
 /edge_finder.py      - Legacy/unused (not imported)
 /templates/          - Frontend HTML
 /static/             - CSS/JS assets
 /requirements.txt    - Dependencies
 /CLAUDE.md           - This file
+
+# Runtime files (shared across gunicorn processes via /tmp)
+/tmp/props_cache.json     - FD vs Kalshi prop comparison data (read by /props route)
+/tmp/propmm_bets.json     - Tracked prop MM bets (for Telegram reporting)
 ```
 
 ---
@@ -246,27 +312,29 @@ TELEGRAM_CHAT_ID          # Optional: notification target
 
 | Lines | Section | Status |
 |-------|---------|--------|
-| 1-180 | Imports, constants, config dicts | ACTIVE |
+| 1-180 | Imports, constants, config dicts (incl. PROP_MM_*) | ACTIVE |
 | 180-540 | Utility functions, telegram, `auto_trade_edge` (returns None) | ACTIVE |
 | 540-700 | OddsConverter, prob_to_american, devig functions | ACTIVE |
 | 700-1090 | FanDuelAPI: get_moneyline, get_spreads, get_totals, get_btts | ACTIVE |
-| 1090-1300 | FanDuelAPI: get_fd_live_props | ACTIVE |
-| 1300-1540 | KalshiAPI class | ACTIVE |
+| 1090-1300 | FanDuelAPI: get_fd_live_props, get_player_props_pregame | ACTIVE |
+| 1300-1540 | KalshiAPI class (incl. cancel_order, _auth_delete) | ACTIVE |
 | 1540-1660 | OrderTracker, get_best_yes/no_price | ACTIVE |
 | 1660-1920 | find_moneyline_edges (2-way + 3-way) | ACTIVE (notify only) |
 | 1920-2100 | find_spread_edges | ACTIVE (notify only) |
 | 2100-2280 | find_total_edges | ACTIVE (notify only) |
 | 2280-2380 | find_live_prop_value | DISABLED (live data unreliable) |
-| 2380-2530 | find_pregame_prop_edges (YES + NO) | ACTIVE (notify only) |
-| 2530-2700 | find_btts_edges | ACTIVE (notify only) |
-| 2700-2900 | find_tennis_edges | ACTIVE (notify only) |
-| 2820-3600 | Completed props infrastructure (ESPN, box scores) | ACTIVE (auto-trades) |
-| 3600-3800 | find_basketball_analytically_final | DISABLED (not called) |
-| 3800-3990 | auto_trade_completed_prop | ACTIVE (auto-trades) |
-| 3990-4050 | Completed props sniper loop | ACTIVE |
-| 4050-4140 | scan_all_sports (main scanner) | ACTIVE |
-| 4140-4200 | Background scanner thread | ACTIVE |
-| 4200-end | Flask routes, debug dashboard | ACTIVE |
+| 2380-2520 | compare_pregame_props (FD one-way vs Kalshi YES/NO) | ACTIVE (/props page) |
+| 2520-2660 | manage_prop_orders (prop MM: YES buys + NO limit orders) | ACTIVE (auto-trades) |
+| 2660-2900 | Prop MM bet tracking & Telegram reporting | ACTIVE |
+| 2900-3100 | find_btts_edges | ACTIVE (notify only) |
+| 3100-3300 | find_tennis_edges | ACTIVE (notify only) |
+| 3300-4000 | Completed props infrastructure (ESPN, box scores) | ACTIVE (auto-trades) |
+| 4000-4200 | find_basketball_analytically_final | DISABLED (not called) |
+| 4200-4400 | auto_trade_completed_prop | ACTIVE (auto-trades) |
+| 4400-4500 | Completed props sniper loop | ACTIVE |
+| 4500-4700 | scan_all_sports (main scanner, incl. prop MM) | ACTIVE |
+| 4700-4750 | Background scanner thread (incl. Telegram checks) | ACTIVE |
+| 4750-end | Flask routes, /props page, /orders page, debug dashboard | ACTIVE |
 
 ---
 
