@@ -251,14 +251,14 @@ Would bet: YES TICKER @ 60c
 PROP MM STATUS (13 active bets)
 
 Filled (11):
-  YES Anthony Edwards Assists 4+ @ 53c (+5.5pp)
-  YES Deni Avdija Threes 2+ @ 61c (+5.2pp)
+  YES Anthony Edwards Assists 4+ @ -113 (+5.5pp)
+  YES Deni Avdija Threes 2+ @ -156 (+5.2pp)
   ...
 
 Total invested: $6.37
 
 Resting (2):
-  YES Donte DiVincenzo Rebounds 4+ @ 57c (+4.5pp)
+  NO Donte DiVincenzo Rebounds 4+ @ +110 (+0.0pp)
 ```
 
 ### Prop MM Daily Summary (9am ET)
@@ -272,9 +272,9 @@ Net P/L: +$1.63
 ROI: +25.6%
 
 Winners:
-  W Nikola Jokić Points 30+ YES @ 49c
+  W Nikola Jokić Points 30+ YES @ +104
 Losers:
-  L James Harden Threes 3+ YES @ 43c
+  L James Harden Threes 3+ YES @ +133
 ```
 
 ---
