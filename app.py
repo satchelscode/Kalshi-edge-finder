@@ -1539,7 +1539,8 @@ class KalshiAPI:
         result = self._auth_post('/trade-api/v2/communications/quotes', body, timeout=3)
         if result:
             quote_id = result.get('id', 'unknown')
-            print(f"   >>> QUOTE {quote_id}: submitted")
+            quote_status = result.get('status', 'unknown')
+            print(f"   >>> QUOTE {quote_id}: submitted (status={quote_status})")
             return result
         return None
 
@@ -3182,6 +3183,9 @@ def process_combo_rfq(kalshi_api, rfq: Dict) -> bool:
         # Track the quote
         data = _read_combo_bets()
         quote_id = result.get('id', rfq_id)
+        quote_status = result.get('status', 'unknown')
+        is_immediately_filled = quote_status in ('filled', 'executed')
+
         data['bets'][quote_id] = {
             'rfq_id': rfq_id,
             'legs': len(legs),
@@ -3194,17 +3198,24 @@ def process_combo_rfq(kalshi_api, rfq: Dict) -> bool:
             'contracts': contracts,
             'cost_cents': quote_cost_cents,
             'quoted_at': datetime.utcnow().isoformat(),
-            'status': 'quoted',
+            'status': 'filled' if is_immediately_filled else 'quoted',
         }
+        if is_immediately_filled:
+            data['bets'][quote_id]['filled_at'] = datetime.utcnow().isoformat()
         data['total_exposure_cents'] = data.get('total_exposure_cents', 0) + quote_cost_cents
         _write_combo_bets(data)
 
         n_legs = len(legs)
-        print(f"   COMBO QUOTED: {n_legs}-leg parlay, NO @ {no_bid_cents}c, "
-              f"{contracts} contracts, cost ${quote_cost_cents/100:.2f} "
-              f"(fair NO {fair_no*100:.1f}%, edge {COMBO_MM_EDGE_CENTS}c)")
-
-        send_combo_telegram('QUOTED', rfq_id, legs, fair_yes, no_bid_cents, contracts)
+        if is_immediately_filled:
+            print(f"   COMBO FILLED (immediate): {n_legs}-leg parlay, NO @ {no_bid_cents}c, "
+                  f"{contracts} contracts, cost ${quote_cost_cents/100:.2f} "
+                  f"(fair NO {fair_no*100:.1f}%, edge {COMBO_MM_EDGE_CENTS}c)")
+            send_combo_telegram('FILLED', rfq_id, legs, fair_yes, no_bid_cents, contracts)
+        else:
+            print(f"   COMBO QUOTED: {n_legs}-leg parlay, NO @ {no_bid_cents}c, "
+                  f"{contracts} contracts, cost ${quote_cost_cents/100:.2f} "
+                  f"(fair NO {fair_no*100:.1f}%, edge {COMBO_MM_EDGE_CENTS}c, api_status={quote_status})")
+            send_combo_telegram('QUOTED', rfq_id, legs, fair_yes, no_bid_cents, contracts)
 
         # Track for fill detection
         _combo_pending_quotes[rfq_id] = {
@@ -3224,7 +3235,7 @@ def process_combo_rfq(kalshi_api, rfq: Dict) -> bool:
 
 
 def _check_combo_fills_ws(rfq_id, quote_id, kalshi_api):
-    """Handle a fill detected via WebSocket event. Called immediately on quote_executed/accepted."""
+    """Handle a fill detected via WebSocket event. Called on quote_executed/quote_filled only."""
     pq = _combo_pending_quotes.get(rfq_id)
     if not pq:
         # Try matching by quote_id
@@ -3499,13 +3510,30 @@ def _combo_mm_loop():
                     quote_event = data.get('msg', data)
                     quote_id = quote_event.get('quote_id', quote_event.get('id', ''))
                     rfq_id = quote_event.get('rfq_id', '')
-                    print(f"   Combo MM WS: {msg_type} quote={quote_id[:12] if quote_id else '?'} rfq={rfq_id[:12] if rfq_id else '?'}")
+                    quote_status = quote_event.get('status', '')
+                    print(f"   Combo MM WS: {msg_type} quote={quote_id[:12] if quote_id else '?'} "
+                          f"rfq={rfq_id[:12] if rfq_id else '?'} status={quote_status}")
 
-                    # Handle fill instantly via WS event — no REST call needed
-                    try:
-                        _check_combo_fills_ws(rfq_id, quote_id, kalshi)
-                    except Exception as e:
-                        print(f"   Combo MM WS fill check error: {e}")
+                    if msg_type in ('quote_executed', 'quote_filled'):
+                        # These mean the trade actually filled — handle immediately
+                        try:
+                            _check_combo_fills_ws(rfq_id, quote_id, kalshi)
+                        except Exception as e:
+                            print(f"   Combo MM WS fill check error: {e}")
+                    elif msg_type == 'quote_accepted':
+                        # quote_accepted = Kalshi received our quote, NOT a fill.
+                        # Verify actual status via REST to be sure.
+                        try:
+                            if quote_id and quote_id != '?':
+                                quote_data = kalshi.get_quote(quote_id)
+                                if quote_data:
+                                    actual_status = quote_data.get('status', quote_data.get('quote', {}).get('status', 'unknown'))
+                                    print(f"   Combo MM WS: quote_accepted → REST status: {actual_status}")
+                                    if actual_status in ('filled', 'executed'):
+                                        _check_combo_fills_ws(rfq_id, quote_id, kalshi)
+                                    # else: quote is pending/open, not filled yet
+                        except Exception as e:
+                            print(f"   Combo MM WS quote_accepted verify error: {e}")
 
                 # Periodic heartbeat logging
                 now = time.time()
@@ -6035,6 +6063,84 @@ h1 {{ color: #00ff88; text-align: center; font-size: 2em; margin-bottom: 5px; }}
         html += "</div></body></html>"
         return html
 
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"<h1 style='color:red'>Error</h1><pre>{e}</pre>", 500
+
+
+@app.route('/combo-debug')
+def combo_debug():
+    """Debug page showing combo MM status: pending quotes, recent fills, and quote verification."""
+    try:
+        kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+
+        # Read combo bets file
+        combo_data = _read_combo_bets()
+        bets = combo_data.get('bets', {})
+        exposure = combo_data.get('total_exposure_cents', 0)
+
+        # Get recent quotes from API
+        recent_quotes = kalshi.get_quotes(limit=20)
+
+        # Pending quotes in memory
+        pending = dict(_combo_pending_quotes)
+
+        html = """<!DOCTYPE html>
+<html><head><title>Combo MM Debug</title>
+<meta http-equiv="refresh" content="10">
+<style>
+body { font-family: monospace; background: #1a1a2e; color: #eee; padding: 20px; }
+h1 { color: #00ff88; } h2 { color: #3498db; margin-top: 30px; }
+.nav { margin-bottom: 15px; }
+.nav a { color: #00ff88; text-decoration: none; margin: 0 15px; }
+pre { background: #16213e; padding: 15px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; }
+.filled { color: #00ff88; } .quoted { color: #f1c40f; } .expired { color: #e74c3c; }
+</style></head><body>
+<h1>Combo MM Debug</h1>
+<div class="nav"><a href="/debug">Edge Scanner</a> | <a href="/orders">Orders</a> | <a href="/history">History</a> | <a href="/combo-debug">Combo Debug</a></div>
+"""
+        html += f"<h2>Exposure</h2><pre>Total: {exposure}c (${exposure/100:.2f})</pre>"
+
+        # Pending quotes (in-memory)
+        html += f"<h2>Pending Quotes ({len(pending)})</h2><pre>"
+        if pending:
+            for rid, pq in pending.items():
+                age = time.time() - pq.get('quoted_ts', 0)
+                html += (f"RFQ: {rid[:12]}... quote: {pq.get('quote_id', '?')[:12]}...\n"
+                         f"  NO @ {pq.get('no_bid_cents')}c, {pq.get('contracts')} contracts, "
+                         f"cost ${pq.get('cost_cents', 0)/100:.2f}, age: {age:.0f}s\n\n")
+        else:
+            html += "None"
+        html += "</pre>"
+
+        # Recent bets from file
+        html += f"<h2>Tracked Bets ({len(bets)})</h2><pre>"
+        for key, bet in sorted(bets.items(), key=lambda x: x[1].get('quoted_at', ''), reverse=True)[:20]:
+            status = bet.get('status', '?')
+            css = 'filled' if status == 'filled' else ('expired' if status == 'expired' else 'quoted')
+            html += (f'<span class="{css}">[{status.upper()}]</span> '
+                     f"RFQ: {bet.get('rfq_id', key)[:12]}... "
+                     f"NO @ {bet.get('no_bid_cents', '?')}c, "
+                     f"{bet.get('contracts', '?')} contracts, "
+                     f"cost ${bet.get('cost_cents', 0)/100:.2f}\n"
+                     f"  legs: {bet.get('legs', '?')}, quoted: {bet.get('quoted_at', '?')}\n")
+            if status == 'filled':
+                html += f"  filled_at: {bet.get('filled_at', '?')}\n"
+            html += "\n"
+        html += "</pre>"
+
+        # Recent quotes from Kalshi API
+        html += f"<h2>Recent API Quotes ({len(recent_quotes)})</h2><pre>"
+        for q in recent_quotes[:15]:
+            qid = q.get('id', q.get('quote_id', '?'))
+            status = q.get('status', '?')
+            rfq = q.get('rfq_id', '?')
+            html += f"[{status}] quote: {qid[:16]}... rfq: {rfq[:12]}... yes={q.get('yes_bid')} no={q.get('no_bid')}\n"
+        html += "</pre>"
+
+        html += "</body></html>"
+        return html
     except Exception as e:
         import traceback
         traceback.print_exc()
