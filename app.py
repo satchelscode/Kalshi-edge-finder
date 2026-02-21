@@ -14,6 +14,7 @@ import json
 from difflib import SequenceMatcher
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
+import websocket
 
 app = Flask(__name__)
 
@@ -3295,73 +3296,216 @@ def _check_combo_fills(kalshi_api):
         _combo_pending_quotes.pop(rfq_id, None)
 
 
+def _combo_ws_auth_headers(api_key_id, private_key):
+    """Generate RSA-PSS signed auth headers for Kalshi WebSocket handshake."""
+    timestamp_ms = str(int(time.time() * 1000))
+    # For WebSocket, sign GET /trade-api/ws/v2
+    path = '/trade-api/ws/v2'
+    msg = timestamp_ms + 'GET' + path
+    signature = private_key.sign(
+        msg.encode('utf-8'),
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.DIGEST_LENGTH
+        ),
+        hashes.SHA256()
+    )
+    return {
+        'KALSHI-ACCESS-KEY': api_key_id,
+        'KALSHI-ACCESS-SIGNATURE': base64.b64encode(signature).decode('utf-8'),
+        'KALSHI-ACCESS-TIMESTAMP': timestamp_ms,
+    }
+
+
+def _combo_fill_checker_loop(kalshi_api):
+    """Background thread to periodically check pending combo quotes for fills."""
+    while True:
+        try:
+            if _combo_pending_quotes:
+                _check_combo_fills(kalshi_api)
+        except Exception as e:
+            print(f"   Combo fill checker error: {e}")
+        time.sleep(5)
+
+
 def _combo_mm_loop():
-    """Poll for new combo RFQs and quote NO on eligible ones."""
-    print("Combo market maker started")
+    """WebSocket-based combo market maker. Subscribes to the communications channel
+    for instant rfq_created events instead of REST polling.
+    Falls back to REST polling if WebSocket fails to connect.
+    """
+    print("Combo market maker started (WebSocket mode)")
     time.sleep(10)  # Let other threads initialize first
 
     kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
-    fill_check_counter = 0
-    poll_count = 0
-    cache_warmed = False
 
-    while True:
-        try:
-            if not COMBO_MM_ENABLED:
-                time.sleep(30)
-                continue
+    # Start fill checker in a separate thread
+    fill_thread = threading.Thread(target=_combo_fill_checker_loop, args=(kalshi,), daemon=True)
+    fill_thread.start()
 
-            open_rfqs = kalshi.get_rfqs(status='open')
-            poll_count += 1
-
-            # Heartbeat every ~60s so we can confirm loop is alive
-            if poll_count % 240 == 0:
-                n_open = len(open_rfqs) if open_rfqs else 0
-                n_quoted = len(_combo_quoted_rfqs)
-                n_pending = len(_combo_pending_quotes)
-                n_cached = len(_combo_ob_cache)
-                print(f"   Combo MM heartbeat: poll #{poll_count}, {n_open} open RFQs, "
-                      f"{n_quoted} already quoted, {n_pending} pending fills, {n_cached} cached OBs")
-
-            # Warm cache once on startup: prefetch orderbooks from all open RFQs
-            if not cache_warmed and open_rfqs:
-                for rfq in open_rfqs:
-                    for leg in rfq.get('mve_selected_legs', []):
-                        ticker = leg.get('market_ticker', '')
-                        if ticker and ticker not in _combo_ob_cache:
-                            _get_leg_mid_market(kalshi, ticker)
-                print(f"   Combo MM cache warmed: {len(_combo_ob_cache)} orderbooks cached")
-                cache_warmed = True
-
-            # Process new RFQs
+    # Catch up: process any already-open RFQs via REST before starting WebSocket
+    try:
+        open_rfqs = kalshi.get_rfqs(status='open')
+        if open_rfqs:
             for rfq in open_rfqs:
                 rfq_id = rfq.get('id', '')
                 if not rfq_id or rfq_id in _combo_quoted_rfqs:
                     continue
-
                 legs = rfq.get('mve_selected_legs', [])
                 if not legs:
                     _combo_quoted_rfqs.add(rfq_id)
                     continue
-
-                quoted = process_combo_rfq(kalshi, rfq)
+                process_combo_rfq(kalshi, rfq)
                 _combo_quoted_rfqs.add(rfq_id)
+            print(f"   Combo MM catch-up: processed {len(open_rfqs)} existing RFQs")
+    except Exception as e:
+        print(f"   Combo MM catch-up error: {e}")
 
-            # Check pending quotes for fills every 3 seconds (every 3rd iteration)
-            fill_check_counter += 1
-            if fill_check_counter >= 12 and _combo_pending_quotes:
-                _check_combo_fills(kalshi)
-                fill_check_counter = 0
+    reconnect_delay = 1  # Start with 1s, exponential backoff on repeated failures
 
+    while True:
+        if not COMBO_MM_ENABLED:
+            time.sleep(30)
+            continue
+
+        ws = None
+        try:
+            # Generate auth headers for WebSocket handshake
+            key_str = KALSHI_PRIVATE_KEY.replace('\\n', '\n')
+            private_key = serialization.load_pem_private_key(key_str.encode(), password=None)
+            auth_headers = _combo_ws_auth_headers(KALSHI_API_KEY_ID, private_key)
+
+            ws_url = 'wss://api.elections.kalshi.com/trade-api/ws/v2'
+            header_list = [f"{k}: {v}" for k, v in auth_headers.items()]
+
+            print(f"   Combo MM: connecting to WebSocket...")
+            ws = websocket.create_connection(
+                ws_url,
+                header=header_list,
+                timeout=30,
+            )
+            print(f"   Combo MM: WebSocket connected!")
+
+            # Subscribe to the communications channel (RFQ events)
+            sub_msg = json.dumps({
+                'id': 1,
+                'cmd': 'subscribe',
+                'params': {'channels': ['communications']}
+            })
+            ws.send(sub_msg)
+
+            # Read subscription confirmation
+            sub_resp = ws.recv()
+            print(f"   Combo MM: subscribed to communications channel: {sub_resp[:200]}")
+
+            reconnect_delay = 1  # Reset on successful connection
+            heartbeat_time = time.time()
+            msg_count = 0
+
+            # Main event loop
+            while True:
+                try:
+                    ws.settimeout(30)  # 30s timeout for recv to allow heartbeat checks
+                    raw = ws.recv()
+                    msg_count += 1
+                except websocket.WebSocketTimeoutException:
+                    # No message in 30s — send a ping to keep alive
+                    try:
+                        ws.ping()
+                    except Exception:
+                        print("   Combo MM: ping failed, reconnecting")
+                        break
+                    # Heartbeat log
+                    now = time.time()
+                    if now - heartbeat_time >= 60:
+                        n_quoted = len(_combo_quoted_rfqs)
+                        n_pending = len(_combo_pending_quotes)
+                        n_cached = len(_combo_ob_cache)
+                        print(f"   Combo MM WS heartbeat: {msg_count} msgs, "
+                              f"{n_quoted} quoted, {n_pending} pending, {n_cached} cached OBs")
+                        heartbeat_time = now
+                    continue
+
+                if not raw:
+                    continue
+
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = data.get('type', '')
+
+                # Handle rfq_created events
+                if msg_type == 'rfq_created':
+                    rfq_event = data.get('msg', data)
+                    rfq_id = rfq_event.get('rfq_id', rfq_event.get('id', ''))
+
+                    if not rfq_id or rfq_id in _combo_quoted_rfqs:
+                        continue
+
+                    _combo_quoted_rfqs.add(rfq_id)
+                    print(f"   Combo MM WS: rfq_created {rfq_id[:12]}...")
+
+                    # The WS event may not include legs — fetch full RFQ via REST
+                    try:
+                        rfq_data = kalshi.get_rfq(rfq_id)
+                        if rfq_data:
+                            rfq = rfq_data.get('rfq', rfq_data)
+                            rfq['id'] = rfq_id  # Ensure id is set
+                            if rfq.get('mve_selected_legs'):
+                                process_combo_rfq(kalshi, rfq)
+                            else:
+                                print(f"   Combo MM WS: RFQ {rfq_id[:8]} has no legs, skipping")
+                    except Exception as e:
+                        print(f"   Combo MM WS: error processing RFQ {rfq_id[:8]}: {e}")
+
+                # Handle quote execution events for instant fill detection
+                elif msg_type in ('quote_executed', 'quote_accepted', 'quote_filled'):
+                    quote_event = data.get('msg', data)
+                    quote_id = quote_event.get('quote_id', quote_event.get('id', ''))
+                    rfq_id = quote_event.get('rfq_id', '')
+                    print(f"   Combo MM WS: {msg_type} quote={quote_id[:12] if quote_id else '?'} rfq={rfq_id[:12] if rfq_id else '?'}")
+
+                    # Trigger immediate fill check if this matches a pending quote
+                    if rfq_id in _combo_pending_quotes or any(
+                        pq.get('quote_id') == quote_id for pq in _combo_pending_quotes.values()
+                    ):
+                        try:
+                            _check_combo_fills(kalshi)
+                        except Exception as e:
+                            print(f"   Combo MM WS fill check error: {e}")
+
+                # Periodic heartbeat logging
+                now = time.time()
+                if now - heartbeat_time >= 60:
+                    n_quoted = len(_combo_quoted_rfqs)
+                    n_pending = len(_combo_pending_quotes)
+                    n_cached = len(_combo_ob_cache)
+                    print(f"   Combo MM WS heartbeat: {msg_count} msgs, "
+                          f"{n_quoted} quoted, {n_pending} pending, {n_cached} cached OBs")
+                    heartbeat_time = now
+
+        except websocket.WebSocketException as e:
+            print(f"   Combo MM WebSocket error: {e}")
         except Exception as e:
             print(f"   Combo MM error: {e}")
-            # Re-create API client on error (auth may have expired)
-            try:
-                kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
-            except Exception:
-                pass
+        finally:
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
 
-        time.sleep(COMBO_MM_POLL_SECONDS)
+        # Reconnect with exponential backoff (max 30s)
+        print(f"   Combo MM: reconnecting in {reconnect_delay}s...")
+        time.sleep(reconnect_delay)
+        reconnect_delay = min(30, reconnect_delay * 2)
+
+        # Re-create API client on reconnect (auth may have expired)
+        try:
+            kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+        except Exception:
+            pass
 
 
 def start_combo_mm():
