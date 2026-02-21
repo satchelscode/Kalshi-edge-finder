@@ -2759,13 +2759,15 @@ def send_propmm_status_telegram(kalshi_api):
     if filled_bets:
         lines.append(f"\nFilled ({len(filled_bets)}):")
         for bet in sorted(filled_bets, key=lambda x: x['player']):
-            lines.append(f"  {bet['side'].upper()} {bet['player']} {bet['stat']} {bet['threshold']}+ @ {bet['price_cents']}c ({bet['diff_pp']:+.1f}pp)")
+            odds = prob_to_american(bet['price_cents'] / 100)
+            lines.append(f"  {bet['side'].upper()} {bet['player']} {bet['stat']} {bet['threshold']}+ @ {odds} ({bet['diff_pp']:+.1f}pp)")
         lines.append(f"\nTotal invested: ${total_cost_cents / 100:.2f}")
 
     if resting_bets:
         lines.append(f"\nResting ({len(resting_bets)}):")
         for bet in sorted(resting_bets, key=lambda x: x['player']):
-            lines.append(f"  {bet['side'].upper()} {bet['player']} {bet['stat']} {bet['threshold']}+ @ {bet['price_cents']}c ({bet['diff_pp']:+.1f}pp)")
+            odds = prob_to_american(bet['price_cents'] / 100)
+            lines.append(f"  {bet['side'].upper()} {bet['player']} {bet['stat']} {bet['threshold']}+ @ {odds} ({bet['diff_pp']:+.1f}pp)")
 
     message = '\n'.join(lines)
 
@@ -2862,12 +2864,14 @@ def send_propmm_morning_summary(kalshi_api):
     if winners:
         lines.append(f"\nWinners:")
         for w in winners:
-            lines.append(f"  W {w['player']} {w['stat']} {w['threshold']}+ {w['side'].upper()} @ {w['price_cents']}c")
+            odds = prob_to_american(w['price_cents'] / 100)
+            lines.append(f"  W {w['player']} {w['stat']} {w['threshold']}+ {w['side'].upper()} @ {odds}")
 
     if losers:
         lines.append(f"\nLosers:")
         for l in losers:
-            lines.append(f"  L {l['player']} {l['stat']} {l['threshold']}+ {l['side'].upper()} @ {l['price_cents']}c")
+            odds = prob_to_american(l['price_cents'] / 100)
+            lines.append(f"  L {l['player']} {l['stat']} {l['threshold']}+ {l['side'].upper()} @ {odds}")
 
     if pending_count > 0:
         lines.append(f"\nStill pending: {pending_count} bets")
