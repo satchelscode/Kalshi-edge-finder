@@ -21,7 +21,14 @@ app = Flask(__name__)
 # Configuration
 ODDS_API_KEY = os.environ.get('ODDS_API_KEY')
 KALSHI_API_KEY_ID = os.environ.get('KALSHI_API_KEY_ID')
-KALSHI_PRIVATE_KEY = os.environ.get('KALSHI_PRIVATE_KEY')
+# Support reading private key from file (more reliable than env var for PEM keys)
+_pk_file = os.environ.get('KALSHI_PRIVATE_KEY_FILE')
+if _pk_file and os.path.exists(_pk_file):
+    with open(_pk_file, 'r') as f:
+        KALSHI_PRIVATE_KEY = f.read().strip()
+    print(f"   Loaded private key from file: {_pk_file}")
+else:
+    KALSHI_PRIVATE_KEY = os.environ.get('KALSHI_PRIVATE_KEY')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
