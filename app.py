@@ -170,7 +170,7 @@ PROPMM_MORNING_HOUR_ET = 9        # 9am ET for daily W/L summary
 
 # Combo (parlay) market-making: quote NO on incoming RFQs
 COMBO_MM_ENABLED = True
-COMBO_MM_MAX_QUOTE_COST = 50.00    # Max $ per individual quote (cap single-parlay risk)
+COMBO_MM_MAX_QUOTE_COST = 150.00   # Max $ per individual quote (cap single-parlay risk)
 COMBO_MM_EDGE_CENTS = -4           # Bid 4c ABOVE fair NO to win fills ($50 cap limits risk)
 COMBO_MM_POLL_SECONDS = 0.25       # Poll for new RFQs every N seconds
 COMBO_MM_ELIGIBLE_PREFIXES = ('KXNBA', 'KXNCAAMB')  # NBA + NCAAB tickers only
@@ -3303,6 +3303,7 @@ def _combo_mm_loop():
     kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
     fill_check_counter = 0
     poll_count = 0
+    cache_warmed = False
 
     while True:
         try:
@@ -3322,13 +3323,15 @@ def _combo_mm_loop():
                 print(f"   Combo MM heartbeat: poll #{poll_count}, {n_open} open RFQs, "
                       f"{n_quoted} already quoted, {n_pending} pending fills, {n_cached} cached OBs")
 
-            # Warm cache: prefetch orderbooks from ALL open RFQs (even already-quoted)
-            # so when a new RFQ arrives with the same legs, pricing is instant
-            for rfq in open_rfqs:
-                for leg in rfq.get('mve_selected_legs', []):
-                    ticker = leg.get('market_ticker', '')
-                    if ticker and ticker not in _combo_ob_cache:
-                        _get_leg_mid_market(kalshi, ticker)
+            # Warm cache once on startup: prefetch orderbooks from all open RFQs
+            if not cache_warmed and open_rfqs:
+                for rfq in open_rfqs:
+                    for leg in rfq.get('mve_selected_legs', []):
+                        ticker = leg.get('market_ticker', '')
+                        if ticker and ticker not in _combo_ob_cache:
+                            _get_leg_mid_market(kalshi, ticker)
+                print(f"   Combo MM cache warmed: {len(_combo_ob_cache)} orderbooks cached")
+                cache_warmed = True
 
             # Process new RFQs
             for rfq in open_rfqs:
