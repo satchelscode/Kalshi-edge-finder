@@ -2963,7 +2963,7 @@ _combo_quoted_rfqs = set()  # RFQ IDs we've already quoted on
 _combo_exposure_cents = 0    # Current total $ at risk in cents
 _combo_pending_quotes = {}   # {rfq_id: {'quote_id': str, 'no_bid_cents': int, 'contracts': int, 'cost_cents': int, 'legs': int}}
 _combo_ob_cache = {}         # {ticker: {'mid_yes': float, 'ts': float}} — orderbook cache for fast pricing
-COMBO_OB_CACHE_TTL = 30      # Cache orderbook data for 30 seconds
+COMBO_OB_CACHE_TTL = 300     # Cache orderbook data for 5 minutes (pre-game markets are stable)
 
 
 def _read_combo_bets():
