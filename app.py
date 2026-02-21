@@ -3400,6 +3400,11 @@ def _combo_mm_loop():
             reconnect_delay = 1  # Reset on successful connection
             heartbeat_time = time.time()
             msg_count = 0
+            rfqs_seen = 0
+            rfqs_quoted = 0
+            rfqs_skipped_cost = 0
+            rfqs_skipped_other = 0
+            logged_raw_events = 0  # Log first few raw events for debugging
 
             # Main event loop
             while True:
@@ -3417,11 +3422,11 @@ def _combo_mm_loop():
                     # Heartbeat log
                     now = time.time()
                     if now - heartbeat_time >= 60:
-                        n_quoted = len(_combo_quoted_rfqs)
                         n_pending = len(_combo_pending_quotes)
                         n_cached = len(_combo_ob_cache)
-                        print(f"   Combo MM WS heartbeat: {msg_count} msgs, "
-                              f"{n_quoted} quoted, {n_pending} pending, {n_cached} cached OBs")
+                        print(f"   Combo MM WS heartbeat: {msg_count} msgs, {rfqs_seen} RFQs seen, "
+                              f"{rfqs_quoted} quoted, {rfqs_skipped_cost} too expensive, "
+                              f"{rfqs_skipped_other} skipped, {n_pending} pending, {n_cached} cached OBs")
                         heartbeat_time = now
                     continue
 
@@ -3435,6 +3440,11 @@ def _combo_mm_loop():
 
                 msg_type = data.get('type', '')
 
+                # Log first 3 raw rfq_created events to see what fields are available
+                if msg_type == 'rfq_created' and logged_raw_events < 3:
+                    print(f"   Combo MM WS RAW EVENT: {json.dumps(data)[:500]}")
+                    logged_raw_events += 1
+
                 # Handle rfq_created events
                 if msg_type == 'rfq_created':
                     rfq_event = data.get('msg', data)
@@ -3444,20 +3454,50 @@ def _combo_mm_loop():
                         continue
 
                     _combo_quoted_rfqs.add(rfq_id)
-                    print(f"   Combo MM WS: rfq_created {rfq_id[:12]}...")
+                    rfqs_seen += 1
 
-                    # The WS event may not include legs — fetch full RFQ via REST
-                    try:
-                        rfq_data = kalshi.get_rfq(rfq_id)
-                        if rfq_data:
-                            rfq = rfq_data.get('rfq', rfq_data)
-                            rfq['id'] = rfq_id  # Ensure id is set
-                            if rfq.get('mve_selected_legs'):
-                                process_combo_rfq(kalshi, rfq)
+                    # Try to use leg data directly from WS event (fastest path — no REST call)
+                    legs = rfq_event.get('mve_selected_legs', [])
+
+                    if legs:
+                        # We have legs from the WS event — skip REST get_rfq() entirely!
+                        rfq = dict(rfq_event)
+                        rfq['id'] = rfq_id
+                        try:
+                            if process_combo_rfq(kalshi, rfq):
+                                rfqs_quoted += 1
                             else:
-                                print(f"   Combo MM WS: RFQ {rfq_id[:8]} has no legs, skipping")
-                    except Exception as e:
-                        print(f"   Combo MM WS: error processing RFQ {rfq_id[:8]}: {e}")
+                                rfqs_skipped_other += 1
+                        except Exception as e:
+                            print(f"   Combo MM WS: error processing RFQ {rfq_id[:8]}: {e}")
+                    else:
+                        # No legs in event — need REST call. Pre-filter first to save API calls.
+                        contracts = rfq_event.get('contracts', 0)
+                        if not contracts:
+                            try:
+                                contracts = int(float(rfq_event.get('contracts_fp', '0')))
+                            except (ValueError, TypeError):
+                                contracts = 0
+
+                        # Skip if likely too expensive (assume worst case ~90c NO bid)
+                        if contracts > 0 and (90 * contracts) > int(COMBO_MM_MAX_QUOTE_COST * 100):
+                            rfqs_skipped_cost += 1
+                            continue
+
+                        # Fetch full RFQ via REST
+                        try:
+                            rfq_data = kalshi.get_rfq(rfq_id)
+                            if rfq_data:
+                                rfq = rfq_data.get('rfq', rfq_data)
+                                rfq['id'] = rfq_id
+                                if rfq.get('mve_selected_legs'):
+                                    if process_combo_rfq(kalshi, rfq):
+                                        rfqs_quoted += 1
+                                    else:
+                                        rfqs_skipped_other += 1
+                        except Exception as e:
+                            if '429' not in str(e):
+                                print(f"   Combo MM WS: error processing RFQ {rfq_id[:8]}: {e}")
 
                 # Handle quote execution events for instant fill detection
                 elif msg_type in ('quote_executed', 'quote_accepted', 'quote_filled'):
@@ -3481,8 +3521,9 @@ def _combo_mm_loop():
                     n_quoted = len(_combo_quoted_rfqs)
                     n_pending = len(_combo_pending_quotes)
                     n_cached = len(_combo_ob_cache)
-                    print(f"   Combo MM WS heartbeat: {msg_count} msgs, "
-                          f"{n_quoted} quoted, {n_pending} pending, {n_cached} cached OBs")
+                    print(f"   Combo MM WS heartbeat: {msg_count} msgs, {rfqs_seen} RFQs seen, "
+                          f"{rfqs_quoted} quoted, {rfqs_skipped_cost} too expensive, "
+                          f"{rfqs_skipped_other} skipped, {n_pending} pending, {n_cached} cached OBs")
                     heartbeat_time = now
 
         except websocket.WebSocketException as e:
