@@ -2,10 +2,11 @@
 
 ## Project Overview
 
-Three-part system on Kalshi:
+Four-part system on Kalshi:
 1. **Auto-trades guaranteed markets** — completed props, NHL tied totals (real money, every 15s)
 2. **Prop market-making** — places YES/NO orders on pre-game player props based on FanDuel lines (real money, every scan)
-3. **Sends Telegram notifications for +EV edges** — moneylines, spreads, totals, BTTS, tennis (NO trading, notification only)
+3. **Combo (parlay) market-making** — quotes NO on incoming RFQs using Kalshi mid-market pricing (real money, polls every 3s)
+4. **Sends Telegram notifications for +EV edges** — moneylines, spreads, totals, BTTS, tennis (NO trading, notification only)
 
 **Tech Stack:** Python (Flask backend) + HTML/CSS/JS (frontend)
 **Main Entry Point:** `app.py` (contains ALL business logic - ~5000 lines)
@@ -15,7 +16,7 @@ Three-part system on Kalshi:
 
 ## Architecture
 
-### Active Threads (2)
+### Active Threads (3)
 
 1. **Completed Props Sniper** (`_completed_props_sniper_loop`) — Runs every 15 seconds
    - Completed player props (NBA, NHL) — **AUTO-TRADES**
@@ -33,6 +34,13 @@ Three-part system on Kalshi:
    - Live player prop value (FD one-way vs Kalshi) — DISABLED (live data unreliable)
    - Completed props + NHL tied (also here, duplicated from sniper) — **AUTO-TRADES**
    - Prop MM Telegram reporting (30-min status + 9am daily summary)
+
+3. **Combo Market Maker** (`_combo_mm_loop`) — Polls every 3 seconds
+   - Polls `GET /communications/rfqs?status=open` for new combo RFQs
+   - Calculates fair value from Kalshi mid-market prices of each leg
+   - Quotes NO at fair minus 2¢ edge — **AUTO-TRADES**
+   - Only quotes NBA (`KXNBA*`) and NCAAB (`KXNCAAMB*`) combos
+   - $100 max total exposure, Telegram confirmation on each quote
 
 ### Key Components
 
@@ -59,6 +67,12 @@ Three-part system on Kalshi:
   - **NO side:** Places 1 resting NO limit order at FD's implied NO price, only if top of orderbook
   - Max 1 contract per prop (open + filled combined), no rebuy once filled
   - Bets tracked in `/tmp/propmm_bets.json` for Telegram reporting
+- `process_combo_rfq()` — combo (parlay) market-making via RFQ system
+  - Polls for open RFQs, calculates fair combo price from individual leg orderbooks
+  - **NO side only:** Quotes NO at mid-market fair minus 2¢ edge
+  - Uses Kalshi's own prices (no external API) for speed
+  - $100 total portfolio exposure cap, auto-reduces contract count to fit
+  - Bets tracked in `/tmp/combo_mm_bets.json`
 
 ### NOTIFICATION ONLY (no money):
 - `auto_trade_edge()` — **ALWAYS returns None** (line 543)
@@ -176,6 +190,17 @@ found any guaranteed edge. The try/except caught it silently.
 - Bets tracked in `/tmp/propmm_bets.json` for Telegram reporting
 - `compare_pregame_props()` provides raw orderbook data (`best_no_bid_cents`, `best_yes_bid_cents`)
 
+### Combo (Parlay) Market-Making (process_combo_rfq)
+- Polls Kalshi RFQ endpoint for open combo requests
+- For each leg: fetches Kalshi orderbook, calculates mid-market YES:
+  `mid_yes = (best_yes_bid + (100 - best_no_bid)) / 2 / 100`
+- Fair combo YES = product of all leg probabilities (assumes independence)
+- Fair combo NO = 1 - combo YES
+- Quote: NO bid = fair_no - 2¢, YES bid = fair_yes - 2¢ (effectively NO-only)
+- **Correlation risk:** Same-game parlays have correlated legs, making independent
+  multiplication underestimate combo YES. Accepted risk with $100 cap for v1.
+- Eligible: NBA (KXNBA*) + NCAAB (KXNCAAMB*) only, 2-10 legs
+
 ### Live Player Props — DISABLED
 - Was: FanDuel one-way Over vs Kalshi YES (no devigging)
 - Disabled because The Odds API live data is unreliable
@@ -208,6 +233,13 @@ PROP_MM_CONTRACTS = 1              # Max 1 contract per prop
 PROP_MM_YES_MIN_DIFF = 4.0         # Buy YES if FD implied > Kalshi YES by 4+pp
 PROPMM_UPDATE_INTERVAL_MINS = 30   # Telegram status update frequency
 PROPMM_MORNING_HOUR_ET = 9         # 9am ET daily W/L summary
+
+# Combo (parlay) market-making
+COMBO_MM_ENABLED = True
+COMBO_MM_MAX_EXPOSURE = 100.00     # Total $ at risk across all open combo positions
+COMBO_MM_EDGE_CENTS = 2            # Quote N cents under fair NO
+COMBO_MM_POLL_SECONDS = 3          # Poll for new RFQs every N seconds
+COMBO_MM_ELIGIBLE_PREFIXES = ('KXNBA', 'KXNCAAMB')  # NBA + NCAAB
 
 # Books used for fair value
 PREGAME_BOOKS = ['fanduel', 'pinnacle']
@@ -304,6 +336,7 @@ TELEGRAM_CHAT_ID          # Optional: notification target
 # Runtime files (shared across gunicorn processes via /tmp)
 /tmp/props_cache.json     - FD vs Kalshi prop comparison data (read by /props route)
 /tmp/propmm_bets.json     - Tracked prop MM bets (for Telegram reporting)
+/tmp/combo_mm_bets.json   - Tracked combo MM quotes/fills (exposure tracking)
 ```
 
 ---
@@ -326,7 +359,8 @@ TELEGRAM_CHAT_ID          # Optional: notification target
 | 2380-2520 | compare_pregame_props (FD one-way vs Kalshi YES/NO) | ACTIVE (/props page) |
 | 2520-2660 | manage_prop_orders (prop MM: YES buys + NO limit orders) | ACTIVE (auto-trades) |
 | 2660-2900 | Prop MM bet tracking & Telegram reporting | ACTIVE |
-| 2900-3100 | find_btts_edges | ACTIVE (notify only) |
+| 2900-3200 | Combo (parlay) MM: RFQ polling, pricing, quoting | ACTIVE (auto-trades) |
+| 3200-3400 | find_btts_edges | ACTIVE (notify only) |
 | 3100-3300 | find_tennis_edges | ACTIVE (notify only) |
 | 3300-4000 | Completed props infrastructure (ESPN, box scores) | ACTIVE (auto-trades) |
 | 4000-4200 | find_basketball_analytically_final | DISABLED (not called) |
