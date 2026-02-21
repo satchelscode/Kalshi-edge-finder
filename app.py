@@ -2972,7 +2972,9 @@ _combo_quoted_rfqs = set()  # RFQ IDs we've already quoted on
 _combo_exposure_cents = 0    # Current total $ at risk in cents
 _combo_pending_quotes = {}   # {rfq_id: {'quote_id': str, 'no_bid_cents': int, 'contracts': int, 'cost_cents': int, 'legs': int}}
 _combo_ob_cache = {}         # {ticker: {'mid_yes': float, 'ts': float}} — orderbook cache for fast pricing
+_combo_market_cache = {}     # {ticker: {'is_live': bool, 'ts': float}} — market status cache
 COMBO_OB_CACHE_TTL = 300     # Cache orderbook data for 5 minutes (pre-game markets are stable)
+COMBO_MARKET_CACHE_TTL = 300 # Cache market status for 5 minutes
 
 
 def _read_combo_bets():
@@ -3065,14 +3067,53 @@ def calculate_combo_fair_value(kalshi_api, legs: List[Dict]) -> Optional[Dict]:
     }
 
 
-def _is_combo_eligible(legs: List[Dict]) -> bool:
-    """Check if all legs are from eligible markets (NBA/NCAAB)."""
+def _is_leg_live(kalshi_api, ticker: str) -> bool:
+    """Check if a market's game has started (live). Uses cache to avoid repeated API calls.
+    Returns True if game is live/started, False if pre-game.
+    """
+    now = time.time()
+    cached = _combo_market_cache.get(ticker)
+    if cached and (now - cached['ts']) < COMBO_MARKET_CACHE_TTL:
+        return cached['is_live']
+
+    # Fetch market details
+    is_live = False
+    try:
+        market = kalshi_api.get_market(ticker)
+        if market:
+            # Check close_time — if it's in the past or very soon, game has started
+            close_time_str = market.get('close_time', '')
+            if close_time_str:
+                close_time = datetime.fromisoformat(close_time_str.replace('Z', '+00:00'))
+                # If close_time is within 5 minutes from now or in the past, consider it live
+                if close_time <= datetime.now(timezone.utc) + timedelta(minutes=5):
+                    is_live = True
+            # Also check if market has 'status' indicating game started
+            status = market.get('status', '')
+            if status in ('closed', 'settled'):
+                is_live = True
+    except Exception as e:
+        print(f"   Combo MM: error checking market status for {ticker[:20]}: {e}")
+
+    _combo_market_cache[ticker] = {'is_live': is_live, 'ts': now}
+    return is_live
+
+
+def _is_combo_eligible(legs: List[Dict], kalshi_api=None) -> bool:
+    """Check if all legs are from eligible markets (NBA/NCAAB) and pre-game only."""
     if len(legs) < COMBO_MM_MIN_LEGS or len(legs) > COMBO_MM_MAX_LEGS:
         return False
     for leg in legs:
         ticker = leg.get('market_ticker', '')
         if not ticker.startswith(COMBO_MM_ELIGIBLE_PREFIXES):
             return False
+    # Pre-game only: skip if any leg's game has already started
+    if kalshi_api:
+        for leg in legs:
+            ticker = leg.get('market_ticker', '')
+            if _is_leg_live(kalshi_api, ticker):
+                print(f"   Combo RFQ: skipped (live game leg: {ticker[:30]})")
+                return False
     return True
 
 
@@ -3143,8 +3184,8 @@ def process_combo_rfq(kalshi_api, rfq: Dict) -> bool:
     if contracts <= 0:
         return False
 
-    # Check eligibility
-    if not _is_combo_eligible(legs):
+    # Check eligibility (includes pre-game only check)
+    if not _is_combo_eligible(legs, kalshi_api=kalshi_api):
         return False
 
     # Calculate fair value from Kalshi orderbooks
