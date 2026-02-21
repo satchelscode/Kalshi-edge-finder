@@ -172,7 +172,7 @@ PROPMM_MORNING_HOUR_ET = 9        # 9am ET for daily W/L summary
 COMBO_MM_ENABLED = True
 COMBO_MM_MAX_EXPOSURE = 100.00     # Total $ at risk across all open combo positions
 COMBO_MM_EDGE_CENTS = 2            # Quote N cents under fair NO (our edge)
-COMBO_MM_POLL_SECONDS = 3          # Poll for new RFQs every N seconds
+COMBO_MM_POLL_SECONDS = 1          # Poll for new RFQs every N seconds
 COMBO_MM_ELIGIBLE_PREFIXES = ('KXNBA', 'KXNCAAMB')  # NBA + NCAAB tickers only
 COMBO_MM_MIN_LEGS = 2              # Minimum legs to quote
 COMBO_MM_MAX_LEGS = 10             # Maximum legs to quote
@@ -1508,6 +1508,20 @@ class KalshiAPI:
     def get_rfq(self, rfq_id: str) -> Optional[Dict]:
         """Get a single RFQ by ID."""
         return self._auth_get(f'/trade-api/v2/communications/rfqs/{rfq_id}')
+
+    def get_quotes(self, rfq_id: str = None, limit: int = 100) -> List[Dict]:
+        """Get quotes, optionally filtered by RFQ ID."""
+        params = {'limit': limit}
+        if rfq_id:
+            params['rfq_id'] = rfq_id
+        result = self._auth_get('/trade-api/v2/communications/quotes', params=params)
+        if result:
+            return result.get('quotes', [])
+        return []
+
+    def get_quote(self, quote_id: str) -> Optional[Dict]:
+        """Get a single quote by ID."""
+        return self._auth_get(f'/trade-api/v2/communications/quotes/{quote_id}')
 
     def create_quote(self, rfq_id: str, yes_bid: float, no_bid: float,
                      rest_remainder: bool = False) -> Optional[Dict]:
@@ -2943,6 +2957,7 @@ def send_propmm_morning_summary(kalshi_api):
 # In-memory tracking (combo MM runs in its own thread)
 _combo_quoted_rfqs = set()  # RFQ IDs we've already quoted on
 _combo_exposure_cents = 0    # Current total $ at risk in cents
+_combo_pending_quotes = {}   # {rfq_id: {'quote_id': str, 'no_bid_cents': int, 'contracts': int, 'cost_cents': int, 'legs': int}}
 
 
 def _read_combo_bets():
@@ -3182,9 +3197,94 @@ def process_combo_rfq(kalshi_api, rfq: Dict) -> bool:
               f"(fair NO {fair_no*100:.1f}%, edge {COMBO_MM_EDGE_CENTS}c)")
 
         send_combo_telegram('QUOTED', rfq_id, legs, fair_yes, no_bid_cents, contracts)
+
+        # Track for fill detection
+        _combo_pending_quotes[rfq_id] = {
+            'quote_id': quote_id,
+            'no_bid_cents': no_bid_cents,
+            'contracts': contracts,
+            'cost_cents': quote_cost_cents,
+            'legs': len(legs),
+            'leg_tickers': [l.get('market_ticker', '') for l in legs],
+            'leg_sides': [l.get('side', '') for l in legs],
+            'fair_yes': fair_yes,
+        }
         return True
 
     return False
+
+
+def _check_combo_fills(kalshi_api):
+    """Check pending combo quotes for fills or expirations.
+    Updates bets file and sends Telegram for fills.
+    """
+    if not _combo_pending_quotes:
+        return
+
+    resolved = []
+    for rfq_id, pq in list(_combo_pending_quotes.items()):
+        try:
+            rfq_data = kalshi_api.get_rfq(rfq_id)
+            if not rfq_data:
+                continue
+
+            rfq_status = rfq_data.get('status', rfq_data.get('rfq', {}).get('status', ''))
+            # Also check nested structure
+            if not rfq_status and isinstance(rfq_data.get('rfq'), dict):
+                rfq_status = rfq_data['rfq'].get('status', '')
+
+            if rfq_status == 'open':
+                continue  # Still pending
+
+            # RFQ is no longer open — check if our quote was filled
+            filled = False
+            quote_id = pq.get('quote_id', '')
+
+            if quote_id and quote_id != rfq_id:
+                quote_data = kalshi_api.get_quote(quote_id)
+                if quote_data:
+                    q = quote_data.get('quote', quote_data)
+                    quote_status = q.get('status', '')
+                    filled = quote_status in ('filled', 'accepted', 'executed')
+                    print(f"   Combo quote {quote_id[:8]}: status={quote_status}, filled={filled}")
+
+            # Update bets file
+            data = _read_combo_bets()
+            bet_key = quote_id if quote_id in data.get('bets', {}) else rfq_id
+            if bet_key in data.get('bets', {}):
+                if filled:
+                    data['bets'][bet_key]['status'] = 'filled'
+                    data['bets'][bet_key]['filled_at'] = datetime.utcnow().isoformat()
+                else:
+                    data['bets'][bet_key]['status'] = 'expired'
+                    # Release exposure
+                    cost = data['bets'][bet_key].get('cost_cents', 0)
+                    data['total_exposure_cents'] = max(0, data.get('total_exposure_cents', 0) - cost)
+                _write_combo_bets(data)
+
+            if filled:
+                n_legs = pq['legs']
+                cost = pq['cost_cents']
+                max_win = (100 - pq['no_bid_cents']) * pq['contracts']
+                print(f"   COMBO FILLED: {n_legs}-leg parlay, NO @ {pq['no_bid_cents']}c, "
+                      f"{pq['contracts']} contracts, cost ${cost/100:.2f}")
+
+                # Build legs list for Telegram
+                legs_for_tg = [{'market_ticker': t, 'side': s}
+                               for t, s in zip(pq['leg_tickers'], pq['leg_sides'])]
+                send_combo_telegram('FILLED', rfq_id, legs_for_tg,
+                                   pq['fair_yes'], pq['no_bid_cents'], pq['contracts'])
+            else:
+                print(f"   Combo RFQ {rfq_id[:8]}: expired/rejected, exposure released ${pq['cost_cents']/100:.2f}")
+
+            resolved.append(rfq_id)
+
+        except Exception as e:
+            print(f"   Combo fill check error for {rfq_id[:8]}: {e}")
+
+    # Clean up resolved quotes
+    for rfq_id in resolved:
+        _combo_pending_quotes.pop(rfq_id, None)
 
 
 def _combo_mm_loop():
@@ -3192,13 +3292,15 @@ def _combo_mm_loop():
     print("Combo market maker started")
     time.sleep(10)  # Let other threads initialize first
 
+    kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+    fill_check_counter = 0
+
     while True:
         try:
             if not COMBO_MM_ENABLED:
                 time.sleep(30)
                 continue
 
-            kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
             open_rfqs = kalshi.get_rfqs(status='open')
 
             for rfq in open_rfqs:
@@ -3218,8 +3320,19 @@ def _combo_mm_loop():
                 if quoted:
                     time.sleep(0.5)  # Brief pause between quotes
 
+            # Check pending quotes for fills every 3 seconds (every 3rd iteration)
+            fill_check_counter += 1
+            if fill_check_counter >= 3 and _combo_pending_quotes:
+                _check_combo_fills(kalshi)
+                fill_check_counter = 0
+
         except Exception as e:
             print(f"   Combo MM error: {e}")
+            # Re-create API client on error (auth may have expired)
+            try:
+                kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+            except Exception:
+                pass
 
         time.sleep(COMBO_MM_POLL_SECONDS)
 
