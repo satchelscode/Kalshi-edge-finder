@@ -171,7 +171,7 @@ MAX_BOOK_DIVERGENCE = 0.10  # Reject edge if FD & Pinnacle devigged probs differ
 # Prop market-making: place resting NO limit orders based on FD one-way lines
 PROP_MM_ENABLED = True
 PROP_MM_EDGE_PP = 0.0      # Match FD exactly (no edge buffer — FD's vig IS our edge)
-PROP_MM_CONTRACTS = 10      # Max 10 contracts per prop
+PROP_MM_CONTRACTS = 100     # Max 100 contracts per prop
 PROP_MM_YES_MIN_DIFF = 4.0  # Buy YES if YES Diff >= 4pp (FD implied much higher than Kalshi)
 PROPMM_BETS_FILE = '/tmp/propmm_bets.json'
 PROPMM_UPDATE_INTERVAL_MINS = 30  # Telegram status update frequency
