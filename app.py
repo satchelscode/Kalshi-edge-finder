@@ -170,7 +170,7 @@ PROPMM_MORNING_HOUR_ET = 9        # 9am ET for daily W/L summary
 
 # Combo (parlay) market-making: quote NO on incoming RFQs
 COMBO_MM_ENABLED = True
-COMBO_MM_MAX_EXPOSURE = 100.00     # Total $ at risk across all open combo positions
+COMBO_MM_MAX_EXPOSURE = 500.00     # Total $ at risk across pending (unfilled) quotes
 COMBO_MM_EDGE_CENTS = 0            # Quote at exact fair NO (maximize fills)
 COMBO_MM_POLL_SECONDS = 1          # Poll for new RFQs every N seconds
 COMBO_MM_ELIGIBLE_PREFIXES = ('KXNBA', 'KXNCAAMB')  # NBA + NCAAB tickers only
@@ -3252,14 +3252,15 @@ def _check_combo_fills(kalshi_api):
             data = _read_combo_bets()
             bet_key = quote_id if quote_id in data.get('bets', {}) else rfq_id
             if bet_key in data.get('bets', {}):
+                cost = data['bets'][bet_key].get('cost_cents', 0)
                 if filled:
                     data['bets'][bet_key]['status'] = 'filled'
                     data['bets'][bet_key]['filled_at'] = datetime.utcnow().isoformat()
                 else:
                     data['bets'][bet_key]['status'] = 'expired'
-                    # Release exposure
-                    cost = data['bets'][bet_key].get('cost_cents', 0)
-                    data['total_exposure_cents'] = max(0, data.get('total_exposure_cents', 0) - cost)
+                # Release exposure on both fills and expirations — filled quotes
+                # become positions (risk already taken), expired ones are dead
+                data['total_exposure_cents'] = max(0, data.get('total_exposure_cents', 0) - cost)
                 _write_combo_bets(data)
 
             if filled:
