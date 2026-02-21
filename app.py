@@ -168,6 +168,16 @@ PROPMM_BETS_FILE = '/tmp/propmm_bets.json'
 PROPMM_UPDATE_INTERVAL_MINS = 30  # Telegram status update frequency
 PROPMM_MORNING_HOUR_ET = 9        # 9am ET for daily W/L summary
 
+# Combo (parlay) market-making: quote NO on incoming RFQs
+COMBO_MM_ENABLED = True
+COMBO_MM_MAX_EXPOSURE = 100.00     # Total $ at risk across all open combo positions
+COMBO_MM_EDGE_CENTS = 2            # Quote N cents under fair NO (our edge)
+COMBO_MM_POLL_SECONDS = 3          # Poll for new RFQs every N seconds
+COMBO_MM_ELIGIBLE_PREFIXES = ('KXNBA', 'KXNCAAMB')  # NBA + NCAAB tickers only
+COMBO_MM_MIN_LEGS = 2              # Minimum legs to quote
+COMBO_MM_MAX_LEGS = 10             # Maximum legs to quote
+COMBO_MM_BETS_FILE = '/tmp/combo_mm_bets.json'
+
 # Multi-book fair value configuration
 # Pre-game: FanDuel + Pinnacle combined devig (require both)
 # Live: Pinnacle only devig (sharpest book with live odds)
@@ -1482,6 +1492,41 @@ class KalshiAPI:
         """Cancel a resting order by order_id."""
         print(f"   >>> CANCELING ORDER: {order_id}")
         return self._auth_delete(f'/trade-api/v2/portfolio/orders/{order_id}')
+
+    # --- RFQ / Combo methods ---
+
+    def get_rfqs(self, status: str = None, limit: int = 100) -> List[Dict]:
+        """Get RFQs, optionally filtered by status (open/closed)."""
+        params = {'limit': limit}
+        if status:
+            params['status'] = status
+        result = self._auth_get('/trade-api/v2/communications/rfqs', params=params)
+        if result:
+            return result.get('rfqs', [])
+        return []
+
+    def get_rfq(self, rfq_id: str) -> Optional[Dict]:
+        """Get a single RFQ by ID."""
+        return self._auth_get(f'/trade-api/v2/communications/rfqs/{rfq_id}')
+
+    def create_quote(self, rfq_id: str, yes_bid: float, no_bid: float,
+                     rest_remainder: bool = False) -> Optional[Dict]:
+        """Submit a quote in response to an RFQ.
+        yes_bid/no_bid in dollars (e.g., 0.15 for 15 cents).
+        """
+        body = {
+            'rfq_id': rfq_id,
+            'yes_bid': f"{yes_bid:.4f}",
+            'no_bid': f"{no_bid:.4f}",
+            'rest_remainder': rest_remainder,
+        }
+        print(f"   >>> COMBO QUOTE: RFQ {rfq_id[:8]}... YES bid ${yes_bid:.2f} / NO bid ${no_bid:.2f}")
+        result = self._auth_post('/trade-api/v2/communications/quotes', body)
+        if result:
+            quote_id = result.get('id', 'unknown')
+            print(f"   >>> QUOTE {quote_id}: submitted")
+            return result
+        return None
 
     def get_markets(self, series_ticker: str, limit: int = 200, status: str = 'open') -> List[Dict]:
         all_markets = []
@@ -2889,6 +2934,301 @@ def send_propmm_morning_summary(kalshi_api):
         print(f"   Prop MM morning summary sent: {len(winners)}W/{len(losers)}L, ROI {sign}{roi:.1f}%")
     except Exception as e:
         print(f"   Prop MM morning summary failed: {e}")
+
+
+# ============================================================
+# COMBO (PARLAY) MARKET MAKER — Quote NO on incoming RFQs
+# ============================================================
+
+# In-memory tracking (combo MM runs in its own thread)
+_combo_quoted_rfqs = set()  # RFQ IDs we've already quoted on
+_combo_exposure_cents = 0    # Current total $ at risk in cents
+
+
+def _read_combo_bets():
+    """Read tracked combo bets from persistent file."""
+    try:
+        with open(COMBO_MM_BETS_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {'bets': {}, 'total_exposure_cents': 0}
+
+
+def _write_combo_bets(data):
+    """Write combo bets to file (atomic)."""
+    try:
+        tmp_file = COMBO_MM_BETS_FILE + '.tmp'
+        with open(tmp_file, 'w') as f:
+            json.dump(data, f)
+        os.replace(tmp_file, COMBO_MM_BETS_FILE)
+    except Exception as e:
+        print(f"   Warning: failed to write combo bets file: {e}")
+
+
+def _get_leg_mid_market(kalshi_api, ticker: str) -> Optional[float]:
+    """Get mid-market YES probability for a single leg from Kalshi orderbook.
+    Returns probability as decimal (0-1) or None if orderbook is empty.
+    """
+    ob = kalshi_api.get_orderbook(ticker)
+    if not ob:
+        return None
+    data = ob.get('orderbook', {})
+    yes_bids = data.get('yes', [])
+    no_bids = data.get('no', [])
+
+    if not yes_bids or not no_bids:
+        return None
+
+    best_yes_bid = max(yes_bids, key=lambda x: x[0])[0]  # cents
+    best_no_bid = max(no_bids, key=lambda x: x[0])[0]    # cents
+    yes_ask = 100 - best_no_bid
+
+    # Sanity: bid should be <= ask
+    if best_yes_bid > yes_ask:
+        # Crossed book, use average anyway
+        pass
+
+    mid_yes = (best_yes_bid + yes_ask) / 2 / 100  # decimal probability
+    return mid_yes
+
+
+def calculate_combo_fair_value(kalshi_api, legs: List[Dict]) -> Optional[Dict]:
+    """Calculate fair combo YES/NO from Kalshi mid-market of each leg.
+
+    legs: list of dicts with 'market_ticker' and 'side' ('yes' or 'no')
+    Returns: {'fair_yes': float, 'fair_no': float, 'leg_probs': list} or None
+    """
+    leg_probs = []
+
+    for leg in legs:
+        ticker = leg.get('market_ticker', '')
+        side = leg.get('side', 'yes')
+
+        mid_yes = _get_leg_mid_market(kalshi_api, ticker)
+        if mid_yes is None:
+            return None  # Can't price — orderbook empty
+
+        # Clamp to avoid 0/1 extremes
+        mid_yes = max(0.02, min(0.98, mid_yes))
+
+        if side == 'yes':
+            leg_probs.append(mid_yes)
+        else:
+            leg_probs.append(1.0 - mid_yes)
+
+        time.sleep(0.15)  # Rate limit between orderbook fetches
+
+    combo_yes = 1.0
+    for p in leg_probs:
+        combo_yes *= p
+
+    return {
+        'fair_yes': combo_yes,
+        'fair_no': 1.0 - combo_yes,
+        'leg_probs': leg_probs,
+    }
+
+
+def _is_combo_eligible(legs: List[Dict]) -> bool:
+    """Check if all legs are from eligible markets (NBA/NCAAB)."""
+    if len(legs) < COMBO_MM_MIN_LEGS or len(legs) > COMBO_MM_MAX_LEGS:
+        return False
+    for leg in legs:
+        ticker = leg.get('market_ticker', '')
+        if not ticker.startswith(COMBO_MM_ELIGIBLE_PREFIXES):
+            return False
+    return True
+
+
+def _format_combo_legs(legs: List[Dict]) -> str:
+    """Format combo legs into a readable string for Telegram."""
+    parts = []
+    for leg in legs:
+        ticker = leg.get('market_ticker', '')
+        side = leg.get('side', 'yes').upper()
+        parts.append(f"{side} {ticker}")
+    return ' + '.join(parts)
+
+
+def send_combo_telegram(action: str, rfq_id: str, legs: List[Dict],
+                        fair_yes: float, no_bid_cents: int, contracts: int):
+    """Send Telegram notification for combo quote events."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        n_legs = len(legs)
+        cost_dollars = (no_bid_cents * contracts) / 100
+        max_win_dollars = ((100 - no_bid_cents) * contracts) / 100
+        fair_no_pct = (1.0 - fair_yes) * 100
+        our_no_pct = no_bid_cents
+
+        leg_lines = []
+        for leg in legs[:6]:  # Max 6 legs in message
+            ticker = leg.get('market_ticker', '')
+            side = leg.get('side', 'yes').upper()
+            leg_lines.append(f"  {side} {ticker}")
+        if len(legs) > 6:
+            leg_lines.append(f"  ... +{len(legs) - 6} more")
+
+        message = f"""COMBO MM {action} ({n_legs}-leg parlay)
+
+Legs:
+{chr(10).join(leg_lines)}
+
+Fair YES: {fair_yes*100:.1f}% | Fair NO: {fair_no_pct:.1f}%
+Our NO bid: {no_bid_cents}c ({prob_to_american(no_bid_cents/100)})
+Contracts: {contracts} | Cost: ${cost_dollars:.2f} | Max win: ${max_win_dollars:.2f}
+RFQ: {rfq_id[:12]}..."""
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, json={'chat_id': TELEGRAM_CHAT_ID, 'text': message}, timeout=10)
+    except Exception as e:
+        print(f"   Combo Telegram failed: {e}")
+
+
+def process_combo_rfq(kalshi_api, rfq: Dict) -> bool:
+    """Process a single combo RFQ: calculate fair value and submit a quote.
+    Returns True if quote was submitted.
+    """
+    global _combo_exposure_cents
+
+    rfq_id = rfq.get('id', '')
+    legs = rfq.get('mve_selected_legs', [])
+    contracts = rfq.get('contracts', 0)
+    contracts_fp = rfq.get('contracts_fp', '')
+
+    # Use contracts_fp if available (more precise)
+    if contracts_fp:
+        try:
+            contracts = int(float(contracts_fp))
+        except (ValueError, TypeError):
+            pass
+
+    if contracts <= 0:
+        return False
+
+    # Check eligibility
+    if not _is_combo_eligible(legs):
+        return False
+
+    # Calculate fair value from Kalshi orderbooks
+    fv = calculate_combo_fair_value(kalshi_api, legs)
+    if fv is None:
+        print(f"   Combo RFQ {rfq_id[:8]}: skipped (empty orderbook on a leg)")
+        return False
+
+    fair_yes = fv['fair_yes']
+    fair_no = fv['fair_no']
+
+    # Skip if combo is too unlikely or too likely
+    if fair_yes < 0.01 or fair_yes > 0.95:
+        print(f"   Combo RFQ {rfq_id[:8]}: skipped (fair YES {fair_yes*100:.1f}% out of range)")
+        return False
+
+    # Calculate our quote prices
+    no_bid_cents = int(fair_no * 100) - COMBO_MM_EDGE_CENTS
+    yes_bid_cents = max(1, int(fair_yes * 100) - COMBO_MM_EDGE_CENTS)
+
+    # Sanity: NO bid must be reasonable
+    if no_bid_cents < 10 or no_bid_cents > 97:
+        return False
+
+    # Check exposure limit
+    quote_cost_cents = no_bid_cents * contracts
+    data = _read_combo_bets()
+    current_exposure = data.get('total_exposure_cents', 0)
+    max_exposure_cents = int(COMBO_MM_MAX_EXPOSURE * 100)
+
+    if current_exposure + quote_cost_cents > max_exposure_cents:
+        # Try fewer contracts to stay within limit
+        available_cents = max_exposure_cents - current_exposure
+        contracts = available_cents // no_bid_cents
+        if contracts <= 0:
+            print(f"   Combo RFQ {rfq_id[:8]}: skipped (would exceed ${COMBO_MM_MAX_EXPOSURE} exposure)")
+            return False
+        quote_cost_cents = no_bid_cents * contracts
+
+    # Submit quote
+    result = kalshi_api.create_quote(
+        rfq_id=rfq_id,
+        yes_bid=yes_bid_cents / 100,
+        no_bid=no_bid_cents / 100,
+        rest_remainder=False,
+    )
+
+    if result:
+        # Track the quote
+        quote_id = result.get('id', rfq_id)
+        data['bets'][quote_id] = {
+            'rfq_id': rfq_id,
+            'legs': len(legs),
+            'leg_tickers': [l.get('market_ticker', '') for l in legs],
+            'leg_sides': [l.get('side', '') for l in legs],
+            'fair_yes': round(fair_yes, 4),
+            'fair_no': round(fair_no, 4),
+            'no_bid_cents': no_bid_cents,
+            'yes_bid_cents': yes_bid_cents,
+            'contracts': contracts,
+            'cost_cents': quote_cost_cents,
+            'quoted_at': datetime.utcnow().isoformat(),
+            'status': 'quoted',
+        }
+        data['total_exposure_cents'] = current_exposure + quote_cost_cents
+        _write_combo_bets(data)
+
+        n_legs = len(legs)
+        print(f"   COMBO QUOTED: {n_legs}-leg parlay, NO @ {no_bid_cents}c, "
+              f"{contracts} contracts, cost ${quote_cost_cents/100:.2f} "
+              f"(fair NO {fair_no*100:.1f}%, edge {COMBO_MM_EDGE_CENTS}c)")
+
+        send_combo_telegram('QUOTED', rfq_id, legs, fair_yes, no_bid_cents, contracts)
+        return True
+
+    return False
+
+
+def _combo_mm_loop():
+    """Poll for new combo RFQs and quote NO on eligible ones."""
+    print("Combo market maker started")
+    time.sleep(10)  # Let other threads initialize first
+
+    while True:
+        try:
+            if not COMBO_MM_ENABLED:
+                time.sleep(30)
+                continue
+
+            kalshi = KalshiAPI(KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY)
+            open_rfqs = kalshi.get_rfqs(status='open')
+
+            for rfq in open_rfqs:
+                rfq_id = rfq.get('id', '')
+                if not rfq_id or rfq_id in _combo_quoted_rfqs:
+                    continue
+
+                # Only process combos (have mve_selected_legs)
+                legs = rfq.get('mve_selected_legs', [])
+                if not legs:
+                    _combo_quoted_rfqs.add(rfq_id)
+                    continue
+
+                quoted = process_combo_rfq(kalshi, rfq)
+                _combo_quoted_rfqs.add(rfq_id)
+
+                if quoted:
+                    time.sleep(0.5)  # Brief pause between quotes
+
+        except Exception as e:
+            print(f"   Combo MM error: {e}")
+
+        time.sleep(COMBO_MM_POLL_SECONDS)
+
+
+def start_combo_mm():
+    """Start the combo market maker thread."""
+    t = threading.Thread(target=_combo_mm_loop, daemon=True)
+    t.start()
+    print("Combo market maker thread launched")
 
 
 # ============================================================
@@ -4738,6 +5078,7 @@ def start_background_scanner():
 # Start scanner when module loads (gunicorn will call this)
 start_background_scanner()  # Multi-book fair value scanner (notifications only, no trading)
 start_completed_props_sniper()  # Guaranteed markets: completed props, NHL tied totals (auto-trades)
+start_combo_mm()  # Combo (parlay) market maker: quote NO on RFQs
 
 
 # ============================================================
