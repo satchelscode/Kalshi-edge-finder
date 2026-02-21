@@ -2962,6 +2962,8 @@ def send_propmm_morning_summary(kalshi_api):
 _combo_quoted_rfqs = set()  # RFQ IDs we've already quoted on
 _combo_exposure_cents = 0    # Current total $ at risk in cents
 _combo_pending_quotes = {}   # {rfq_id: {'quote_id': str, 'no_bid_cents': int, 'contracts': int, 'cost_cents': int, 'legs': int}}
+_combo_ob_cache = {}         # {ticker: {'mid_yes': float, 'ts': float}} — orderbook cache for fast pricing
+COMBO_OB_CACHE_TTL = 30      # Cache orderbook data for 30 seconds
 
 
 def _read_combo_bets():
@@ -2986,8 +2988,17 @@ def _write_combo_bets(data):
 
 def _get_leg_mid_market(kalshi_api, ticker: str) -> Optional[float]:
     """Get mid-market YES probability for a single leg from Kalshi orderbook.
+    Uses cached data if available and fresh (< 30s). Otherwise fetches live.
     Returns probability as decimal (0-1) or None if orderbook is empty.
     """
+    now = time.time()
+
+    # Check cache first
+    cached = _combo_ob_cache.get(ticker)
+    if cached and (now - cached['ts']) < COMBO_OB_CACHE_TTL:
+        return cached['mid_yes']
+
+    # Fetch fresh orderbook
     ob = kalshi_api.get_orderbook(ticker)
     if not ob:
         return None
@@ -3002,12 +3013,11 @@ def _get_leg_mid_market(kalshi_api, ticker: str) -> Optional[float]:
     best_no_bid = max(no_bids, key=lambda x: x[0])[0]    # cents
     yes_ask = 100 - best_no_bid
 
-    # Sanity: bid should be <= ask
-    if best_yes_bid > yes_ask:
-        # Crossed book, use average anyway
-        pass
-
     mid_yes = (best_yes_bid + yes_ask) / 2 / 100  # decimal probability
+
+    # Cache the result
+    _combo_ob_cache[ticker] = {'mid_yes': mid_yes, 'ts': now}
+
     return mid_yes
 
 
@@ -3034,8 +3044,6 @@ def calculate_combo_fair_value(kalshi_api, legs: List[Dict]) -> Optional[Dict]:
             leg_probs.append(mid_yes)
         else:
             leg_probs.append(1.0 - mid_yes)
-
-        time.sleep(0.05)  # Brief pause between orderbook fetches
 
     combo_yes = 1.0
     for p in leg_probs:
@@ -3305,20 +3313,29 @@ def _combo_mm_loop():
             open_rfqs = kalshi.get_rfqs(status='open')
             poll_count += 1
 
-            # Heartbeat every 60 polls (~60s) so we can confirm loop is alive
+            # Heartbeat every ~60s so we can confirm loop is alive
             if poll_count % 240 == 0:
                 n_open = len(open_rfqs) if open_rfqs else 0
                 n_quoted = len(_combo_quoted_rfqs)
                 n_pending = len(_combo_pending_quotes)
+                n_cached = len(_combo_ob_cache)
                 print(f"   Combo MM heartbeat: poll #{poll_count}, {n_open} open RFQs, "
-                      f"{n_quoted} already quoted, {n_pending} pending fills")
+                      f"{n_quoted} already quoted, {n_pending} pending fills, {n_cached} cached OBs")
 
+            # Warm cache: prefetch orderbooks from ALL open RFQs (even already-quoted)
+            # so when a new RFQ arrives with the same legs, pricing is instant
+            for rfq in open_rfqs:
+                for leg in rfq.get('mve_selected_legs', []):
+                    ticker = leg.get('market_ticker', '')
+                    if ticker and ticker not in _combo_ob_cache:
+                        _get_leg_mid_market(kalshi, ticker)
+
+            # Process new RFQs
             for rfq in open_rfqs:
                 rfq_id = rfq.get('id', '')
                 if not rfq_id or rfq_id in _combo_quoted_rfqs:
                     continue
 
-                # Only process combos (have mve_selected_legs)
                 legs = rfq.get('mve_selected_legs', [])
                 if not legs:
                     _combo_quoted_rfqs.add(rfq_id)
@@ -3326,9 +3343,6 @@ def _combo_mm_loop():
 
                 quoted = process_combo_rfq(kalshi, rfq)
                 _combo_quoted_rfqs.add(rfq_id)
-
-                if quoted:
-                    time.sleep(0.5)  # Brief pause between quotes
 
             # Check pending quotes for fills every 3 seconds (every 3rd iteration)
             fill_check_counter += 1
