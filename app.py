@@ -6,6 +6,7 @@ import re
 import base64
 import hashlib
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, render_template, jsonify, request, redirect, Response
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -3034,21 +3035,32 @@ def _get_leg_mid_market(kalshi_api, ticker: str) -> Optional[float]:
 
 def calculate_combo_fair_value(kalshi_api, legs: List[Dict]) -> Optional[Dict]:
     """Calculate fair combo YES/NO from Kalshi mid-market of each leg.
+    Fetches all orderbooks in PARALLEL for speed.
 
     legs: list of dicts with 'market_ticker' and 'side' ('yes' or 'no')
     Returns: {'fair_yes': float, 'fair_no': float, 'leg_probs': list} or None
     """
+    tickers = [leg.get('market_ticker', '') for leg in legs]
+    sides = [leg.get('side', 'yes') for leg in legs]
+
+    # Fetch all orderbooks in parallel
+    mid_results = {}
+    with ThreadPoolExecutor(max_workers=len(legs)) as executor:
+        futures = {executor.submit(_get_leg_mid_market, kalshi_api, t): t for t in tickers}
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                mid_results[ticker] = future.result()
+            except Exception:
+                mid_results[ticker] = None
+
+    # Build leg probabilities in order
     leg_probs = []
-
-    for leg in legs:
-        ticker = leg.get('market_ticker', '')
-        side = leg.get('side', 'yes')
-
-        mid_yes = _get_leg_mid_market(kalshi_api, ticker)
+    for ticker, side in zip(tickers, sides):
+        mid_yes = mid_results.get(ticker)
         if mid_yes is None:
             return None  # Can't price — orderbook empty
 
-        # Clamp to avoid 0/1 extremes
         mid_yes = max(0.02, min(0.98, mid_yes))
 
         if side == 'yes':
@@ -3107,13 +3119,32 @@ def _is_combo_eligible(legs: List[Dict], kalshi_api=None) -> bool:
         ticker = leg.get('market_ticker', '')
         if not ticker.startswith(COMBO_MM_ELIGIBLE_PREFIXES):
             return False
-    # Pre-game only: skip if any leg's game has already started
+    # Pre-game only: skip if any leg's game has already started (parallel check)
     if kalshi_api:
-        for leg in legs:
-            ticker = leg.get('market_ticker', '')
-            if _is_leg_live(kalshi_api, ticker):
-                print(f"   Combo RFQ: skipped (live game leg: {ticker[:30]})")
-                return False
+        tickers = [leg.get('market_ticker', '') for leg in legs]
+        # Check all cached first (fast path — no threads needed)
+        uncached = []
+        now = time.time()
+        for t in tickers:
+            cached = _combo_market_cache.get(t)
+            if cached and (now - cached['ts']) < COMBO_MARKET_CACHE_TTL:
+                if cached['is_live']:
+                    print(f"   Combo RFQ: skipped (live game leg: {t[:30]})")
+                    return False
+            else:
+                uncached.append(t)
+        # Fetch uncached in parallel
+        if uncached:
+            with ThreadPoolExecutor(max_workers=len(uncached)) as executor:
+                futures = {executor.submit(_is_leg_live, kalshi_api, t): t for t in uncached}
+                for future in as_completed(futures):
+                    ticker = futures[future]
+                    try:
+                        if future.result():
+                            print(f"   Combo RFQ: skipped (live game leg: {ticker[:30]})")
+                            return False
+                    except Exception:
+                        pass
     return True
 
 
