@@ -170,8 +170,7 @@ PROPMM_MORNING_HOUR_ET = 9        # 9am ET for daily W/L summary
 
 # Combo (parlay) market-making: quote NO on incoming RFQs
 COMBO_MM_ENABLED = True
-COMBO_MM_MAX_EXPOSURE = 500.00     # Total $ at risk across pending (unfilled) quotes
-COMBO_MM_MAX_QUOTE_COST = 10.00    # Max $ per individual quote (spread risk across many parlays)
+COMBO_MM_MAX_QUOTE_COST = 150.00   # Max $ per individual quote (cap single-parlay risk)
 COMBO_MM_EDGE_CENTS = 0            # Quote at exact fair NO (maximize fills)
 COMBO_MM_POLL_SECONDS = 1          # Poll for new RFQs every N seconds
 COMBO_MM_ELIGIBLE_PREFIXES = ('KXNBA', 'KXNCAAMB')  # NBA + NCAAB tickers only
@@ -3149,26 +3148,13 @@ def process_combo_rfq(kalshi_api, rfq: Dict) -> bool:
     if no_bid_cents < 10 or no_bid_cents > 97:
         return False
 
-    # Cap contracts to per-quote max cost
+    # Cap contracts to per-quote max cost ($150 max per parlay)
     max_quote_cents = int(COMBO_MM_MAX_QUOTE_COST * 100)
     max_contracts_per_quote = max_quote_cents // no_bid_cents
     if max_contracts_per_quote <= 0:
         return False
     contracts = min(contracts, max_contracts_per_quote)
-
-    # Check total exposure limit
     quote_cost_cents = no_bid_cents * contracts
-    data = _read_combo_bets()
-    current_exposure = data.get('total_exposure_cents', 0)
-    max_exposure_cents = int(COMBO_MM_MAX_EXPOSURE * 100)
-
-    if current_exposure + quote_cost_cents > max_exposure_cents:
-        available_cents = max_exposure_cents - current_exposure
-        contracts = min(contracts, available_cents // no_bid_cents)
-        if contracts <= 0:
-            print(f"   Combo RFQ {rfq_id[:8]}: skipped (would exceed ${COMBO_MM_MAX_EXPOSURE} exposure)")
-            return False
-        quote_cost_cents = no_bid_cents * contracts
 
     # Submit quote
     result = kalshi_api.create_quote(
@@ -3180,6 +3166,7 @@ def process_combo_rfq(kalshi_api, rfq: Dict) -> bool:
 
     if result:
         # Track the quote
+        data = _read_combo_bets()
         quote_id = result.get('id', rfq_id)
         data['bets'][quote_id] = {
             'rfq_id': rfq_id,
@@ -3195,7 +3182,7 @@ def process_combo_rfq(kalshi_api, rfq: Dict) -> bool:
             'quoted_at': datetime.utcnow().isoformat(),
             'status': 'quoted',
         }
-        data['total_exposure_cents'] = current_exposure + quote_cost_cents
+        data['total_exposure_cents'] = data.get('total_exposure_cents', 0) + quote_cost_cents
         _write_combo_bets(data)
 
         n_legs = len(legs)
