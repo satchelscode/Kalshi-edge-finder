@@ -3152,13 +3152,14 @@ def process_combo_rfq(kalshi_api, rfq: Dict) -> bool:
     if no_bid_cents < 10 or no_bid_cents > 99:
         return False
 
-    # Cap contracts to per-quote max cost ($150 max per parlay)
+    # Hard cap: skip RFQs where full cost exceeds max quote cost.
+    # The API fills ALL contracts in the RFQ — we can't partially fill.
+    full_cost_cents = no_bid_cents * contracts
     max_quote_cents = int(COMBO_MM_MAX_QUOTE_COST * 100)
-    max_contracts_per_quote = max_quote_cents // no_bid_cents
-    if max_contracts_per_quote <= 0:
+    if full_cost_cents > max_quote_cents:
+        print(f"   Combo RFQ {rfq_id[:8]}: skipped (full cost ${full_cost_cents/100:.2f} > ${COMBO_MM_MAX_QUOTE_COST} cap)")
         return False
-    contracts = min(contracts, max_contracts_per_quote)
-    quote_cost_cents = no_bid_cents * contracts
+    quote_cost_cents = full_cost_cents
 
     # Submit quote
     result = kalshi_api.create_quote(
