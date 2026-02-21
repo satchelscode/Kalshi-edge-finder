@@ -1343,16 +1343,16 @@ class KalshiAPI:
             'KALSHI-ACCESS-TIMESTAMP': timestamp_ms,
         }
 
-    def _auth_get(self, path: str, params: Dict = None) -> Optional[Dict]:
-        """Authenticated GET request."""
+    def _auth_get(self, path: str, params: Dict = None, timeout: int = 10) -> Optional[Dict]:
+        """Authenticated GET request using session for connection reuse."""
         if not self.private_key:
             return None
         try:
             headers = self._sign_request('GET', path)
-            response = requests.get(
+            self.session.headers.update(headers)
+            response = self.session.get(
                 f"https://api.elections.kalshi.com{path}",
-                headers={**self.session.headers, **headers},
-                params=params, timeout=10
+                params=params, timeout=timeout
             )
             response.raise_for_status()
             return response.json()
@@ -1360,16 +1360,16 @@ class KalshiAPI:
             print(f"   Kalshi auth GET {path} error: {e}")
             return None
 
-    def _auth_post(self, path: str, body: Dict) -> Optional[Dict]:
-        """Authenticated POST request."""
+    def _auth_post(self, path: str, body: Dict, timeout: int = 10) -> Optional[Dict]:
+        """Authenticated POST request using session for connection reuse."""
         if not self.private_key:
             return None
         try:
             headers = self._sign_request('POST', path)
-            response = requests.post(
+            self.session.headers.update(headers)
+            response = self.session.post(
                 f"https://api.elections.kalshi.com{path}",
-                headers={**self.session.headers, **headers},
-                json=body, timeout=10
+                json=body, timeout=timeout
             )
             response.raise_for_status()
             return response.json()
@@ -1383,14 +1383,14 @@ class KalshiAPI:
             return None
 
     def _auth_delete(self, path: str) -> bool:
-        """Authenticated DELETE request. Returns True on success."""
+        """Authenticated DELETE request using session for connection reuse."""
         if not self.private_key:
             return False
         try:
             headers = self._sign_request('DELETE', path)
-            response = requests.delete(
+            self.session.headers.update(headers)
+            response = self.session.delete(
                 f"https://api.elections.kalshi.com{path}",
-                headers={**self.session.headers, **headers},
                 timeout=10
             )
             response.raise_for_status()
@@ -1506,9 +1506,9 @@ class KalshiAPI:
             return result.get('rfqs', [])
         return []
 
-    def get_rfq(self, rfq_id: str) -> Optional[Dict]:
-        """Get a single RFQ by ID."""
-        return self._auth_get(f'/trade-api/v2/communications/rfqs/{rfq_id}')
+    def get_rfq(self, rfq_id: str, timeout: int = 3) -> Optional[Dict]:
+        """Get a single RFQ by ID. Short timeout for latency-sensitive combo MM."""
+        return self._auth_get(f'/trade-api/v2/communications/rfqs/{rfq_id}', timeout=timeout)
 
     def get_quotes(self, rfq_id: str = None, limit: int = 100) -> List[Dict]:
         """Get quotes, optionally filtered by RFQ ID."""
@@ -1536,7 +1536,7 @@ class KalshiAPI:
             'rest_remainder': rest_remainder,
         }
         print(f"   >>> COMBO QUOTE: RFQ {rfq_id[:8]}... YES bid ${yes_bid:.2f} / NO bid ${no_bid:.2f}")
-        result = self._auth_post('/trade-api/v2/communications/quotes', body)
+        result = self._auth_post('/trade-api/v2/communications/quotes', body, timeout=3)
         if result:
             quote_id = result.get('id', 'unknown')
             print(f"   >>> QUOTE {quote_id}: submitted")
@@ -3342,23 +3342,18 @@ def _combo_mm_loop():
     fill_thread = threading.Thread(target=_combo_fill_checker_loop, args=(kalshi,), daemon=True)
     fill_thread.start()
 
-    # Catch up: process any already-open RFQs via REST before starting WebSocket
+    # Skip catch-up of existing open RFQs — they're already stale by startup.
+    # Just mark them as seen so we don't re-process via WebSocket.
     try:
         open_rfqs = kalshi.get_rfqs(status='open')
         if open_rfqs:
             for rfq in open_rfqs:
                 rfq_id = rfq.get('id', '')
-                if not rfq_id or rfq_id in _combo_quoted_rfqs:
-                    continue
-                legs = rfq.get('mve_selected_legs', [])
-                if not legs:
+                if rfq_id:
                     _combo_quoted_rfqs.add(rfq_id)
-                    continue
-                process_combo_rfq(kalshi, rfq)
-                _combo_quoted_rfqs.add(rfq_id)
-            print(f"   Combo MM catch-up: processed {len(open_rfqs)} existing RFQs")
+            print(f"   Combo MM: marked {len(open_rfqs)} existing RFQs as seen (skipping stale)")
     except Exception as e:
-        print(f"   Combo MM catch-up error: {e}")
+        print(f"   Combo MM startup error: {e}")
 
     reconnect_delay = 1  # Start with 1s, exponential backoff on repeated failures
 
