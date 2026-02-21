@@ -172,7 +172,7 @@ PROPMM_MORNING_HOUR_ET = 9        # 9am ET for daily W/L summary
 COMBO_MM_ENABLED = True
 COMBO_MM_MAX_QUOTE_COST = 50.00    # Max $ per individual quote (cap single-parlay risk)
 COMBO_MM_EDGE_CENTS = -4           # Bid 4c ABOVE fair NO to win fills ($50 cap limits risk)
-COMBO_MM_POLL_SECONDS = 1          # Poll for new RFQs every N seconds
+COMBO_MM_POLL_SECONDS = 0.25       # Poll for new RFQs every N seconds
 COMBO_MM_ELIGIBLE_PREFIXES = ('KXNBA', 'KXNCAAMB')  # NBA + NCAAB tickers only
 COMBO_MM_MIN_LEGS = 2              # Minimum legs to quote
 COMBO_MM_MAX_LEGS = 10             # Maximum legs to quote
@@ -3035,7 +3035,7 @@ def calculate_combo_fair_value(kalshi_api, legs: List[Dict]) -> Optional[Dict]:
         else:
             leg_probs.append(1.0 - mid_yes)
 
-        time.sleep(0.15)  # Rate limit between orderbook fetches
+        time.sleep(0.05)  # Brief pause between orderbook fetches
 
     combo_yes = 1.0
     for p in leg_probs:
@@ -3305,7 +3305,7 @@ def _combo_mm_loop():
             poll_count += 1
 
             # Heartbeat every 60 polls (~60s) so we can confirm loop is alive
-            if poll_count % 60 == 0:
+            if poll_count % 240 == 0:
                 n_open = len(open_rfqs) if open_rfqs else 0
                 n_quoted = len(_combo_quoted_rfqs)
                 n_pending = len(_combo_pending_quotes)
@@ -3331,7 +3331,7 @@ def _combo_mm_loop():
 
             # Check pending quotes for fills every 3 seconds (every 3rd iteration)
             fill_check_counter += 1
-            if fill_check_counter >= 3 and _combo_pending_quotes:
+            if fill_check_counter >= 12 and _combo_pending_quotes:
                 _check_combo_fills(kalshi)
                 fill_check_counter = 0
 
